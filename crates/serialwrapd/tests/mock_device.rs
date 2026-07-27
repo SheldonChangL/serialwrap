@@ -46,26 +46,63 @@ fn read_with_deadline(mut file: File, timeout: Duration) -> Option<Vec<u8>> {
 // concurrently, exactly like a real daemon would (read continuously as the
 // device produces output) rather than "write everything, then read".
 
+// ROOT CAUSE (Linux CI flake, issue #39): this test used to spawn its
+// writer with `thread::spawn(move || device.write_device_output(&banner))`,
+// which *moves* `device` into the writer closure. The moment
+// `write_device_output` returns, that closure's stack frame drops —
+// including `device` itself, since nothing gives it back out (the closure's
+// return value is only the `io::Result<()>` from the write call). Dropping
+// `MockDevice` tears down the PTY: its `responder` field's `Drop` impl
+// (`Responder::stop`) joins the responder thread, which lets go of *its*
+// `Arc<OwnedFd>` clone of the master, and `device`'s own `master`/
+// `spare_slave` fds close right along with it — so the master side of the
+// PTY fully closes within roughly one responder-poll tick (<=50ms) of the
+// write returning, often faster.
+//
+// That race the main thread's `reader.read_exact` on the slave side: on
+// Linux, once every fd on the *master* side of a PTY closes while bytes the
+// kernel accepted are still sitting unread in the line discipline's queue,
+// a concurrent slave-side `read()` can come back with EIO/EOF instead of
+// the buffered data — a kernel-level race, not a logic bug in this crate
+// (see `pty::PtyPair`'s docs on the analogous, already-handled master-sees-
+// hangup direction). macOS's PTY implementation is far more forgiving here,
+// which is exactly why this only ever reproduced on ubuntu-latest: a
+// single-write, no-delay test like this one gives the writer thread almost
+// nothing else to do before it can drop `device`, so the teardown races the
+// read as tightly as possible.
+//
+// The fix is not a bigger timeout or a retry — it's to stop tearing the
+// device down while a read against it is still in flight. `thread::scope`
+// lets the writer closure *borrow* `device` (it only needs `&self`) instead
+// of owning it, so `device` stays alive in this function's own stack frame
+// for as long as the function runs, regardless of when the writer thread
+// finishes — it cannot be dropped mid-read no matter how CI schedules these
+// threads.
 #[test]
 fn boot_banner_is_captured_as_the_first_bytes() {
     let device = MockDevice::new().expect("open mock device");
     let mut reader = device.open_slave().expect("open slave");
-
     let banner = script::boot_banner();
-    let writer = {
-        let banner = banner.clone();
-        thread::spawn(move || device.write_device_output(&banner))
-    };
 
-    let mut buf = vec![0u8; banner.len()];
-    reader.read_exact(&mut buf).expect("read boot banner");
-    writer
-        .join()
-        .expect("writer thread panicked")
-        .expect("write boot banner");
-    assert_eq!(buf, banner, "boot banner must arrive byte-exact");
+    thread::scope(|scope| {
+        let writer = scope.spawn(|| device.write_device_output(&banner));
+
+        let mut buf = vec![0u8; banner.len()];
+        reader.read_exact(&mut buf).expect("read boot banner");
+        writer
+            .join()
+            .expect("writer thread panicked")
+            .expect("write boot banner");
+        assert_eq!(buf, banner, "boot banner must arrive byte-exact");
+    });
 }
 
+// Same device-lifetime hazard as `boot_banner_is_captured_as_the_first_bytes`
+// above (see its comment for the full root cause): the writer used to own
+// `device` outright, so it — and the PTY master along with it — could drop
+// the instant the last scripted write returned, racing the main thread's
+// still-in-progress `read_exact`. `thread::scope` keeps `device` owned by
+// this function for its whole lifetime instead.
 #[test]
 fn periodic_lines_arrive_in_order_at_the_scripted_interval() {
     let device = MockDevice::new().expect("open mock device");
@@ -75,37 +112,42 @@ fn periodic_lines_arrive_in_order_at_the_scripted_interval() {
     let interval = Duration::from_millis(40);
 
     let start = Instant::now();
-    let writer = thread::spawn(move || {
+    thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            for seq in 0..COUNT {
+                device.write_device_output(&script::periodic_line(seq))?;
+                thread::sleep(interval);
+            }
+            Ok::<(), std::io::Error>(())
+        });
+
+        let mut expected = Vec::new();
         for seq in 0..COUNT {
-            device.write_device_output(&script::periodic_line(seq))?;
-            thread::sleep(interval);
+            expected.extend_from_slice(&script::periodic_line(seq));
         }
-        Ok::<(), std::io::Error>(())
+        let mut buf = vec![0u8; expected.len()];
+        reader.read_exact(&mut buf).expect("read periodic lines");
+        let elapsed = start.elapsed();
+        writer
+            .join()
+            .expect("writer thread panicked")
+            .expect("write periodic lines");
+        assert_eq!(
+            buf, expected,
+            "periodic lines must arrive in order, byte-exact"
+        );
+
+        // Loose sanity check that the interval was actually honored (not
+        // just one instantaneous burst) — generous tolerance for scheduler
+        // jitter. This one *is* an inherently time-based assertion (the
+        // acceptance criterion is about the interval being honored), unlike
+        // the device-teardown race this refactor fixes.
+        let expected_min = interval * (COUNT as u32 - 1);
+        assert!(
+            elapsed >= expected_min,
+            "expected the writer loop to take at least {expected_min:?}, took {elapsed:?}"
+        );
     });
-
-    let mut expected = Vec::new();
-    for seq in 0..COUNT {
-        expected.extend_from_slice(&script::periodic_line(seq));
-    }
-    let mut buf = vec![0u8; expected.len()];
-    reader.read_exact(&mut buf).expect("read periodic lines");
-    let elapsed = start.elapsed();
-    writer
-        .join()
-        .expect("writer thread panicked")
-        .expect("write periodic lines");
-    assert_eq!(
-        buf, expected,
-        "periodic lines must arrive in order, byte-exact"
-    );
-
-    // Loose sanity check that the interval was actually honored (not just
-    // one instantaneous burst) — generous tolerance for scheduler jitter.
-    let expected_min = interval * (COUNT as u32 - 1);
-    assert!(
-        elapsed >= expected_min,
-        "expected the writer loop to take at least {expected_min:?}, took {elapsed:?}"
-    );
 }
 
 #[test]
@@ -119,46 +161,49 @@ fn binary_chunk_round_trips_byte_exact_and_is_non_utf8() {
         "fixture bug: binary_chunk should never be valid UTF-8"
     );
 
-    let writer = {
-        let payload = payload.clone();
-        thread::spawn(move || device.write_device_output(&payload))
-    };
+    // Same device-lifetime hazard as `boot_banner_is_captured_as_the_first_bytes`
+    // (see its comment): borrow `device` via `thread::scope` instead of
+    // moving it into the writer, so it can't be torn down mid-read.
+    thread::scope(|scope| {
+        let writer = scope.spawn(|| device.write_device_output(&payload));
 
-    let mut buf = vec![0u8; payload.len()];
-    reader.read_exact(&mut buf).expect("read binary chunk");
-    writer
-        .join()
-        .expect("writer thread panicked")
-        .expect("write binary chunk");
-    assert_eq!(
-        buf, payload,
-        "binary chunk must round-trip byte-exact over the PTY"
-    );
+        let mut buf = vec![0u8; payload.len()];
+        reader.read_exact(&mut buf).expect("read binary chunk");
+        writer
+            .join()
+            .expect("writer thread panicked")
+            .expect("write binary chunk");
+        assert_eq!(
+            buf, payload,
+            "binary chunk must round-trip byte-exact over the PTY"
+        );
+    });
 }
 
+// Same device-lifetime hazard as `boot_banner_is_captured_as_the_first_bytes`
+// above (see its comment for the full root cause).
 #[test]
 fn repeated_line_round_trips_with_expected_repeat_count() {
     let device = MockDevice::new().expect("open mock device");
     let mut reader = device.open_slave().expect("open slave");
 
     let payload = script::repeated_line("boot ok", 50);
-    let writer = {
-        let payload = payload.clone();
-        thread::spawn(move || device.write_device_output(&payload))
-    };
+    thread::scope(|scope| {
+        let writer = scope.spawn(|| device.write_device_output(&payload));
 
-    let mut buf = vec![0u8; payload.len()];
-    reader.read_exact(&mut buf).expect("read repeated lines");
-    writer
-        .join()
-        .expect("writer thread panicked")
-        .expect("write repeated lines");
-    assert_eq!(buf, payload);
-    assert_eq!(
-        buf.iter().filter(|&&b| b == b'\n').count(),
-        50,
-        "expected exactly 50 newline-terminated repeats"
-    );
+        let mut buf = vec![0u8; payload.len()];
+        reader.read_exact(&mut buf).expect("read repeated lines");
+        writer
+            .join()
+            .expect("writer thread panicked")
+            .expect("write repeated lines");
+        assert_eq!(buf, payload);
+        assert_eq!(
+            buf.iter().filter(|&&b| b == b'\n').count(),
+            50,
+            "expected exactly 50 newline-terminated repeats"
+        );
+    });
 }
 
 #[test]

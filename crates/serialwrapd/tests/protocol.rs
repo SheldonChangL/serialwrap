@@ -119,6 +119,49 @@ impl Client {
     }
 }
 
+/// Block until `list_clients` (over a *separate* connection from `sock`)
+/// reports some client genuinely `Activity::WaitingFor { device, pattern,
+/// .. }` — i.e. until a `wait_for` call for that exact device/pattern has
+/// actually reached `Request::WaitFor`'s handler and taken
+/// `DeviceQueryState::wait_for`'s "checked" snapshot.
+///
+/// Exists for the same reason as `crates/serialwrap/tests/mcp_bridge.rs`'s
+/// identically-named helper (issue #39): a test proving `wait_for` matches
+/// a line that arrives *after* the call started must not just sleep a
+/// guessed duration before appending that line and hope the daemon's own
+/// request dispatch was faster — `wait_for` deliberately only matches lines
+/// assembled from its own "checked" snapshot onward, so a guess that turns
+/// out too short makes the append look like pre-existing history and the
+/// call spuriously times out. `protocol::session`'s `WaitFor` handler calls
+/// `shared.clients.set_activity(client_id, Activity::WaitingFor { .. })`
+/// synchronously, with no `.await` in between, immediately before taking
+/// that snapshot, so by the time this poll ever observes it, the snapshot
+/// has already happened.
+async fn wait_until_client_is_waiting_for(sock: &std::path::Path, device: &str, pattern: &str) {
+    let (mut probe, _ack) = Client::connect(sock, "sync-probe", "human").await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut id = 0u64;
+    loop {
+        id += 1;
+        probe.send(json!({"id": id, "op": "list_clients"})).await;
+        let reply = probe.recv().await;
+        let waiting = reply["clients"].as_array().into_iter().flatten().any(|c| {
+            c["activity"]["state"] == "waiting_for"
+                && c["activity"]["device"] == device
+                && c["activity"]["pattern"] == pattern
+        });
+        if waiting {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never reported a client waiting_for device={device:?} pattern={pattern:?} \
+             within 5s — real hang, not just a slow poll"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 fn tiny_recorder_config() -> RecorderConfig {
     // Small segments, effectively unbounded ring: forces rotation across
     // segment boundaries without ever evicting anything — matches
@@ -232,9 +275,12 @@ async fn read_since_is_correct_across_a_segment_boundary_through_the_protocol() 
     let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
     let (mut c, _ack) = Client::connect(&sock_path, "reader", "human").await;
 
-    // Let the background poller ingest everything already on disk.
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
+    // No sleep needed: this `read_since` below is this device's first-ever
+    // query, and `QueryRegistry::get_or_spawn` performs one synchronous
+    // `ingest` the first time any query touches a device specifically so
+    // its first caller can never observe less than what's already
+    // (synchronously, durably — see `Recorder`'s module docs on fsync only
+    // affecting crash durability, not readability) on disk.
     let mut cursor = 0u64;
     let mut collected = Vec::new();
     loop {
@@ -649,6 +695,21 @@ async fn a_valid_utf8_line_never_carries_a_redundant_raw_b64() {
 // `tail`/`read_since`. These two tests are the wire-level proof of the fix:
 // same `raw_b64`-present-only-when-not-valid-UTF-8 rule `line_json` already
 // uses, now applied to `wait_for`'s own reply too.
+//
+// Both tests below used to `send` the `wait_for` request (fire-and-forget —
+// `send` doesn't wait for a reply), sleep a guessed 30ms, then append the
+// matching line -- the same class of hazard root-caused and fixed in
+// `crates/serialwrap/tests/mcp_bridge.rs`'s
+// `wait_for_matched_binary_line_carries_the_real_raw_hex_via_the_bridge`
+// (issue #39): if the daemon takes longer than the guess to actually read,
+// dispatch, and start waiting on the request, the append lands before
+// `wait_for`'s "checked" snapshot and is (correctly, by its own semantics)
+// never matched, so the call spuriously times out. This file talks straight
+// to the daemon over one socket (no subprocess hop like the MCP bridge
+// has), so the window is narrower and neither of these has actually been
+// observed to flake -- but it's the identical anti-pattern, so it gets the
+// identical, deterministic fix: confirm the real `Activity::WaitingFor`
+// event via `wait_until_client_is_waiting_for` instead of guessing.
 
 #[tokio::test]
 async fn wait_for_matched_invalid_utf8_line_carries_raw_b64() {
@@ -672,7 +733,7 @@ async fn wait_for_matched_invalid_utf8_line_carries_raw_b64() {
         json!({"id": 1, "op": "wait_for", "device": "dev", "pattern": "^status:", "timeout_s": 3.0}),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    wait_until_client_is_waiting_for(&sock_path, "dev", "^status:").await;
     recorder.append_rx(&with_newline).unwrap();
 
     let reply = tokio::time::timeout(Duration::from_secs(2), c.recv())
@@ -717,7 +778,7 @@ async fn wait_for_matched_valid_utf8_line_never_carries_a_redundant_raw_b64() {
         json!({"id": 1, "op": "wait_for", "device": "dev", "pattern": "boot ok", "timeout_s": 3.0}),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    wait_until_client_is_waiting_for(&sock_path, "dev", "boot ok").await;
     recorder.append_rx(b"boot ok\n").unwrap();
 
     let reply = tokio::time::timeout(Duration::from_secs(2), c.recv())
@@ -857,11 +918,12 @@ async fn subscribe_since_cursor_below_the_retained_floor_is_a_structured_data_ag
     let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
     let (mut c, _ack) = Client::connect(&sock_path, "reader", "human").await;
 
-    // Let the background poller ingest everything (and its own
-    // `DeviceQueryState::oldest_seq` floor get set) before subscribing with
-    // a since_cursor of 0, which is now guaranteed to be aged out.
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
+    // No sleep needed: this `subscribe` is this device's first-ever query,
+    // and `QueryRegistry::get_or_spawn` (called before the `since_cursor`
+    // check below) performs one synchronous `ingest` first — including
+    // resolving the `DataAgedOut` floor via `Recorder::read_since`'s own
+    // resync path — so `oldest_seq` is already correct by the time
+    // `since_cursor: 0` is checked against it.
     c.send(json!({"id": 1, "op": "subscribe", "device": "dev", "since_cursor": 0}))
         .await;
     let reply = tokio::time::timeout(Duration::from_secs(2), c.recv())
@@ -1275,7 +1337,13 @@ async fn set_config_over_the_wire_produces_a_config_change_event_and_never_touch
     assert_eq!(set_reply["ok"], true, "set_config failed: {set_reply}");
     assert_eq!(set_reply["config"]["baud"].as_u64(), Some(74880));
 
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    // No sleep needed: `set_config`'s handler appends the `config_change`
+    // event synchronously (`device_profile::append_config_change_event`)
+    // before it ever replies, and this `read_since` is this device's
+    // first-ever query -- `QueryRegistry::get_or_spawn`'s synchronous first
+    // ingest already covers it (`set_config` itself never touches the query
+    // machinery, so there's no earlier query to have "used up" that
+    // guarantee).
     c.send(json!({"id": 2, "op": "read_since", "device": "dev", "cursor": 0}))
         .await;
     let read_reply = c.recv().await;

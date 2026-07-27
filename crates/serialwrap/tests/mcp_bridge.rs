@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::task::JoinHandle;
 
@@ -69,6 +70,87 @@ async fn start_daemon_with_empty_device(device_id: &str) -> (TestDaemon, Arc<Rec
     std::mem::forget(data_dir);
     let daemon = start_daemon_with_device(device_id, Arc::clone(&recorder)).await;
     (daemon, recorder)
+}
+
+/// Block until the daemon's own bookkeeping shows *some* connected client
+/// registered as `Activity::WaitingFor { device, pattern, .. }` — i.e. until
+/// a `wait_for` call for that exact device/pattern has actually reached
+/// `protocol::session`'s `Request::WaitFor` handler and taken
+/// `DeviceQueryState::wait_for`'s "checked" snapshot.
+///
+/// Why this exists (issue #39): a test that wants to prove `wait_for`
+/// blocks and then matches a line that arrives *after* the call started
+/// cannot just spawn a task that sleeps a guessed number of milliseconds
+/// before appending that line and hope it's long enough — `wait_for`
+/// deliberately only matches lines assembled from the moment its own
+/// "checked" snapshot is taken onward (see `query::DeviceQueryState::wait_for`'s
+/// docs), so if the append happens to land *before* that snapshot (e.g.
+/// because spawning the `serialwrap mcp` subprocess, its IPC round trip to
+/// the daemon, and request dispatch together happen to take longer than the
+/// guessed delay — very plausible on a loaded, shared CI runner running a
+/// debug build), the line is treated as pre-existing history and never
+/// matches, and `wait_for` burns its entire timeout before reporting a
+/// (spurious) timeout. That is exactly the failure mode issue #39 observed:
+/// `"result":"timeout"` at ~3000ms elapsed, not a late-but-real match.
+///
+/// This polls the daemon directly over a *separate* raw protocol
+/// connection (bypassing the MCP subprocess and its stdio bridge, which
+/// don't expose `list_clients` at all) purely to detect that real,
+/// already-observable event, rather than guessing how long it takes to
+/// happen. `protocol::session`'s `WaitFor` handler calls
+/// `shared.clients.set_activity(client_id, Activity::WaitingFor { .. })`
+/// synchronously, with no `.await` in between, immediately before calling
+/// `DeviceQueryState::wait_for` (whose first action is that "checked"
+/// snapshot) — so by the time this poll ever observes `WaitingFor`, the
+/// snapshot has already happened, and it is safe to append data right
+/// after this returns.
+async fn wait_until_client_is_waiting_for(socket: &Path, device: &str, pattern: &str) {
+    let stream = UnixStream::connect(socket)
+        .await
+        .expect("connect sync-probe socket");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    let hello = json!({"op": "hello", "name": "sync-probe", "type": "human", "version": "0.1.0"});
+    write_half
+        .write_all(format!("{hello}\n").as_bytes())
+        .await
+        .expect("write hello");
+    let mut line = String::new();
+    reader.read_line(&mut line).await.expect("read hello ack");
+
+    // Ceiling purely to turn a genuine hang/regression into a clear failure
+    // instead of an infinite loop — not a guess at how long the real event
+    // takes (see the doc comment above).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut id = 0u64;
+    loop {
+        id += 1;
+        line.clear();
+        write_half
+            .write_all(format!("{}\n", json!({"id": id, "op": "list_clients"})).as_bytes())
+            .await
+            .expect("write list_clients");
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("read list_clients reply");
+        let reply: Value = serde_json::from_str(&line).expect("list_clients reply was valid JSON");
+        let waiting = reply["clients"].as_array().into_iter().flatten().any(|c| {
+            c["activity"]["state"] == "waiting_for"
+                && c["activity"]["device"] == device
+                && c["activity"]["pattern"] == pattern
+        });
+        if waiting {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never reported a client waiting_for device={device:?} pattern={pattern:?} \
+             within 5s — real hang, not just a slow poll"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
 }
 
 fn spawn_line_collector<R>(reader: R) -> (Arc<Mutex<Vec<String>>>, JoinHandle<()>)
@@ -254,19 +336,29 @@ impl McpProcess {
 
 // ---- Acceptance criterion 1: wait_for -> tail flow, no sleep in the agent's own trace ----
 
+// This test used to stand in for "the mock device's own boot latency" with
+// a background task that slept a guessed 50ms before appending the boot
+// lines. That's the same class of hazard fixed in
+// `wait_for_matched_binary_line_carries_the_real_raw_hex_via_the_bridge`
+// above (see its root-cause comment): the guess races the actual time it
+// takes to spawn the `serialwrap mcp` subprocess and get `wait_for`'s
+// request all the way to `DeviceQueryState::wait_for`'s "checked" snapshot,
+// and if that ever takes longer than the guess, the append is (correctly,
+// by `wait_for`'s own semantics) treated as pre-existing history and never
+// matches. Confirming the real, already-observable "this client is now
+// actually waiting" event removes the guess entirely — and, as a bonus,
+// makes the "elapsed < 1500ms" check below an even sharper proof of
+// event-driven completion (no artificial latency to hide behind).
 #[tokio::test]
 async fn wait_for_then_tail_completes_with_no_sleep_in_the_agents_tool_trace() {
     let (daemon, recorder) = start_daemon_with_empty_device("dev").await;
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
 
-    // Simulates the mock device's own boot latency -- this sleep lives in
-    // a background task standing in for the *device's* timing, never in
-    // the agent-facing call sequence below (wait_for -> tail), which is
-    // the thing acceptance criterion 1 actually constrains.
     let writer_recorder = Arc::clone(&recorder);
+    let socket_path = daemon.socket_path.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_until_client_is_waiting_for(&socket_path, "dev", "boot ok").await;
         writer_recorder
             .append_rx(b"booting...\nboot ok\nstatus: nominal\n")
             .expect("append boot + status lines");
@@ -389,7 +481,14 @@ async fn tail_result_embeds_the_disconnect_event() {
     recorder
         .append_event("disconnect", serde_json::Map::new())
         .expect("append disconnect event");
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // No sleep needed before the first query against a fresh device:
+    // `append_rx`/`append_event` are synchronous and durable the instant
+    // they return (fsync only affects crash durability, not readability —
+    // see `Recorder`'s module docs), and `QueryRegistry::get_or_spawn`
+    // performs one synchronous `ingest` the very first time any query
+    // touches a device specifically so its very first caller can never
+    // observe less than what's already on disk. The `tail` call below is
+    // that first call.
 
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
@@ -435,7 +534,10 @@ async fn get_config_fetches_the_disconnect_event_separately() {
     recorder
         .append_event("disconnect", serde_json::Map::new())
         .expect("append disconnect event");
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // No sleep needed -- same reasoning as `tail_result_embeds_the_disconnect_event`
+    // above: `get_config`'s `fetch_new_events` issues a `QueryEvents`
+    // request, which is this device's first-ever query and therefore gets
+    // `QueryRegistry::get_or_spawn`'s synchronous first ingest.
 
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
@@ -616,7 +718,9 @@ async fn read_since_cursor_from_tail_continues_without_gap_or_duplicate() {
             .append_rx(format!("line-{i}\n").as_bytes())
             .expect("append rx");
     }
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    // No sleep needed before this first `tail` query -- see
+    // `tail_result_embeds_the_disconnect_event`'s comment on
+    // `get_or_spawn`'s synchronous first ingest.
 
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
@@ -628,11 +732,27 @@ async fn read_since_cursor_from_tail_continues_without_gap_or_duplicate() {
     let cursor = tail_result["cursor"].as_u64().expect("cursor");
 
     recorder.append_rx(b"line-5\n").expect("append rx");
-    tokio::time::sleep(Duration::from_millis(60)).await;
-
-    let read_since_result = mcp
-        .call_tool("read_since", json!({"device": "dev", "cursor": cursor}))
-        .await;
+    // Unlike the first `tail` above, this is *not* the device's first-ever
+    // query, so there's no synchronous ingest to lean on here -- this
+    // relies on the background poller (`query::DEFAULT_POLL_INTERVAL`,
+    // 5ms) to pick up `line-5`. Poll `read_since` until it actually shows
+    // up rather than sleeping a guessed multiple of the poll interval and
+    // hoping: a real device/CI runner's poll cadence isn't something a test
+    // should have to predict.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let read_since_result = loop {
+        let result = mcp
+            .call_tool("read_since", json!({"device": "dev", "cursor": cursor}))
+            .await;
+        if !result["lines"].as_array().unwrap_or(&Vec::new()).is_empty() {
+            break result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "read_since never saw line-5 within 2s of the background poller running"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
     let lines = read_since_result["lines"].as_array().expect("lines array");
     assert_eq!(lines.len(), 1, "lines: {lines:?}");
     assert_eq!(lines[0]["text"], "line-5");
@@ -691,7 +811,9 @@ async fn binary_stream_over_1mb_is_summarized_into_a_capped_tail_response() {
     recorder
         .append_rx(&payload)
         .expect("append 1MB binary payload");
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // No sleep needed before this first `tail` query -- see
+    // `tail_result_embeds_the_disconnect_event`'s comment on
+    // `get_or_spawn`'s synchronous first ingest.
 
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
@@ -741,7 +863,9 @@ async fn one_hundred_thousand_duplicate_lines_fold_with_the_exact_count_via_tail
     for _ in 0..100_000 {
         recorder.append_rx(b"read timeout\n").expect("append rx");
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // No sleep needed before this first `tail` query -- see
+    // `tail_result_embeds_the_disconnect_event`'s comment on
+    // `get_or_spawn`'s synchronous first ingest.
 
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
@@ -794,7 +918,9 @@ async fn cursor_pagination_with_folding_and_truncation_matches_a_whole_read() {
             .append_rx(format!("beta-{i}\n").as_bytes())
             .expect("append rx");
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // No sleep needed before the first `tail` query below -- see
+    // `tail_result_embeds_the_disconnect_event`'s comment on
+    // `get_or_spawn`'s synchronous first ingest.
 
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
@@ -860,6 +986,29 @@ async fn cursor_pagination_with_folding_and_truncation_matches_a_whole_read() {
 
 // ---- wait_for byte fidelity (T3.2's "順帶" fix, issue #13) ----
 
+// ROOT CAUSE (Linux CI flake, issue #39): this test used to spawn a task
+// that slept a guessed 30ms before appending the matching line, racing that
+// guess against however long it actually takes to spawn the `serialwrap
+// mcp` subprocess, complete its IPC round trip to this in-process daemon,
+// and have `protocol::session` dispatch the `wait_for` request —
+// `DeviceQueryState::wait_for` only ever matches lines assembled *from the
+// moment its own "checked" snapshot is taken onward* (by design: see its
+// docs), so if that whole chain took longer than 30ms — plausible on a
+// loaded, shared, debug-build CI runner — the append landed *before* the
+// snapshot, was treated as pre-existing history, and `wait_for` correctly
+// (per its own semantics) never matched it, burning the full `timeout_s`
+// before giving up. That is exactly what was observed:
+// `"result":"timeout","elapsed_ms":3001.3` — a genuine, full-length
+// timeout, not a late arrival.
+//
+// The fix is not a bigger delay (that just narrows the window without
+// closing it) but confirming the real, already-observable event this test
+// actually depends on: `wait_until_client_is_waiting_for` polls the
+// daemon's own `list_clients` bookkeeping (over a separate connection —
+// the MCP bridge doesn't expose that op) until it reports this client
+// genuinely `Activity::WaitingFor` this device/pattern, which can only be
+// true *after* the "checked" snapshot has already been taken (see that
+// function's doc comment for why). Only then do we append.
 #[tokio::test]
 async fn wait_for_matched_binary_line_carries_the_real_raw_hex_via_the_bridge() {
     let (daemon, recorder) = start_daemon_with_empty_device("dev").await;
@@ -872,8 +1021,9 @@ async fn wait_for_matched_binary_line_carries_the_real_raw_hex_via_the_bridge() 
     with_newline.push(b'\n');
 
     let writer_recorder = Arc::clone(&recorder);
+    let socket_path = daemon.socket_path.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        wait_until_client_is_waiting_for(&socket_path, "dev", "^status:").await;
         writer_recorder
             .append_rx(&with_newline)
             .expect("append binary line");

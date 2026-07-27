@@ -387,20 +387,23 @@ async fn s1_boot_banner_is_visible_via_plain_tail_with_no_client_present_during_
     // racing the daemon's own hotplug detection on purpose — S1's literal
     // framing ("插入裝置，不做任何操作"). No client connects at any point
     // during this.
+    //
+    // This used to write from a background thread that owned `device` and
+    // ended with a fixed `thread::sleep(300ms)` "drain barrier" (same
+    // rationale as `serialwrapd`'s own `port_hotplug.rs` S1 test used to
+    // have): dropping `device` closes the PTY master, and a master-side
+    // close can discard whatever the daemon's reader thread hasn't yet
+    // drained out of the kernel's input queue. A fixed sleep only narrows
+    // that race, it doesn't close it. There's no actual need for a
+    // background thread here at all, though: `banner` is a handful of
+    // bytes, far under the PTY's kernel buffer, so the write below can
+    // never block — calling it directly keeps `device` owned by this
+    // function for its entire lifetime (including through the poll loop
+    // below), so there is nothing left to race.
     let banner = script::boot_banner();
-    let writer = {
-        let banner = banner.clone();
-        std::thread::spawn(move || {
-            let result = device.write_device_output(&banner);
-            // Keep the mock device (and its PTY master) alive a little
-            // longer so the daemon's reader thread has time to actually
-            // drain what was written before the fd closes — same
-            // drain-barrier pattern (and rationale) as
-            // `serialwrapd`'s own `port_hotplug.rs` S1 test.
-            std::thread::sleep(Duration::from_millis(300));
-            result
-        })
-    };
+    device
+        .write_device_output(&banner)
+        .expect("write boot banner");
 
     // Wait until the banner is actually durably recorded — inspecting the
     // detector's own `Recorder` handle directly, which is not a wire
@@ -427,10 +430,6 @@ async fn s1_boot_banner_is_visible_via_plain_tail_with_no_client_present_during_
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    writer
-        .join()
-        .expect("writer thread panicked")
-        .expect("write boot banner");
 
     // Only now — after the banner is already durably recorded, with no
     // client having connected at all up to this point — bind the protocol
