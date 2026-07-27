@@ -13,11 +13,25 @@ use rust_embed::RustEmbed;
 #[folder = "../../webui/dist"]
 struct Assets;
 
+/// Whether `path`'s last segment has a file extension. Vite's build always
+/// gives real static assets a hashed extension (`index-Hh0iSpFP.js`), so a
+/// missing path that still looks like a filename (`/assets/old-chunk.js`
+/// after a rebuild renamed it, or a plain typo) is almost certainly a
+/// genuine 404 — not an SPA client-side route, which this task's frontend
+/// doesn't have yet but T5.2+'s might.
+fn looks_like_a_static_file(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|last| last.contains('.'))
+}
+
 /// Fallback handler for any request no other route matched: serves the
 /// embedded asset at the request path, or `index.html` for anything that
-/// looks like an SPA client-side route (no file extension) — but never for
-/// `/api/*`, where a miss should stay a `404`, not silently turn into the
-/// app shell.
+/// looks like an SPA client-side route (no file extension in the last path
+/// segment) — but never for `/api/*` or a missing extensioned path (e.g. a
+/// stale `/assets/*.js` reference), where a miss should stay a `404`, not
+/// silently turn into the app shell (which the browser would then choke on
+/// trying to parse as JS/CSS).
 pub async fn serve_asset(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -31,7 +45,7 @@ pub async fn serve_asset(uri: Uri) -> Response {
             .into_response();
     }
 
-    if uri.path().starts_with("/api/") {
+    if uri.path().starts_with("/api/") || looks_like_a_static_file(path) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 
@@ -62,5 +76,34 @@ mod tests {
             Assets::get("index.html").is_some(),
             "webui/dist must contain index.html (see build.rs and webui/README.md)"
         );
+    }
+
+    #[test]
+    fn extensioned_paths_are_not_treated_as_spa_routes() {
+        assert!(looks_like_a_static_file("assets/index-Hh0iSpFP.js"));
+        assert!(looks_like_a_static_file("assets/old-chunk-1234.js"));
+        assert!(looks_like_a_static_file("favicon.ico"));
+    }
+
+    #[test]
+    fn extensionless_paths_do_not_look_like_static_files() {
+        assert!(!looks_like_a_static_file("devices/42"));
+        assert!(!looks_like_a_static_file(""));
+    }
+
+    #[tokio::test]
+    async fn a_missing_extensioned_asset_404s_instead_of_falling_back_to_index_html() {
+        use axum::http::StatusCode;
+
+        let response = serve_asset("/assets/does-not-exist-1234.js".parse().unwrap()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_extensionless_unknown_path_falls_back_to_index_html() {
+        use axum::http::StatusCode;
+
+        let response = serve_asset("/devices/42".parse().unwrap()).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

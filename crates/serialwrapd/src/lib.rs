@@ -54,13 +54,21 @@ pub async fn run() -> std::io::Result<()> {
     ));
     let handle = detector.spawn();
 
+    // Bind the web listener *before* `protocol::server::bind`: the UDS
+    // bind is destructive — it unconditionally unlinks whatever socket
+    // file is already at that path, live daemon or not (see that
+    // function's own doc comment) — while a TCP bind failure just fails.
+    // Binding the safe one first means an accidental second `serialwrap
+    // daemon` (its web port already taken by the first instance) exits
+    // here, before ever touching the first instance's socket, instead of
+    // unlinking a socket a perfectly healthy daemon is still listening on.
+    let web_listener = tokio::net::TcpListener::bind(web::web_addr()).await?;
+
     let socket_path = protocol::default_socket_path()?;
     let listener = protocol::server::bind(&socket_path)?;
     let shared = Arc::new(
         protocol::Shared::new(backend, env!("CARGO_PKG_VERSION")).with_gate(production_gate()),
     );
-
-    let web_listener = tokio::net::TcpListener::bind(web::web_addr()).await?;
     let web_shared = Arc::clone(&shared);
 
     // Both futures loop forever absent a fatal error of their own kind

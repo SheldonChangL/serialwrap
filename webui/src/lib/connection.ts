@@ -138,12 +138,23 @@ export class Connection {
   }
 
   private checkStale(): void {
+    let becameStale = false;
     this.info.update((i) => {
       if (i.state !== "open" || i.lastMessageAt === null) return i;
       if (Date.now() - i.lastMessageAt > STALE_AFTER_MS) {
+        becameStale = true;
         return { ...i, state: "stale" };
       }
       return i;
     });
+    if (becameStale) {
+      // Labeling the UI "stale" isn't enough on its own: nothing else
+      // ever tells *this* socket to give up, so without forcing it closed
+      // here the pill would say "reconnecting" forever while the old,
+      // silently-wedged socket just sits there. Closing it fires the
+      // browser's `close` event, which routes through `handleDisconnect`
+      // exactly like any other drop and actually schedules a reconnect.
+      this.socket?.close();
+    }
   }
 }
