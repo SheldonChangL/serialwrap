@@ -33,8 +33,13 @@ mock-device = { path = "../mock-device" }
 tempfile = "3"
 # Send a real SIGINT to a spawned `serialwrap tail -f` child process, to
 # test the Ctrl-C acceptance criterion (T1.5) against the actual compiled
-# binary rather than an in-process approximation.
-nix = { workspace = true, features = ["signal"] }
+# binary rather than an in-process approximation. `term` adds
+# `openpty`/termios, used by T2.1's own CLI-level write tests to build a
+# raw PTY pair directly (same reasoning as `serialwrapd`'s own
+# `[dev-dependencies]` comment on why: byte-exact per-line-ending
+# assertions need the PTY master read directly, which `mock-device`'s
+# line-based command-responder API can't give a test).
+nix = { workspace = true, features = ["signal", "term"] }
 # Spawn the compiled `serialwrap` binary as a child process from
 # integration tests (T1.5) — the base `[dependencies]` tokio feature set
 # doesn't include `process`, since production `devices`/`tail`/`daemon`

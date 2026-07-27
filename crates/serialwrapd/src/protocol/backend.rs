@@ -53,6 +53,17 @@ pub trait DeviceBackend: Send + Sync {
     ) -> io::Result<()>;
     fn dtr_pulse(&self, id: &DeviceId, duration: Duration, changed_by: &str) -> io::Result<()>;
     fn error_counts(&self, id: &DeviceId) -> io::Result<ErrorCounts>;
+    /// Write `data` to the device's physical port (`TASKS.md` T2.1, issue
+    /// #8). Callers (see `protocol::session`'s `Request::Write` handler)
+    /// are responsible for the write-gate decision *before* ever calling
+    /// this — by the time this runs, the request has already been
+    /// determined allowed (today: human clients only, per the
+    /// Security-model wiki's policy table; T4.1's rule engine is what
+    /// decides for `agent`/`tool` later). This trait method only ever
+    /// moves bytes; it never records a `tx` event itself (the caller does,
+    /// since only the caller knows the requesting client's identity and
+    /// the gate decision that authorized the write).
+    fn write_bytes(&self, id: &DeviceId, data: &[u8]) -> io::Result<()>;
 }
 
 /// Merge a partial JSON config patch onto `current`, producing a new,
@@ -144,6 +155,53 @@ impl DeviceBackend for LiveBackend {
     fn error_counts(&self, id: &DeviceId) -> io::Result<ErrorCounts> {
         self.config_api.error_counts(id)
     }
+
+    /// # Known limitation: a second, independent fd
+    ///
+    /// This task's scope deliberately excludes touching `port.rs` (see
+    /// `TASKS.md` T2.1's boundaries), so this cannot reach into
+    /// `PortConfigApi`'s already-open, shared fd (the one
+    /// `HotplugDetector`'s reader thread and every `set_dtr`/`dtr_pulse`
+    /// ioctl already share). Instead this opens a *fresh*, independent,
+    /// write-only fd at the device's current path — the same thing
+    /// `mock_device::MockDevice::open_slave`'s docs describe as "as the
+    /// daemon would when it opens a device node" — writes `data`, and lets
+    /// it close again. This is safe (a tty's termios/baud/parity is a
+    /// property of the line discipline itself, not of any one fd, so a
+    /// freshly opened fd inherits whatever the shared fd already
+    /// configured) but not ideal: a follow-up should instead expose the
+    /// already-open fd through `PortConfigApi`, the same way
+    /// `set_dtr`/`dtr_pulse` already do, and drop this second-fd approach.
+    fn write_bytes(&self, id: &DeviceId, data: &[u8]) -> io::Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let summary = self
+            .config_api
+            .list_devices()
+            .into_iter()
+            .find(|d| &d.id == id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("no such device: {}", id.0))
+            })?;
+        if !summary.connected {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("{} is not currently attached", id.0),
+            ));
+        }
+        let path = summary.path.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("{} has no known device path", id.0),
+            )
+        })?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&path)?;
+        file.write_all(data)
+    }
 }
 
 /// Test-only in-memory [`DeviceBackend`]. Not `#[cfg(test)]`-gated for the
@@ -153,6 +211,8 @@ impl DeviceBackend for LiveBackend {
 pub mod testing {
     use super::*;
     use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::Write as _;
     use std::sync::Mutex;
 
     struct Entry {
@@ -160,6 +220,12 @@ pub mod testing {
         config: PortConfig,
         path: Option<std::path::PathBuf>,
         connected: bool,
+        /// A writable fd a test registered via [`TestBackend::register_writer`]
+        /// — e.g. the slave side of a raw PTY pair, so a write-path test can
+        /// read back exactly what `write_bytes` sent from the pair's master
+        /// side. `None` until a test opts in; `write_bytes` errors clearly
+        /// rather than silently discarding bytes when it is.
+        writer: Option<Mutex<File>>,
     }
 
     /// A device registry with no real hardware underneath: tests
@@ -189,8 +255,25 @@ pub mod testing {
                         config: PortConfig::default(),
                         path: None,
                         connected: true,
+                        writer: None,
                     },
                 );
+        }
+
+        /// Give `id` a real fd to write to, so `write_bytes` has somewhere
+        /// to send bytes a test can read back independently (e.g. a raw
+        /// PTY pair's slave side, with the test reading the master side) —
+        /// `TASKS.md` T2.1's byte-exact acceptance criteria need this. A
+        /// no-op if `id` was never `register`ed.
+        pub fn register_writer(&self, id: &DeviceId, writer: File) {
+            if let Some(entry) = self
+                .devices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(id)
+            {
+                entry.writer = Some(Mutex::new(writer));
+            }
         }
 
         pub fn set_connected(&self, id: &DeviceId, connected: bool) {
@@ -329,6 +412,26 @@ pub mod testing {
                 ));
             }
             Ok(ErrorCounts::Unavailable)
+        }
+
+        fn write_bytes(&self, id: &DeviceId, data: &[u8]) -> io::Result<()> {
+            let devices = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = devices.get(id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("unknown device {}", id.0))
+            })?;
+            if !entry.connected {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("device {} is not connected", id.0),
+                ));
+            }
+            match &entry.writer {
+                Some(w) => w.lock().unwrap_or_else(|e| e.into_inner()).write_all(data),
+                None => Err(io::Error::other(format!(
+                    "no writer registered for test device {} (see TestBackend::register_writer)",
+                    id.0
+                ))),
+            }
         }
     }
 }

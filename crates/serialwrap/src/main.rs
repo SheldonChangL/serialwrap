@@ -34,14 +34,14 @@ enum Command {
     /// Tail a device's record stream (see TASKS.md T1.5).
     Tail(cli::tail::TailArgs),
     /// Write bytes to a device, subject to the write gate (see TASKS.md T2.1).
-    Write,
+    Write(cli::write::WriteArgs),
     /// Take a temporary lease and run an external command against the device
     /// (see TASKS.md T2.2).
     Run,
     /// Read or update per-device configuration (see TASKS.md T2.3).
-    Config,
+    Config(cli::config::ConfigArgs),
     /// List, kick, or demote connected clients (see TASKS.md T2.3).
-    Clients,
+    Clients(cli::clients::ClientsArgs),
     /// Export recorded data as jsonl/txt/bin (see TASKS.md T2.4).
     Export,
     /// Query the audit view over the record stream (see TASKS.md T4.3).
@@ -58,10 +58,10 @@ async fn main() -> std::io::Result<()> {
         Command::Mcp => cli::dispatch(mcp::run().await),
         Command::Devices => cli::dispatch(cli::devices::run().await),
         Command::Tail(args) => cli::dispatch(cli::tail::run(args).await),
-        Command::Write => stub("write", "T2.1"),
+        Command::Write(args) => cli::dispatch(cli::write::run(args).await),
         Command::Run => stub("run", "T2.2"),
-        Command::Config => stub("config", "T2.3"),
-        Command::Clients => stub("clients", "T2.3"),
+        Command::Config(args) => cli::dispatch(cli::config::run(args).await),
+        Command::Clients(args) => cli::dispatch(cli::clients::run(args).await),
         Command::Export => stub("export", "T2.4"),
         Command::Audit => stub("audit", "T4.3"),
         Command::Approvals => stub("approvals", "T4.2"),
