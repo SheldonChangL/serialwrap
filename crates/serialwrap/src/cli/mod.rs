@@ -23,6 +23,7 @@ pub mod error;
 pub mod export;
 pub mod render;
 pub mod run;
+pub mod service;
 pub mod tail;
 pub mod time;
 pub mod write;

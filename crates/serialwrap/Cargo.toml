@@ -6,6 +6,35 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# `cargo deb -p serialwrap` (T6.1, issue #23): Linux packaging alternative
+# to the install script (`packaging/linux/install.sh`). Asset paths are
+# resolved relative to this crate's own manifest directory (cargo-deb's own
+# convention), hence the `../../` back to the workspace root for the
+# shared `target/` dir and the udev rule template that lives under
+# `packaging/`. The udev rule installs to `lib/udev/rules.d/` (not
+# `etc/udev/rules.d/`) per Debian policy: packages ship rules under `lib/`,
+# leaving `etc/udev/rules.d/` free for local admin overrides.
+[package.metadata.deb]
+maintainer = "SheldonChangL <noreply@users.noreply.github.com>"
+copyright = "2026, SheldonChangL"
+extended-description = """\
+A serial port broker for firmware development: one daemon owns the port \
+and records continuously, while humans, AI agents (via MCP), and flashing \
+tools all attach as clients. See \
+https://github.com/SheldonChangL/serialwrap for setup and usage."""
+section = "electronics"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["../../target/release/serialwrap", "usr/bin/", "755"],
+    [
+        "../../packaging/linux/60-serialwrap.rules",
+        "lib/udev/rules.d/60-serialwrap.rules",
+        "644",
+    ],
+    ["../../README.md", "usr/share/doc/serialwrap/README.md", "644"],
+]
+
 [dependencies]
 serialwrapd = { path = "../serialwrapd" }
 wrap-proto = { path = "../wrap-proto" }
@@ -26,6 +55,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # device bytes for byte-exact hex-preview rendering (`cli::render`) — same
 # version `serialwrapd` itself uses to encode it.
 base64 = "0.22"
+# Platform home/config-dir resolution for `service install`/`uninstall`
+# (T6.1, issue #23): `~/Library/LaunchAgents` on macOS, `$XDG_CONFIG_HOME`
+# (or `~/.config`) on Linux — same crate and version `serialwrapd` already
+# uses for its own data/config dir resolution (`recorder::default_data_dir`,
+# `gate::rules::default_rules_path`), kept consistent rather than adding a
+# second home-dir-resolution dependency.
+directories = "5"
 
 [dev-dependencies]
 # Test-only PTY fixture (see TASKS.md T0.2), used by this crate's own
