@@ -22,9 +22,37 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap = { version = "4", features = ["derive"] }
 
-# Reserved for later milestones (T1.3 port I/O, T5.1 web GUI, T6.1 packaging).
-# Listed here now so the version is pinned workspace-wide, but no crate
-# depends on them yet at this skeleton stage.
-serialport = "4"
+# Reserved for later milestones (T5.1 web GUI, T6.1 packaging). Listed here
+# now so the version is pinned workspace-wide, but no crate depends on them
+# yet at this skeleton stage.
 axum = "0.8"
 rust-embed = "8"
+
+# Used by serialwrapd (T1.1) for `available_ports()` enumeration.
+# `default-features = false` drops the "libudev" feature: on Linux that
+# feature links against libudev and requires the `libudev-dev` system
+# package, which is not guaranteed present on a bare CI image (and isn't
+# part of this project's install docs). Without it, serialport's Linux
+# `available_ports()` falls back to its pure-`/sys/class/tty` scan
+# (serialport-rs src/posix/enumerate.rs's plain `cfg(target_os = "linux")`
+# branch), which reads the same vid/pid/serial_number/manufacturer/product
+# fields straight out of sysfs, no libudev needed. This is *not* strictly
+# equivalent, though: the libudev path filters candidate ports by
+# probe-opening `serial8250` nodes and excludes some subsystems (`amba`,
+# `pnp`, `serial-base`) the sysfs fallback's `_ => None` unknown-subsystem
+# arm doesn't special-case identically. In practice this means the sysfs
+# path may enumerate a few more onboard non-USB UART nodes (e.g.
+# `/dev/ttyS*`) than the libudev path would on a given machine. Each such
+# node just gets its own path-based (not USB-based) device id — never a
+# crash or wrong data — so this is an accepted, documented tradeoff against
+# not needing the `libudev-dev` system package, not a claim of identical
+# enumeration output. macOS's IOKit-based enumeration is unaffected either
+# way (not gated by this feature).
+serialport = { version = "4", default-features = false }
+
+# Safe wrappers over poll()/termios, used by serialwrapd's per-device
+# reader thread (T1.1: a stop-flag-checking poll loop, not a plain blocking
+# read, is what lets a superseded connection be told to stop and actually
+# join before a new one opens the same device) and already used the same
+# way by mock-device's own responder thread.
+nix = { version = "0.31", features = ["poll"] }
