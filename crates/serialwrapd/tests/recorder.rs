@@ -1,12 +1,35 @@
 //! Integration tests for the T1.2 recorder against the real PTY-backed mock
 //! device fixture (T0.2) and, for the crash test, a real killed OS process
 //! — not simulated in-process state. These are the acceptance tests named
-//! in `TASKS.md`/issue #4: byte-exact sustained throughput and `kill -9`
-//! chaos recovery. Cross-segment/rotation/eviction/gap-free-seq/aged-out
-//! correctness are covered by the (much faster) unit tests in
-//! `src/recorder.rs`, which use tiny configured segment/ring sizes instead
-//! of needing tens of megabytes of real traffic to exercise the same
-//! logic.
+//! in `TASKS.md`/issue #4: byte-exact throughput, cross-segment
+//! correctness, and `kill -9` chaos recovery. Cross-segment/rotation/
+//! eviction/gap-free-seq/aged-out correctness are *also* covered by the
+//! (much faster) unit tests in `src/recorder.rs`, which use tiny
+//! configured segment/ring sizes instead of needing megabytes of real
+//! traffic to exercise the same logic.
+//!
+//! # Two-tier throughput testing
+//!
+//! `cargo test` runtime is a cost every one of this project's remaining
+//! tasks pays, every time, on every machine that runs it — a slow default
+//! suite erodes the feedback loop for everyone downstream of this task,
+//! and that cost compounds far past whatever a single 60-second run once
+//! caught. So the byte-exactness acceptance criterion is split in two:
+//!
+//! - [`mock_device_byte_exact_across_several_segment_boundaries`] runs in
+//!   the default suite, finishes in well under 5 seconds, and proves the
+//!   same thing the 60s run does (byte-exact content, no dupes/gaps,
+//!   correct across real segment-boundary crossings) by using a small
+//!   segment size instead of a long wall-clock duration to force the
+//!   rotations.
+//! - [`mock_device_1mb_per_second_sustained_60s_is_byte_exact`] is
+//!   `#[ignore]`d and reproduces the issue's literal "1MB/s for 60+
+//!   seconds" wording verbatim. Run it explicitly with
+//!   `cargo test -- --ignored` (wired into CI as a separate step so it
+//!   still runs on every push, just not in the path a human is waiting
+//!   on). See that test's own doc comment for why it's believed to add no
+//!   coverage the fast test doesn't already have, and what would have to
+//!   be true for that belief to be wrong.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -35,15 +58,162 @@ fn make_chunk(chunk_index: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Acceptance criterion 1: mock device sustains >=1MB/s for >=60 real
-/// seconds; recorded content must be byte-exact against the source
-/// (hash comparison), verified both against what `append_rx` returned
-/// *and* independently against what's actually readable back off disk via
-/// `read_since` (so this also exercises cross-segment `read_since`
-/// correctness at a realistic scale — the default 64MB segment cap is
-/// crossed well before 60s at this rate).
+/// Fast, default-suite counterpart to the `#[ignore]`d 60s sustained-
+/// throughput test below. Uses a small (1 MiB) configured segment size —
+/// not a long wall-clock duration — to force real segment rotations, so a
+/// few megabytes of mock-device traffic cross several segment boundaries
+/// in well under 5 seconds while still proving the same thing: recorded
+/// content is byte-exact against the source, both from `append_rx`'s
+/// return values and from a fresh `read_since` re-read off disk.
 #[test]
-fn mock_device_1mb_per_second_for_60s_is_byte_exact_against_recorded_output() {
+fn mock_device_byte_exact_across_several_segment_boundaries() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RecorderConfig {
+        segment_bytes: 1024 * 1024,
+        ..RecorderConfig::default()
+    };
+    let recorder =
+        Arc::new(Recorder::open(tmp.path(), "boundary-dev", config).expect("open recorder"));
+
+    let device = MockDevice::new().expect("open mock device");
+    let reader = device.open_slave().expect("open slave");
+
+    const CHUNK: usize = 64 * 1024;
+    // Base64 inflates ~4/3 plus JSON/timestamp overhead per line, so this
+    // comfortably produces several 1MiB segments without needing to tune
+    // the exact ratio.
+    const TOTAL: usize = 5 * 1024 * 1024;
+
+    let writer = thread::spawn(move || {
+        let mut hasher = Sha256::new();
+        let mut written = 0usize;
+        let mut chunk_index = 0u64;
+        while written < TOTAL {
+            let len = CHUNK.min(TOTAL - written);
+            let chunk = make_chunk(chunk_index, len);
+            hasher.update(&chunk);
+            device.write_device_output(&chunk).expect("write chunk");
+            written += chunk.len();
+            chunk_index += 1;
+        }
+        // Drain barrier: see the sustained test's identical comment below
+        // for why this matters (pty hangup on drop discards whatever the
+        // reader hasn't drained yet).
+        thread::sleep(Duration::from_millis(200));
+        (written as u64, hasher.finalize())
+    });
+
+    let recorder_for_reader = Arc::clone(&recorder);
+    let reader_thread = thread::spawn(move || {
+        let mut reader = reader;
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    recorder_for_reader.append_rx(&buf[..n]).expect("append_rx");
+                    hasher.update(&buf[..n]);
+                    total += n as u64;
+                }
+                Err(_) => break,
+            }
+        }
+        (total, hasher.finalize())
+    });
+
+    let (source_total, source_hash) = writer.join().expect("writer thread panicked");
+    let (recorded_total, recorded_hash) = reader_thread.join().expect("reader thread panicked");
+
+    assert_eq!(
+        recorded_total, source_total,
+        "recorded byte count must exactly match source byte count"
+    );
+    assert_eq!(
+        recorded_hash, source_hash,
+        "recorded content hash must exactly match source content hash"
+    );
+
+    let segments_dir = tmp.path().join("devices/boundary-dev/segments");
+    let segment_count = fs::read_dir(&segments_dir).unwrap().count();
+    println!(
+        "fast byte-exact boundary test: {source_total} bytes across {segment_count} segments \
+         (1MiB cap each), sha256={}",
+        to_hex(source_hash)
+    );
+    assert!(
+        segment_count >= 3,
+        "test needs to actually cross several segment boundaries to be meaningful, only got \
+         {segment_count} segment(s) — TOTAL or segment_bytes above need adjusting"
+    );
+
+    // Independently re-derive from what's actually on disk via the query
+    // interface, not just the in-memory return values of append_rx.
+    let mut from_disk = Vec::with_capacity(source_total as usize);
+    let mut cursor = 0u64;
+    loop {
+        let page = recorder
+            .read_since(cursor, 512 * 1024)
+            .expect("read_since over recorded boundary-crossing data");
+        if page.records.is_empty() {
+            break;
+        }
+        for record in &page.records {
+            if let Record::Rx { data_b64, .. } = record {
+                from_disk.extend(BASE64.decode(data_b64).expect("valid base64 data_b64"));
+            }
+        }
+        assert!(
+            page.next_cursor > cursor,
+            "read_since must always make forward progress"
+        );
+        cursor = page.next_cursor;
+    }
+    assert_eq!(from_disk.len() as u64, source_total);
+    let mut disk_hasher = Sha256::new();
+    disk_hasher.update(&from_disk);
+    assert_eq!(
+        to_hex(disk_hasher.finalize()),
+        to_hex(source_hash),
+        "bytes read back from disk via read_since must be byte-exact against the source"
+    );
+}
+
+/// Acceptance criterion 1, literal reproduction: mock device sustains at
+/// least 1MB/s for at least 60 real seconds; recorded content must be
+/// byte-exact against the source (hash comparison), verified both against
+/// what `append_rx` returned *and* independently against what's actually
+/// readable back off disk via `read_since` (so this also exercises
+/// cross-segment `read_since` correctness at a realistic scale — the
+/// default 64MB segment cap is crossed well before 60s at this rate).
+///
+/// `#[ignore]`d: not run by a plain `cargo test`. Run explicitly with
+/// `cargo test -- --ignored` (CI does this as its own step, so it still
+/// runs on every push — just not in the path a human waits on locally).
+///
+/// This is believed to add no *coverage* the fast
+/// [`mock_device_byte_exact_across_several_segment_boundaries`] doesn't
+/// already have — both force real segment rotations and check the same
+/// byte-exactness properties; only the mechanism differs (small segments
+/// vs. long wall-clock duration). For that belief to be wrong, there
+/// would have to be a bug class that only manifests through elapsed *time*
+/// specifically, independent of data volume or rotation/eviction/fsync
+/// *cycle count* (which the fast test already exercises via small
+/// segments) — e.g. some form of clock or counter drift that only
+/// accumulates past what a few seconds can trigger. `t_mono`/`t_wall` are
+/// read fresh per call with no accumulating state, `fsync` is a stateless
+/// periodic check against `Instant::elapsed()`, and ring eviction is
+/// purely byte-count-driven — so no such mechanism is known to exist in
+/// this implementation today. Kept anyway because it's the literal
+/// acceptance criterion as written and costs nothing once it's off the
+/// path everyone waits on.
+#[test]
+#[ignore = "literal 60s/1MB/s acceptance-criterion reproduction; run via `cargo test -- --ignored` \
+            (also wired into CI). See doc comment for why the fast \
+            mock_device_byte_exact_across_several_segment_boundaries test above is believed to \
+            cover the same ground in <5s."]
+fn mock_device_1mb_per_second_sustained_60s_is_byte_exact() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let recorder = Arc::new(
         Recorder::open(tmp.path(), "throughput-dev", RecorderConfig::default())

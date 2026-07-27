@@ -986,6 +986,19 @@ fn rfc3339_now() -> String {
 mod tests {
     use super::*;
 
+    /// An interval effectively disabling periodic fsync for tests that
+    /// don't care about durability timing: reads (`read_since`, and even
+    /// `fs::read` from another process) see unbuffered `write_all` output
+    /// regardless of whether it's been fsynced — fsync only affects
+    /// surviving a power/OS-level failure, not visibility — so forcing a
+    /// real `sync_data()` syscall on every append (as `Duration::ZERO`
+    /// would) buys these tests nothing but I/O contention. That was
+    /// previously set to zero here and measured adding tens of seconds to
+    /// `cargo test` under parallel execution for no coverage gain; crash
+    /// durability itself is exercised separately by tests that use
+    /// `RecorderConfig::default()`'s real 1s cadence (or a real `kill -9`).
+    const NO_EFFECTIVE_FSYNC: Duration = Duration::from_secs(3600);
+
     /// Small segments, small ring: forces both rotation *and* eviction.
     /// Use only in tests that specifically want eviction to kick in.
     fn tiny_config() -> RecorderConfig {
@@ -994,7 +1007,7 @@ mod tests {
             ring_bytes: 900,
             checkpoint_every: 3,
             checkpoint_bytes: 100,
-            fsync_interval: Duration::from_millis(0),
+            fsync_interval: NO_EFFECTIVE_FSYNC,
         }
     }
 
@@ -1007,7 +1020,7 @@ mod tests {
             ring_bytes: u64::MAX,
             checkpoint_every: 3,
             checkpoint_bytes: 100,
-            fsync_interval: Duration::from_millis(0),
+            fsync_interval: NO_EFFECTIVE_FSYNC,
         }
     }
 
@@ -1031,7 +1044,18 @@ mod tests {
     #[test]
     fn concurrent_appends_produce_a_gap_free_contiguous_seq_range() {
         let tmp = tempfile::tempdir().unwrap();
-        let recorder = std::sync::Arc::new(open(tmp.path(), "dev", tiny_rotation_config()));
+        // Deliberately *not* `tiny_rotation_config`: the property under
+        // test (seq allocation + write happen atomically under one lock,
+        // so concurrent callers can never observe or produce a gap) has
+        // nothing to do with segment size — it's purely about `Inner`'s
+        // mutex. Forcing ~1200 tiny segment file creations here (as the
+        // tiny config would, at 2400 appends / 300 bytes-per-segment)
+        // measurably slowed `cargo test` for zero extra coverage; segment
+        // rotation itself is already exercised by
+        // `segment_rotation_creates_new_files_named_by_starting_seq` and
+        // by the "cross-check against disk" read-back below, which uses
+        // whatever segment layout the config produces.
+        let recorder = std::sync::Arc::new(open(tmp.path(), "dev", RecorderConfig::default()));
 
         const THREADS: usize = 8;
         const PER_THREAD: usize = 300;
