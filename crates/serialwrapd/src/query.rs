@@ -234,6 +234,17 @@ impl StreamItem<'_> {
 /// single background consumer of [`Recorder::read_since`]. See the module
 /// docs for why there is exactly one of these per device, not one per
 /// connection.
+///
+/// # Known limitation: unbounded in-memory growth
+///
+/// `lines`/`events` only ever grow — nothing here mirrors the recorder's
+/// own ring eviction (`Recorder`'s on-disk segments are bounded by
+/// `RecorderConfig::ring_bytes`; this in-memory cache is not). A daemon
+/// left running for a very long time against a chatty device will grow
+/// this cache indefinitely. Acceptable for this task's scope (protocol
+/// correctness, not production memory bounding) but worth trimming to a
+/// bounded suffix window (or dropping the cache and re-deriving from disk
+/// on `DataAgedOut`) before this ships for real long-lived daemons.
 pub struct DeviceQueryState {
     lines: Mutex<Vec<AssembledLine>>,
     events: Mutex<Vec<OobRecord>>,

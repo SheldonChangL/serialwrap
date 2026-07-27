@@ -707,9 +707,10 @@ async fn dispatch(
                                 "push": true,
                                 "lines": drained.lines.iter().map(line_json).collect::<Vec<_>>(),
                                 "events": drained.events.iter().map(oob_json).collect::<Vec<_>>(),
-                            });
-                            shared.clients.add_bytes_out(client_id, 0);
-                            if tx.send(push.to_string()).is_err() {
+                            })
+                            .to_string();
+                            shared.clients.add_bytes_out(client_id, push.len() as u64);
+                            if tx.send(push).is_err() {
                                 return;
                             }
                             continue;
