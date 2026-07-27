@@ -1,0 +1,19 @@
+[package]
+name = "mock-device"
+description = "PTY-backed mock serial device for tests. Test-only fixture: never a dependency of the serialwrap release binary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Safe wrappers over openpty/termios/poll. Used directly (not just in
+# dev-dependencies of this crate) because the whole point of this crate is
+# the PTY plumbing; it is this crate itself that only ever gets pulled in
+# as a *dev-dependency* by other workspace members (see T0.2 test fixture
+# design notes in TASKS.md).
+nix = { version = "0.31", features = ["term", "poll", "fs", "process"] }
+# Only used for `ttyname_r`, to resolve the slave PTY's filesystem path from
+# its already-open fd (portable across macOS/Linux; nix's own `ptsname`
+# helper is tied to the `posix_openpt` flow, not the `openpty()` one we use).
+libc = "0.2"

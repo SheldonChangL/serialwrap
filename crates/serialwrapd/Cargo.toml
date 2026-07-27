@@ -8,3 +8,8 @@ repository.workspace = true
 
 [dependencies]
 wrap-proto = { path = "../wrap-proto" }
+
+[dev-dependencies]
+# Test-only PTY fixture (see TASKS.md T0.2). Pulled in as a dev-dependency
+# only, so it never links into the `serialwrap` release binary.
+mock-device = { path = "../mock-device" }
