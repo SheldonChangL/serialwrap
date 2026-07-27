@@ -21,6 +21,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Application Support/serialwrap`) — recorder callers use this by default;
 # tests always inject an explicit tempdir instead (T1.2).
 directories = "5"
+# Device enumeration (vid/pid/serial_number, per-platform port paths) for
+# hotplug detection (T1.1). See the workspace `[workspace.dependencies]`
+# entry for why `default-features` is disabled.
+serialport = { workspace = true }
+# `poll()` for the per-device reader thread's stop-flag-checking loop
+# (T1.1) — same pattern mock-device's own responder thread already uses.
+nix = { workspace = true }
 
 [dev-dependencies]
 # Test-only PTY fixture (see TASKS.md T0.2). Pulled in as a dev-dependency
