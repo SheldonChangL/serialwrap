@@ -424,6 +424,24 @@ mod tests {
         );
     }
 
+    /// Pins the path the plist's StandardOutPath/StandardErrorPath resolve
+    /// against. Also the reason `macos_log_dir` is exercised on every
+    /// platform rather than only on macOS: under `--all-targets` on Linux
+    /// its `cfg(test)` arm compiles it in, and with no caller it tripped
+    /// `-D dead-code` in CI while passing locally on macOS, where
+    /// `install` uses it. Covering it here fixes the warning by closing
+    /// the real gap — the function had no test at all — instead of
+    /// narrowing the cfg to hide it.
+    #[test]
+    fn macos_log_dir_is_under_library_logs() {
+        let dir = macos_log_dir(Path::new("/Users/alice"));
+        assert_eq!(dir, Path::new("/Users/alice/Library/Logs/serialwrap"));
+
+        let plist = launchd_plist(Path::new("/bin/serialwrap"), &dir);
+        assert!(plist.contains("/Users/alice/Library/Logs/serialwrap/daemon.log"));
+        assert!(plist.contains("/Users/alice/Library/Logs/serialwrap/daemon.err.log"));
+    }
+
     #[test]
     fn write_unit_file_creates_parent_directories() {
         let dir = tempfile::tempdir().expect("tempdir");
