@@ -430,42 +430,47 @@ fn boot_banner_first_line_is_captured_end_to_end_via_mock_device() {
 
     // The device "powers on" and prints its banner immediately — racing
     // the daemon's own detection on purpose, exactly like a real replug.
+    //
+    // ROOT CAUSE this refactor removes (same class as issue #39's
+    // `mock_device.rs` flake): the writer used to own `device` outright and
+    // end with a fixed `thread::sleep(300ms)` "drain barrier", because
+    // dropping `device` closes the PTY master, and a master-side close can
+    // discard whatever the detector's own reader thread hasn't yet drained
+    // out of the kernel's input queue — a fixed sleep only makes that race
+    // *less likely*, it doesn't remove it. The poll loop below already
+    // waits for the real, observable event that makes it safe to let
+    // `device` go: bytes actually landing in `handle.recorders()` can only
+    // happen after the detector's reader has already pulled them off the
+    // wire, so once that loop finds them there is nothing left in the
+    // kernel queue that dropping `device` could lose. `thread::scope` keeps
+    // `device` borrowed (not owned) by the writer, so it stays alive for as
+    // long as this whole function runs — including through the entire poll
+    // loop below — regardless of how long the write itself takes.
     let banner = script::boot_banner();
-    let writer = {
-        let banner = banner.clone();
-        thread::spawn(move || {
-            let result = device.write_device_output(&banner);
-            // Drain barrier: `device` (and its PTY master) drops the
-            // instant this closure returns, and a pty hangup discards
-            // whatever's still sitting in the kernel's input queue rather
-            // than letting the reader (our detector's background thread)
-            // drain it first — see the identical comment in
-            // `tests/recorder.rs`'s sustained-throughput test.
-            thread::sleep(Duration::from_millis(300));
-            result
-        })
-    };
-
-    let deadline = Instant::now() + Duration::from_secs(5);
     let mut collected = Vec::new();
-    while Instant::now() < deadline {
-        let recorders = handle.recorders();
-        let snapshot = {
-            let guard = recorders.lock().unwrap();
-            guard.get(&id).map(|r| rx_bytes(r))
-        };
-        if let Some(bytes) = snapshot {
-            if bytes.len() >= banner.len() {
-                collected = bytes;
-                break;
+    thread::scope(|scope| {
+        let writer = scope.spawn(|| device.write_device_output(&banner));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let recorders = handle.recorders();
+            let snapshot = {
+                let guard = recorders.lock().unwrap();
+                guard.get(&id).map(|r| rx_bytes(r))
+            };
+            if let Some(bytes) = snapshot {
+                if bytes.len() >= banner.len() {
+                    collected = bytes;
+                    break;
+                }
             }
+            thread::sleep(Duration::from_millis(5));
         }
-        thread::sleep(Duration::from_millis(5));
-    }
-    writer
-        .join()
-        .expect("writer thread panicked")
-        .expect("write boot banner");
+        writer
+            .join()
+            .expect("writer thread panicked")
+            .expect("write boot banner");
+    });
     handle.stop();
 
     assert!(

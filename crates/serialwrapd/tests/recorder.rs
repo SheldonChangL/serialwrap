@@ -33,6 +33,7 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -41,6 +42,7 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use mock_device::MockDevice;
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use serialwrapd::recorder::{Recorder, RecorderConfig};
 use sha2::{Digest, Sha256};
 use wrap_proto::Record;
@@ -84,47 +86,57 @@ fn mock_device_byte_exact_across_several_segment_boundaries() {
     // the exact ratio.
     const TOTAL: usize = 5 * 1024 * 1024;
 
-    let writer = thread::spawn(move || {
-        let mut hasher = Sha256::new();
-        let mut written = 0usize;
-        let mut chunk_index = 0u64;
-        while written < TOTAL {
-            let len = CHUNK.min(TOTAL - written);
-            let chunk = make_chunk(chunk_index, len);
-            hasher.update(&chunk);
-            device.write_device_output(&chunk).expect("write chunk");
-            written += chunk.len();
-            chunk_index += 1;
-        }
-        // Drain barrier: see the sustained test's identical comment below
-        // for why this matters (pty hangup on drop discards whatever the
-        // reader hasn't drained yet).
-        thread::sleep(Duration::from_millis(200));
-        (written as u64, hasher.finalize())
-    });
-
-    let recorder_for_reader = Arc::clone(&recorder);
-    let reader_thread = thread::spawn(move || {
-        let mut reader = reader;
-        let mut hasher = Sha256::new();
-        let mut total = 0u64;
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    recorder_for_reader.append_rx(&buf[..n]).expect("append_rx");
-                    hasher.update(&buf[..n]);
-                    total += n as u64;
-                }
-                Err(_) => break,
+    // ROOT CAUSE this refactor removes (same class as issue #39's
+    // `mock_device.rs` flake): the writer used to own `device` outright and
+    // include a fixed `thread::sleep` "drain barrier" after its last write,
+    // because dropping `device` (which happens the instant a closure that
+    // owns it returns) closes the PTY master, and a master-side close can
+    // discard whatever the reader hasn't yet drained out of the kernel's
+    // input queue — see `boot_banner_is_captured_as_the_first_bytes` in
+    // `mock_device.rs` for the full mechanism. A fixed sleep only makes
+    // that race *less likely* (hope the reader caught up in time), it
+    // doesn't remove it. The actual fix: know exactly how many bytes we're
+    // waiting for (`TOTAL`, a compile-time constant here) and have the
+    // reader stop deterministically once it has them all, instead of
+    // relying on EOF (i.e. on the master having already closed) as its
+    // termination signal — and borrow `device` via `thread::scope` so nothing
+    // can drop it before both threads below are done with it regardless.
+    let (source_total, source_hash, recorded_total, recorded_hash) = thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let mut hasher = Sha256::new();
+            let mut written = 0usize;
+            let mut chunk_index = 0u64;
+            while written < TOTAL {
+                let len = CHUNK.min(TOTAL - written);
+                let chunk = make_chunk(chunk_index, len);
+                hasher.update(&chunk);
+                device.write_device_output(&chunk).expect("write chunk");
+                written += chunk.len();
+                chunk_index += 1;
             }
-        }
-        (total, hasher.finalize())
-    });
+            (written as u64, hasher.finalize())
+        });
 
-    let (source_total, source_hash) = writer.join().expect("writer thread panicked");
-    let (recorded_total, recorded_hash) = reader_thread.join().expect("reader thread panicked");
+        let recorder_for_reader = Arc::clone(&recorder);
+        let reader_thread = scope.spawn(move || {
+            let mut reader = reader;
+            let mut hasher = Sha256::new();
+            let mut total = 0u64;
+            let mut buf = vec![0u8; CHUNK];
+            while total < TOTAL as u64 {
+                let n = reader.read(&mut buf).expect("read from mock device");
+                assert_ne!(n, 0, "unexpected EOF after only {total} of {TOTAL} bytes");
+                recorder_for_reader.append_rx(&buf[..n]).expect("append_rx");
+                hasher.update(&buf[..n]);
+                total += n as u64;
+            }
+            (total, hasher.finalize())
+        });
+
+        let (source_total, source_hash) = writer.join().expect("writer thread panicked");
+        let (recorded_total, recorded_hash) = reader_thread.join().expect("reader thread panicked");
+        (source_total, source_hash, recorded_total, recorded_hash)
+    });
 
     assert_eq!(
         recorded_total, source_total,
@@ -229,61 +241,98 @@ fn mock_device_1mb_per_second_sustained_60s_is_byte_exact() {
     const TARGET_BYTES_PER_SEC: f64 = 1_200_000.0;
     const TEST_DURATION: Duration = Duration::from_secs(62);
 
-    // Owns `device`; when this closure returns (after >=62s), `device`
-    // drops, closing the PTY master, which is what lets the reader thread
-    // below observe EOF/error once it has drained everything already
-    // buffered — no separate "stop" signal needed.
-    let writer = thread::spawn(move || {
-        let start = Instant::now();
-        let mut hasher = Sha256::new();
-        let mut total: u64 = 0;
-        let mut chunk_index = 0u64;
-        while start.elapsed() < TEST_DURATION {
-            let chunk = make_chunk(chunk_index, CHUNK);
-            hasher.update(&chunk);
-            device.write_device_output(&chunk).expect("write chunk");
-            total += chunk.len() as u64;
-            chunk_index += 1;
+    // ROOT CAUSE this refactor removes (same class as issue #39's
+    // `mock_device.rs` flake, and the identical fix already applied to
+    // `mock_device_byte_exact_across_several_segment_boundaries` above):
+    // the writer used to own `device` outright and end with a fixed
+    // `thread::sleep(300ms)` "drain barrier", because dropping `device`
+    // closes the PTY master, and a master-side close can discard whatever
+    // the reader hasn't yet drained out of the kernel's input queue. A
+    // fixed sleep only makes that race *less likely*, it doesn't remove
+    // it — and unlike the fast segment-boundary test, the reader here
+    // can't just know the total byte count up front (`total` depends on
+    // real elapsed time, which *is* this test's actual subject). Instead:
+    // borrow `device` via `thread::scope` (so nothing can drop it before
+    // both threads are done regardless of timing), and have the writer
+    // announce its final count over a channel once it's done, so the
+    // reader's own loop can stop deterministically at exactly that count
+    // instead of relying on EOF (i.e. on the master having already
+    // closed).
+    let (final_count_tx, final_count_rx) = std::sync::mpsc::channel::<u64>();
+    let (source_total, source_hash, recorded_total, recorded_hash) = thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let start = Instant::now();
+            let mut hasher = Sha256::new();
+            let mut total: u64 = 0;
+            let mut chunk_index = 0u64;
+            while start.elapsed() < TEST_DURATION {
+                let chunk = make_chunk(chunk_index, CHUNK);
+                hasher.update(&chunk);
+                device.write_device_output(&chunk).expect("write chunk");
+                total += chunk.len() as u64;
+                chunk_index += 1;
 
-            let target_elapsed = Duration::from_secs_f64(total as f64 / TARGET_BYTES_PER_SEC);
-            if let Some(remaining) = target_elapsed.checked_sub(start.elapsed()) {
-                thread::sleep(remaining);
-            }
-        }
-        // Drain barrier: `device` (and its PTY master) drops the instant
-        // this closure returns, and a pty hangup discards whatever's still
-        // sitting in the kernel's input queue rather than letting the
-        // reader drain it. The recorder has consistently kept up with far
-        // more than 1MB/s in practice (see mock-device's own throughput
-        // test), so this is normally a no-op; it exists so a regression
-        // that makes the recorder the bottleneck fails as a real assertion
-        // below instead of as a flaky short read here.
-        thread::sleep(Duration::from_millis(300));
-        (total, hasher.finalize())
-    });
-
-    let recorder_for_reader = Arc::clone(&recorder);
-    let reader_thread = thread::spawn(move || {
-        let mut reader = reader;
-        let mut hasher = Sha256::new();
-        let mut total: u64 = 0;
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    recorder_for_reader.append_rx(&buf[..n]).expect("append_rx");
-                    hasher.update(&buf[..n]);
-                    total += n as u64;
+                let target_elapsed = Duration::from_secs_f64(total as f64 / TARGET_BYTES_PER_SEC);
+                if let Some(remaining) = target_elapsed.checked_sub(start.elapsed()) {
+                    thread::sleep(remaining);
                 }
-                Err(_) => break,
             }
-        }
-        (total, hasher.finalize())
-    });
+            let _ = final_count_tx.send(total);
+            (total, hasher.finalize())
+        });
 
-    let (source_total, source_hash) = writer.join().expect("writer thread panicked");
-    let (recorded_total, recorded_hash) = reader_thread.join().expect("reader thread panicked");
+        let recorder_for_reader = Arc::clone(&recorder);
+        let reader_thread = scope.spawn(move || {
+            let mut reader = reader;
+            let mut hasher = Sha256::new();
+            let mut total: u64 = 0;
+            let mut buf = vec![0u8; CHUNK];
+            let mut final_count: Option<u64> = None;
+            loop {
+                if final_count.is_none() {
+                    if let Ok(count) = final_count_rx.try_recv() {
+                        final_count = Some(count);
+                    }
+                }
+                if final_count.is_some_and(|count| total >= count) {
+                    break;
+                }
+                // Poll with a short timeout instead of a plain blocking
+                // `read`: once the writer is done, `final_count` might not
+                // have been observed yet by the check above (racing the
+                // channel send against this loop's own scheduling),
+                // and there is no more data ever coming for a blocking
+                // `read` to return -- it would hang until the assertion at
+                // the top of this file's suite-wide timeout budget, not a
+                // moment sooner (`device`/its PTY master now correctly
+                // stay open for this whole test, on purpose, so there's no
+                // EOF to save it either). Bounding the wait lets the loop
+                // come back around and recheck the channel/`final_count`
+                // periodically instead -- the same pattern
+                // `mock_device::Responder`'s own loop already uses for an
+                // identical "stop condition can change while blocked in a
+                // read" problem.
+                let mut fds = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
+                let ready = poll(&mut fds, PollTimeout::from(20u16)).expect("poll reader fd");
+                if ready == 0 {
+                    continue;
+                }
+                let n = reader.read(&mut buf).expect("read from mock device");
+                assert_ne!(
+                    n, 0,
+                    "unexpected EOF after only {total} bytes (final count: {final_count:?})"
+                );
+                recorder_for_reader.append_rx(&buf[..n]).expect("append_rx");
+                hasher.update(&buf[..n]);
+                total += n as u64;
+            }
+            (total, hasher.finalize())
+        });
+
+        let (source_total, source_hash) = writer.join().expect("writer thread panicked");
+        let (recorded_total, recorded_hash) = reader_thread.join().expect("reader thread panicked");
+        (source_total, source_hash, recorded_total, recorded_hash)
+    });
 
     let elapsed_secs = TEST_DURATION.as_secs_f64();
     println!(
@@ -397,8 +446,28 @@ fn kill_minus_9_mid_write_recovers_with_bounded_loss() {
         .expect("spawn crash-writer child process");
 
     // Let it accumulate a solid amount of real, fsynced progress before
-    // pulling the plug.
-    thread::sleep(Duration::from_millis(700));
+    // pulling the plug — poll the child's own status file for real
+    // confirmed progress rather than guessing how long that takes on
+    // whatever machine/CI runner this runs on. The child write-then-renames
+    // this file (see `run_crash_child`), so a partial read is not a
+    // concern; only "does it exist yet with a parseable, positive value"
+    // is. Ceiling is generous only to turn "the child never got going" into
+    // a clear failure, not a hang.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let confirmed: u64 = fs::read_to_string(&status_path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        if confirmed > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "crash-writer child never confirmed any progress within 10s"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
 
     let kill_ret = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
     assert_eq!(
