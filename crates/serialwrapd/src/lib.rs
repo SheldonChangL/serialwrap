@@ -19,14 +19,42 @@ pub mod gate;
 pub mod port;
 pub mod port_config;
 pub mod port_io;
+pub mod protocol;
 pub mod query;
 pub mod recorder;
 
-/// Entry point the `serialwrap daemon` subcommand will call.
+use std::sync::Arc;
+
+/// Entry point the `serialwrap daemon` subcommand calls: brings up hotplug
+/// detection (T1.1) against the real system enumerator and the UDS
+/// protocol server (T1.4) on the production socket path, and serves
+/// forever.
 ///
-/// Placeholder for now: starts nothing and returns immediately. The real
-/// implementation will bring up the UDS listener, the recorder, and the
-/// device-detection loop (see `TASKS.md` T1.1-T1.4).
+/// CLI-level concerns (daemonizing, PID files, log destinations) are
+/// T1.5's territory — this is the in-process daemon core only.
 pub async fn run() -> std::io::Result<()> {
+    let data_dir = recorder::default_data_dir()?;
+    let detector = port::HotplugDetector::new(
+        Box::new(port::SystemEnumerator::new()),
+        data_dir,
+        port::HotplugConfig::default(),
+    );
+    let backend = Arc::new(protocol::backend::LiveBackend::new(
+        detector.port_config_api(),
+        detector.recorders(),
+    ));
+    let handle = detector.spawn();
+
+    let socket_path = protocol::default_socket_path()?;
+    let listener = protocol::server::bind(&socket_path)?;
+    let shared = Arc::new(protocol::Shared::new(backend, env!("CARGO_PKG_VERSION")));
+
+    protocol::server::serve(listener, shared).await;
+
+    // Unreachable in practice (`serve` loops forever absent a fatal accept
+    // error, which it logs and continues past) — kept so `handle` has a
+    // clear owner and an explicit, orderly shutdown path exists if `serve`
+    // is ever changed to return.
+    handle.stop();
     Ok(())
 }
