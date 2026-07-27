@@ -1,17 +1,15 @@
 name: Flaky test stress verification (temporary, issue #39)
 
 # TEMPORARY workflow for verifying the timing-stability fixes in issue #39 on
-# Linux, where the original flakes reproduced (never on macOS). Manually
-# triggered only; removed again once verification is done — not part of the
-# permanent CI setup.
+# Linux, where the original flakes reproduced (never on macOS). Triggered by
+# pushes to this fix branch only (workflow_dispatch requires the workflow
+# file to already exist on the default branch, which this deliberately does
+# not, to avoid touching main); removed again once verification is done —
+# not part of the permanent CI setup.
 
 on:
-  workflow_dispatch:
-    inputs:
-      iterations:
-        description: "How many times to repeat cargo test --all"
-        required: false
-        default: "200"
+  push:
+    branches: [fix-test-timing-stability]
 
 jobs:
   stress:
@@ -33,8 +31,7 @@ jobs:
       - name: Repeat cargo test --all N times, fail fast on the first failure
         run: |
           set -u
-          N="${{ github.event.inputs.iterations }}"
-          N="${N:-200}"
+          N=200
           echo "Running cargo test --all x ${N} on $(uname -a)"
           for i in $(seq 1 "$N"); do
             if ! out=$(cargo test --all 2>&1); then
