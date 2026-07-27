@@ -15,6 +15,7 @@
 
 pub mod device_profile;
 pub mod error_counts;
+pub mod export;
 pub mod gate;
 pub mod port;
 pub mod port_config;

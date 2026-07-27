@@ -135,6 +135,56 @@ pub enum Request {
         client_id: u64,
         permission: Permission,
     },
+    /// Render a device's recorded stream as a portable artifact (`TASKS.md`
+    /// T2.4, issue #11). See the [Event stream and storage
+    /// wiki](https://github.com/SheldonChangL/serialwrap/wiki/Event-stream-and-storage)'s
+    /// "Export formats" section for what each [`ExportFormat`] guarantees.
+    /// This is the one API both the CLI and the future GUI export (T5.5)
+    /// call — see `serialwrapd::export`'s module docs for why the
+    /// range-resolution/formatting logic lives daemon-side rather than in
+    /// the CLI.
+    ///
+    /// `from`/`to` bound the range (omitted = open on that end: from the
+    /// oldest retained record / up to the current tip). `filter` narrows
+    /// `rx` content for `jsonl`/`txt` only — `format: Bin` combined with a
+    /// `filter` is a structured `invalid_request` error, never a silent
+    /// ignore (the wiki: "bin 不允許過濾，保證完整性").
+    Export {
+        device: String,
+        format: ExportFormat,
+        #[serde(default)]
+        from: Option<ExportBound>,
+        #[serde(default)]
+        to: Option<ExportBound>,
+        #[serde(default)]
+        filter: Option<Filter>,
+    },
+}
+
+/// Output format for [`Request::Export`]. See the wiki's Event stream and
+/// storage page, "Export formats" section, for the guarantee each one
+/// makes (`jsonl` lossless/round-trippable, `txt` human-readable, `bin`
+/// byte-exact `rx`-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportFormat {
+    Jsonl,
+    Txt,
+    Bin,
+}
+
+/// One end of an [`Request::Export`] range: an exact sequence number, or an
+/// RFC 3339 wall-clock timestamp string. Untagged so the wire value is just
+/// a bare integer or a bare string — matching the wiki's own phrasing for
+/// `--from`/`--to`, "wall time or seq" — and parsed (including the wall
+/// timestamp string) entirely daemon-side in `serialwrapd::export`: this
+/// crate stays shape-only and must not depend on `chrono` (see the crate's
+/// module docs on the dependency direction this enforces).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExportBound {
+    Seq(u64),
+    Wall(String),
 }
 
 /// Narrows which assembled lines a `tail`/`read_since`/`subscribe` call
@@ -249,5 +299,72 @@ mod tests {
                 since_cursor: Some(42),
             }
         );
+    }
+
+    #[test]
+    fn export_round_trips_with_seq_bounds_and_defaults_optional_fields() {
+        let json = r#"{"op":"export","device":"dev","format":"jsonl","from":10,"to":20}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req,
+            Request::Export {
+                device: "dev".to_string(),
+                format: ExportFormat::Jsonl,
+                from: Some(ExportBound::Seq(10)),
+                to: Some(ExportBound::Seq(20)),
+                filter: None,
+            }
+        );
+    }
+
+    #[test]
+    fn export_bound_untagged_wire_shape_distinguishes_seq_from_wall() {
+        assert_eq!(serde_json::to_string(&ExportBound::Seq(5)).unwrap(), "5");
+        assert_eq!(
+            serde_json::to_string(&ExportBound::Wall("2026-07-27T10:00:00+08:00".to_string()))
+                .unwrap(),
+            "\"2026-07-27T10:00:00+08:00\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ExportBound>("5").unwrap(),
+            ExportBound::Seq(5)
+        );
+        assert_eq!(
+            serde_json::from_str::<ExportBound>("\"2026-07-27T10:00:00+08:00\"").unwrap(),
+            ExportBound::Wall("2026-07-27T10:00:00+08:00".to_string())
+        );
+    }
+
+    #[test]
+    fn export_format_serializes_to_snake_case_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&ExportFormat::Jsonl).unwrap(),
+            "\"jsonl\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExportFormat::Txt).unwrap(),
+            "\"txt\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExportFormat::Bin).unwrap(),
+            "\"bin\""
+        );
+    }
+
+    #[test]
+    fn export_bin_with_a_filter_still_deserializes_daemon_rejects_it_not_serde() {
+        // The wire shape itself must accept `format: bin` + `filter`
+        // together — rejection is a deliberate, structured daemon-side
+        // decision (`serialwrapd::export::export_range`), not something
+        // baked into the request's own deserialization.
+        let json = r#"{"op":"export","device":"dev","format":"bin","filter":{"pattern":"x"}}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Export { format, filter, .. } => {
+                assert_eq!(format, ExportFormat::Bin);
+                assert!(filter.is_some());
+            }
+            other => panic!("expected Export, got {other:?}"),
+        }
     }
 }

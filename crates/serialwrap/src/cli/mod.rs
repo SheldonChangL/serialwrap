@@ -18,6 +18,7 @@ pub mod clients;
 pub mod config;
 pub mod devices;
 pub mod error;
+pub mod export;
 pub mod render;
 pub mod run;
 pub mod tail;

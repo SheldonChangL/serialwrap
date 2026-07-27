@@ -689,6 +689,7 @@ dependencies = [
  "nix 0.31.3",
  "serde_json",
  "serialwrapd",
+ "sha2",
  "tempfile",
  "tokio",
  "wrap-proto",

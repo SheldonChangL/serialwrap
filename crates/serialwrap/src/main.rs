@@ -43,7 +43,7 @@ enum Command {
     /// List, kick, or demote connected clients (see TASKS.md T2.3).
     Clients(cli::clients::ClientsArgs),
     /// Export recorded data as jsonl/txt/bin (see TASKS.md T2.4).
-    Export,
+    Export(cli::export::ExportArgs),
     /// Query the audit view over the record stream (see TASKS.md T4.3).
     Audit,
     /// Manage pending write approvals (see TASKS.md T4.2).
@@ -62,7 +62,7 @@ async fn main() -> std::io::Result<()> {
         Command::Run(args) => cli::dispatch(cli::run::run(args).await),
         Command::Config(args) => cli::dispatch(cli::config::run(args).await),
         Command::Clients(args) => cli::dispatch(cli::clients::run(args).await),
-        Command::Export => stub("export", "T2.4"),
+        Command::Export(args) => cli::dispatch(cli::export::run(args).await),
         Command::Audit => stub("audit", "T4.3"),
         Command::Approvals => stub("approvals", "T4.2"),
     }

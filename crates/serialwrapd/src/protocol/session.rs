@@ -216,6 +216,30 @@ fn query_error_to_wire(e: QueryError) -> WireError {
     }
 }
 
+/// Map a [`crate::export::ExportError`] onto a structured wire error
+/// (`TASKS.md` T2.4, issue #11). Every variant here is a client-correctable
+/// `invalid_request` — a range that partially or wholly overlaps
+/// ring-evicted data is *not* one of these (see
+/// [`crate::export::ExportResult::truncated_start`]); it's a normal `ok`
+/// reply carrying a warning, never an error.
+fn export_error_to_wire(e: &crate::export::ExportError) -> WireError {
+    use crate::export::ExportError;
+    match e {
+        ExportError::FilterNotAllowedForBin => WireError::new(
+            ErrorCode::InvalidRequest,
+            "--filter is not allowed with the bin format: it would silently break byte-exactness",
+        ),
+        ExportError::InvalidPattern(msg) => {
+            WireError::new(ErrorCode::InvalidRequest, format!("invalid pattern: {msg}"))
+        }
+        ExportError::InvalidTimestamp(msg) => WireError::new(
+            ErrorCode::InvalidRequest,
+            format!("invalid timestamp: {msg}"),
+        ),
+        ExportError::Io(e) => WireError::new(ErrorCode::Internal, e.to_string()),
+    }
+}
+
 /// Wire shape for one assembled line: always `text`/`seq`/`t_mono`/`t_wall`,
 /// plus `raw_b64` — the line's exact original bytes, base64-encoded — but
 /// *only* when `text` alone can't already reconstruct them byte-for-byte.
@@ -1193,6 +1217,55 @@ async fn dispatch(
                         ),
                     ),
                 );
+            }
+        }
+
+        Request::Export {
+            device,
+            format,
+            from,
+            to,
+            filter,
+        } => {
+            let dev = DeviceId(device.clone());
+            let Some(recorder) = shared.backend.recorder(&dev) else {
+                send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(
+                        Some(id),
+                        WireError::new(
+                            ErrorCode::DeviceNotFound,
+                            format!("no such device: {device}"),
+                        ),
+                    ),
+                );
+                return;
+            };
+            let range = crate::export::ExportRange { from, to };
+            match crate::export::export_range(&recorder, &range, format, filter.as_ref()) {
+                Ok(result) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    ok_reply(
+                        id,
+                        serde_json::json!({
+                            "format": result.format,
+                            "data_b64": BASE64.encode(&result.bytes),
+                            "record_count": result.record_count,
+                            "last_seq": result.last_seq,
+                            "truncated_start": result.truncated_start,
+                        }),
+                    ),
+                ),
+                Err(e) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(Some(id), export_error_to_wire(&e)),
+                ),
             }
         }
 
