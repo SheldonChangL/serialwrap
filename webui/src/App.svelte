@@ -3,6 +3,8 @@
   import { Connection, type ConnectionInfo } from "./lib/connection";
   import ConnectionStatus from "./lib/ConnectionStatus.svelte";
   import DeviceList from "./lib/DeviceList.svelte";
+  import LiveLog from "./lib/LiveLog.svelte";
+  import { fetchDevices } from "./lib/api";
 
   const connection = new Connection();
   let info = $state<ConnectionInfo>({
@@ -17,7 +19,24 @@
     info = value;
   });
 
-  onMount(() => connection.start());
+  // One device per browser tab (see the UX-design wiki's "deliberate
+  // omissions" section — no multi-device tabs in v1): the live log view
+  // below simply follows whichever device `GET /api/devices` lists first.
+  let primaryDeviceId = $state<string | null>(null);
+
+  async function loadPrimaryDevice(): Promise<void> {
+    try {
+      const devices = await fetchDevices();
+      primaryDeviceId = devices[0]?.id ?? null;
+    } catch {
+      primaryDeviceId = null;
+    }
+  }
+
+  onMount(() => {
+    connection.start();
+    void loadPrimaryDevice();
+  });
   onDestroy(() => {
     unsubscribe();
     connection.stop();
@@ -31,17 +50,20 @@
   </header>
 
   <p class="tagline">
-    Web GUI foundation (T5.1) — WebSocket connectivity and one live API call.
-    The log view, timeline, approval cards, and clients/audit/export panels
-    land in later tasks.
+    Web GUI foundation (T5.1) plus the live log view (T5.2). Timeline,
+    approval cards, and clients/audit/export panels land in later tasks.
   </p>
+
+  {#if primaryDeviceId}
+    <LiveLog deviceId={primaryDeviceId} />
+  {/if}
 
   <DeviceList />
 </main>
 
 <style>
   main {
-    max-width: 40rem;
+    max-width: 60rem;
     margin: 0 auto;
     padding: 2rem 1.25rem 3rem;
     display: flex;

@@ -2,7 +2,13 @@
   "compilerOptions": {
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
     "target": "es2023",
-    "lib": ["ES2023"],
+    // "DOM" is needed here (not just in tsconfig.app.json) because
+    // `live-log.spec.ts`'s `page.evaluate(...)` callbacks type-check as
+    // browser-context code even though this tsconfig otherwise targets
+    // Node (T5.2, issue #19) — `page.evaluate` runs its argument inside
+    // the page, not this process, but tsc has no way to know that from
+    // the callback's own text.
+    "lib": ["ES2023", "DOM"],
     "types": ["node"],
     "skipLibCheck": true,
 

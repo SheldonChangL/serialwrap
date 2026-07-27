@@ -61,8 +61,24 @@ async function waitForHealthy(url: string, timeoutMs: number): Promise<void> {
  * recorder data dir, and `rules.toml` lookup never collide with a real
  * user's `~/.serialwrap` or with other concurrently-running test daemons.
  */
-export async function startDaemon(port?: number): Promise<DaemonHandle> {
-  const usePort = port ?? nextPort++;
+export interface StartDaemonOptions {
+  port?: number;
+  /**
+   * Registers a `TestBackend`-backed device named this instead of the
+   * real `SystemEnumerator`/hotplug path (`TASKS.md` T5.2, issue #19) —
+   * see `serialwrapd::TEST_BACKEND_DEVICE_ENV`'s doc comment for why this
+   * exists and why it's safe. Every T5.2 live-log test (`live-log.spec.ts`)
+   * needs *some* device with a real recorder behind it to inject records
+   * into (`POST /api/devices/:id/test/inject`, see `injectLog` below);
+   * `infrastructure.spec.ts`'s T5.1 tests never pass this, so they keep
+   * exercising the zero-devices case exactly as before.
+   */
+  testDeviceId?: string;
+}
+
+export async function startDaemon(options?: number | StartDaemonOptions): Promise<DaemonHandle> {
+  const opts: StartDaemonOptions = typeof options === "number" ? { port: options } : (options ?? {});
+  const usePort = opts.port ?? nextPort++;
   const home = mkdtempSync(path.join(tmpdir(), "serialwrap-e2e-"));
 
   let child: ChildProcess | undefined;
@@ -79,6 +95,7 @@ export async function startDaemon(port?: number): Promise<DaemonHandle> {
         XDG_RUNTIME_DIR: home,
         XDG_DATA_HOME: home,
         XDG_CONFIG_HOME: home,
+        ...(opts.testDeviceId ? { SERIALWRAP_TEST_BACKEND_DEVICE: opts.testDeviceId } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -117,4 +134,32 @@ export async function startDaemon(port?: number): Promise<DaemonHandle> {
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/** One record `injectLog` can append — mirrors `serialwrapd::web::api`'s
+ * `InjectOp` wire shape exactly (`crates/serialwrapd/src/web/api.rs`). */
+export type InjectOp =
+  | { kind: "rx"; text?: string; data_b64?: string }
+  | { kind: "tx"; text?: string; data_b64?: string; client: string; client_type: "human" | "agent" | "tool"; gate: string }
+  | { kind: "event"; name: string; extra?: Record<string, unknown> }
+  | { kind: "gate"; action: string; reason: string; request_seq: number };
+
+/**
+ * Append records to a `startDaemon({ testDeviceId })`-registered device's
+ * real recorder via `POST /api/devices/:id/test/inject` — the seam every
+ * T5.2 live-log E2E test uses to put real data through the real
+ * recorder→query→presentation→WS/tail pipeline (`crates/serialwrapd/src/web/api.rs`'s
+ * `test_inject` handler; `serialwrapd::TEST_BACKEND_DEVICE_ENV`'s doc
+ * comment covers why this only ever does anything against a
+ * `testDeviceId`-started daemon).
+ */
+export async function injectLog(daemon: DaemonHandle, deviceId: string, ops: InjectOp[]): Promise<void> {
+  const res = await fetch(`${daemon.url}/api/devices/${encodeURIComponent(deviceId)}/test/inject`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ops }),
+  });
+  if (!res.ok) {
+    throw new Error(`test/inject failed: ${res.status} ${await res.text()}`);
+  }
 }
