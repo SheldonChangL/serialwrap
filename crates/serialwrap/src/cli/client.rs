@@ -80,13 +80,35 @@ impl DaemonClient {
     /// `cli::error::describe_wire_error` for turning a `false` reply into
     /// an actionable message).
     pub async fn call(&mut self, request: Request) -> io::Result<Value> {
+        self.send(request).await?;
+        self.read_reply().await
+    }
+
+    /// Send `request` with a freshly allocated `id`, without waiting for a
+    /// reply. Used by `subscribe` (issue #32's `since_cursor`), whose only
+    /// "replies" are an indefinite stream of asynchronous pushes read back
+    /// later via [`Self::read_push`] rather than one synchronous ack —
+    /// unlike every other request this CLI sends, a subscribe's first
+    /// wire-level reply can be arbitrarily delayed (it's whenever the
+    /// daemon next has new data to push), so a caller needs to read it
+    /// concurrently with e.g. a Ctrl-C future, which [`Self::call`]'s
+    /// send-then-block-on-one-reply shape doesn't allow.
+    pub async fn send(&mut self, request: Request) -> io::Result<()> {
         let id = self.next_id;
         self.next_id += 1;
         let mut body = serde_json::to_value(&request).expect("Request always serializes");
         body.as_object_mut()
             .expect("Request always serializes to a JSON object")
             .insert("id".to_string(), id.into());
-        self.write_line(&body.to_string()).await?;
+        self.write_line(&body.to_string()).await
+    }
+
+    /// Read the next line as a reply/push — the same framing [`Self::call`]
+    /// itself uses internally, exposed directly for a caller (like
+    /// `subscribe`'s follow loop) that sent one request via [`Self::send`]
+    /// and now reads a continuing stream of pushes rather than a single
+    /// reply.
+    pub async fn read_push(&mut self) -> io::Result<Value> {
         self.read_reply().await
     }
 

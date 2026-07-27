@@ -28,6 +28,8 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -168,8 +170,30 @@ fn query_error_to_wire(e: QueryError) -> WireError {
     }
 }
 
+/// Wire shape for one assembled line: always `text`/`seq`/`t_mono`/`t_wall`,
+/// plus `raw_b64` — the line's exact original bytes, base64-encoded — but
+/// *only* when `text` alone can't already reconstruct them byte-for-byte.
+///
+/// That's exactly when `raw` isn't valid UTF-8: if it is, `text` (produced
+/// via `String::from_utf8_lossy` over already-valid UTF-8, which is a
+/// no-op) has the identical bytes as `raw`, so shipping a second
+/// base64-encoded copy would be pure overhead for the overwhelmingly common
+/// case (ordinary text log lines). Only genuinely binary/mixed-encoding
+/// lines — rare relative to total line volume on a real device stream —
+/// pay the ~33% base64 size cost, and only for that one line. See issue
+/// #32 and the [Client protocol
+/// wiki](https://github.com/SheldonChangL/serialwrap/wiki/Client-protocol)
+/// for the full rationale and the field's presence rule.
 fn line_json(l: &crate::query::AssembledLine) -> serde_json::Value {
-    serde_json::json!({ "text": l.text, "seq": l.seq, "t_mono": l.t_mono, "t_wall": l.t_wall })
+    let mut obj = serde_json::Map::new();
+    obj.insert("text".to_string(), l.text.clone().into());
+    obj.insert("seq".to_string(), l.seq.into());
+    obj.insert("t_mono".to_string(), l.t_mono.into());
+    obj.insert("t_wall".to_string(), l.t_wall.clone().into());
+    if std::str::from_utf8(&l.raw).is_err() {
+        obj.insert("raw_b64".to_string(), BASE64.encode(&l.raw).into());
+    }
+    serde_json::Value::Object(obj)
 }
 
 fn oob_json(e: &OobRecord) -> serde_json::Value {
@@ -676,7 +700,11 @@ async fn dispatch(
             }
         }
 
-        Request::Subscribe { device, filter } => {
+        Request::Subscribe {
+            device,
+            filter,
+            since_cursor,
+        } => {
             let dev = DeviceId(device.clone());
             let Some(recorder) = shared.backend.recorder(&dev) else {
                 send(
@@ -694,7 +722,28 @@ async fn dispatch(
                 return;
             };
             let state = shared.queries.get_or_spawn(&dev, recorder);
-            let mut idx = (state.line_count(), state.event_count());
+            // `since_cursor` closes the tail-then-subscribe gap (issue
+            // #32): resolve it to the exact same starting position
+            // `read_since(since_cursor)` would use, so the first thing this
+            // subscription ever drains is exactly what a `read_since` call
+            // at this same instant would have returned — no gap, no
+            // duplicate. Omitted, this falls back to the old
+            // start-from-now snapshot.
+            let mut idx = match since_cursor {
+                Some(since_cursor) => match state.cursor_from_seq(since_cursor) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        send(
+                            shared,
+                            client_id,
+                            tx,
+                            err_reply(Some(id), query_error_to_wire(e)),
+                        );
+                        return;
+                    }
+                },
+                None => (state.line_count(), state.event_count()),
+            };
             loop {
                 let notified = state.notified();
                 match state.drain_since(idx, filter.as_ref()) {

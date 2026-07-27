@@ -74,10 +74,24 @@ pub enum Request {
         pattern: String,
         timeout_s: f64,
     },
+    /// `since_cursor`, when given, has exactly `read_since`'s `cursor`
+    /// semantics ("push everything with `seq >= since_cursor`, then keep
+    /// pushing"): a client that already called `tail`/`read_since` and got
+    /// back a cursor can pass it straight here and never miss (or
+    /// re-receive) a record in between, closing the "tail history, then
+    /// subscribe" gap that existed when `subscribe` only ever started from
+    /// whatever was current at dispatch time (see the [Client protocol
+    /// wiki](https://github.com/SheldonChangL/serialwrap/wiki/Client-protocol)).
+    /// Omitted (or `null`), it falls back to that old start-from-now
+    /// behavior. A `since_cursor` older than this device's retained window
+    /// fails the same way `read_since` does: a structured `data_aged_out`
+    /// error, never a silent skip to "now".
     Subscribe {
         device: String,
         #[serde(default)]
         filter: Option<Filter>,
+        #[serde(default)]
+        since_cursor: Option<u64>,
     },
     QueryEvents {
         device: String,
@@ -210,5 +224,30 @@ mod tests {
         let json = r#"{"pattern":"ERROR"}"#;
         let filter: Filter = serde_json::from_str(json).unwrap();
         assert!(!filter.exclude);
+    }
+
+    #[test]
+    fn subscribe_since_cursor_defaults_to_none_and_round_trips_when_given() {
+        let json = r#"{"op":"subscribe","device":"dev"}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req,
+            Request::Subscribe {
+                device: "dev".to_string(),
+                filter: None,
+                since_cursor: None,
+            }
+        );
+
+        let json = r#"{"op":"subscribe","device":"dev","since_cursor":42}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req,
+            Request::Subscribe {
+                device: "dev".to_string(),
+                filter: None,
+                since_cursor: Some(42),
+            }
+        );
     }
 }

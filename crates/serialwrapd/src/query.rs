@@ -81,12 +81,22 @@ const MAX_INGEST_BYTES: usize = 16 * 1024 * 1024;
 /// `read_since`, `wait_for`, and `subscribe` all operate on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssembledLine {
-    /// Line text with its terminating `\n` (and a preceding `\r`, if any —
-    /// i.e. CRLF input) stripped. Decoded via `String::from_utf8_lossy`:
-    /// device output is untrusted bytes, not necessarily valid UTF-8 (see
-    /// the wiki's Security model — "device output is untrusted input"), so
-    /// an invalid sequence becomes U+FFFD rather than failing the whole
-    /// read.
+    /// The exact original bytes, with only the terminating `\n` (and a
+    /// preceding `\r`, if any — i.e. CRLF input) stripped. This is the
+    /// authoritative source of truth for this line: recorded rx bytes are
+    /// untrusted, not necessarily valid UTF-8 (see the wiki's Security
+    /// model), and this project's core promise — "you record bytes, not
+    /// characters" — has to hold at the query layer too, not just in
+    /// `recorder.rs`. See [`Self::text`] for the lossy display-only
+    /// derivative.
+    pub raw: Vec<u8>,
+    /// `raw` decoded via `String::from_utf8_lossy` — a convenience field
+    /// for callers that only want to print or pattern-match text (e.g.
+    /// `wait_for`'s regex, the CLI's default rendering) and don't care
+    /// about byte-exactness. An invalid sequence becomes U+FFFD here, but
+    /// unlike before this field existed alongside [`Self::raw`], that lossy
+    /// conversion is no longer destructive: `raw` still holds the original
+    /// bytes regardless of what `text` looks like.
     pub text: String,
     /// `seq` of the raw `rx` record whose bytes contained this line's
     /// terminating `\n`. Not unique across a batch — a single rx chunk can
@@ -380,6 +390,7 @@ impl DeviceQueryState {
                                 }
                                 let text = String::from_utf8_lossy(&raw).into_owned();
                                 lines.push(AssembledLine {
+                                    raw,
                                     text,
                                     seq: *seq,
                                     t_mono: *t_mono,
@@ -657,6 +668,44 @@ impl DeviceQueryState {
         }
     }
 
+    /// Resolve a `since_cursor` (`read_since`-compatible: "everything with
+    /// `seq >= since_cursor`") into the [`DrainCursor`] position
+    /// [`Self::drain_since`] should start from — what closes the
+    /// tail-then-subscribe gap (`TASKS.md` issue #32): a client passes back
+    /// the cursor an earlier `tail`/`read_since` call returned, and the
+    /// first thing `subscribe` ever drains from the resulting position is
+    /// exactly what a `read_since(since_cursor)` call would have returned
+    /// at that same instant — no gap, no duplicate.
+    ///
+    /// Fails with [`QueryError::DataAgedOut`] under exactly the condition
+    /// [`Self::read_since`] does: `since_cursor` older than the oldest
+    /// record this state still retains. This can only happen right here,
+    /// at subscribe start — once resolved, a `DrainCursor` stays valid for
+    /// the lifetime of the subscription, because `lines`/`events` are
+    /// append-only in memory (see the struct docs' "known limitation");
+    /// nothing after this call can ever again invalidate an already-issued
+    /// `DrainCursor`.
+    pub fn cursor_from_seq(&self, since_cursor: u64) -> Result<DrainCursor, QueryError> {
+        if let Some(oldest) = *self.oldest_seq.lock().unwrap_or_else(|e| e.into_inner()) {
+            if since_cursor < oldest {
+                return Err(QueryError::DataAgedOut {
+                    oldest_available_seq: oldest,
+                });
+            }
+        }
+        let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+        let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        // `lines`/`events` are each sorted ascending by `seq` (ties allowed
+        // — see `AssembledLine::seq`'s docs) purely by construction: only
+        // ever appended to, in the order `ingest` processes an
+        // already-ascending `Recorder::read_since` page. `partition_point`
+        // is exactly the right tool for "first index at/after a threshold"
+        // over such a sequence.
+        let line_idx = lines.partition_point(|l| l.seq < since_cursor);
+        let event_idx = events.partition_point(|e| e.seq < since_cursor);
+        Ok((line_idx, event_idx))
+    }
+
     /// Snapshot everything at/after `from` right now — used by a
     /// `subscribe` task's first poll and every subsequent wakeup. Returns
     /// the [`DrainResult`] to resume from next time.
@@ -788,6 +837,122 @@ mod tests {
         let page = state.read_since(0, None, None).unwrap();
         assert_eq!(page.lines.len(), 1);
         assert!(page.lines[0].text.ends_with('x'));
+    }
+
+    // ---- Issue #32 acceptance criterion 1: byte-exact round trip ----
+
+    #[test]
+    fn invalid_utf8_line_keeps_its_exact_original_bytes_in_raw() {
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+        // Deliberately invalid UTF-8 (a lone continuation byte, then a
+        // truncated 2-byte sequence) mixed in with ordinary text — this is
+        // exactly the shape `String::from_utf8_lossy` cannot round-trip
+        // (it would fold both into a single U+FFFD each, destroying the
+        // original byte count and values).
+        let original: Vec<u8> = {
+            let mut v = b"before-".to_vec();
+            v.extend_from_slice(&[0xFF, 0xFE, 0x80]);
+            v.extend_from_slice(b"-after");
+            v
+        };
+        let mut with_newline = original.clone();
+        with_newline.push(b'\n');
+        recorder.append_rx(&with_newline).unwrap();
+        state.ingest(&recorder);
+
+        let page = state.read_since(0, None, None).unwrap();
+        assert_eq!(page.lines.len(), 1);
+        let line = &page.lines[0];
+
+        assert_eq!(
+            line.raw, original,
+            "raw must be byte-for-byte identical to what was written, newline stripped"
+        );
+        assert!(
+            std::str::from_utf8(&line.raw).is_err(),
+            "test fixture must actually be invalid UTF-8, or this test proves nothing"
+        );
+        assert!(
+            line.text.contains('\u{FFFD}'),
+            "text is still the lossy display form: {:?}",
+            line.text
+        );
+
+        let mut original_hasher = Sha256::new();
+        original_hasher.update(&original);
+        let mut raw_hasher = Sha256::new();
+        raw_hasher.update(&line.raw);
+        assert_eq!(
+            format!("{:x}", original_hasher.finalize()),
+            format!("{:x}", raw_hasher.finalize()),
+            "sha256(original) must match sha256(raw) — the whole point of carrying raw bytes"
+        );
+    }
+
+    // ---- Issue #32 acceptance criterion 2: subscribe(since_cursor) has no gap ----
+
+    #[test]
+    fn cursor_from_seq_resolves_to_the_same_position_read_since_would_start_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+        for i in 0..10 {
+            recorder
+                .append_rx(format!("line-{i}\n").as_bytes())
+                .unwrap();
+        }
+        state.ingest(&recorder);
+
+        // tail-style: everything is currently at seq 0..=9, so "the cursor
+        // to continue from" is 10 (same `+1` convention `tail`/`read_since`
+        // already use).
+        let since_cursor = 10;
+        recorder.append_rx(b"line-10\n").unwrap();
+        state.ingest(&recorder);
+
+        let (line_idx, event_idx) = state.cursor_from_seq(since_cursor).unwrap();
+        let drained = state.drain_since((line_idx, event_idx), None).unwrap();
+        let read_since_page = state.read_since(since_cursor, None, None).unwrap();
+
+        assert_eq!(event_idx, 0, "no events were ever appended in this test");
+        assert_eq!(
+            drained.lines.iter().map(|l| l.seq).collect::<Vec<_>>(),
+            read_since_page
+                .lines
+                .iter()
+                .map(|l| l.seq)
+                .collect::<Vec<_>>(),
+            "subscribe's drain_since(cursor_from_seq(N)) must agree with read_since(N)"
+        );
+        assert_eq!(drained.lines.len(), 1, "expected only the seq=10 line");
+        assert_eq!(
+            drained.lines[0].seq, 10,
+            "first line must be N+1 = 10, not a repeat of 0..9"
+        );
+        assert_eq!(drained.lines[0].text, "line-10");
+    }
+
+    #[test]
+    fn cursor_from_seq_reports_data_aged_out_below_the_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+        recorder.append_rx(b"line one\n").unwrap();
+        state.ingest(&recorder);
+        // Same simulated-eviction setup `read_since_reports_data_aged_out_below_the_floor`
+        // uses: pretend seq 0..5 have already been evicted.
+        *state.oldest_seq.lock().unwrap() = Some(5);
+        let err = state.cursor_from_seq(0).unwrap_err();
+        assert_eq!(
+            err,
+            QueryError::DataAgedOut {
+                oldest_available_seq: 5
+            }
+        );
     }
 
     #[test]
