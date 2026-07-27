@@ -116,6 +116,67 @@ Linux 的 framing/overrun/parity error 計數走 `TIOCGICOUNT` ioctl；macOS 沒
   - 判定通過：CLI/事件流輸出明確標示 unavailable（字串或專屬列舉值），不是數字 0
   - 驗證紀錄：
 
+## 6. 打包安裝與服務自啟（乾淨 VM、launchd、systemd）
+
+對應：T6.1 打包與服務安裝 — [issue #23](https://github.com/SheldonChangL/serialwrap/issues/23)（`needs:hardware`）
+
+這裡的 mock-device 治具原理上就測不出「一台從沒裝過開發環境的機器，從零開始能不能在
+15 分鐘內裝起來看到 log」——這個問題的答案恰恰取決於治具刻意繞過的東西：相依套件是否
+齊全、文件步驟有沒有漏、真正的桌面/init 系統能不能把 daemon 拉起來。以下區分「這次
+session 已經自動驗過的部分」與「仍需要人在真實環境跑一次的部分」，不要混為一談。
+
+**已驗過（本次 session，非人工）：**
+
+- [x] Linux（Docker `ubuntu:24.04`，非乾淨 VM，見下方限制）：從乾淨映像跑 `apt`
+  安裝相依套件 → `rustup` 裝 Rust → Node 22 → `npm run build`（前端）→ `cargo
+  build --release` → `cargo test --all`（364+ 個測試，mock-device 全流程）→ 啟動
+  daemon → 透過 CLI `tail` 在螢幕上看到 log 行，總計 **~135 秒**（遠低於 15
+  分鐘門檻）。完整指令序列與逐段計時見 PR 說明；`packaging/linux/install.sh`
+  單獨用同一個 base image 重跑一次，66 秒完成（複用已裝好 Rust/Node 的 base
+  image，故比上面全流程數字快，公平比較應看上面含 apt/rustup/node 安裝的
+  135 秒）。
+  - **這不等於通過「乾淨 Ubuntu VM」那一項**：Docker 容器沒有真實 USB 裝置、
+    沒有桌面 session（GUI 瀏覽器打開 `http://127.0.0.1:5590` 這一步沒有實測，
+    只驗了背後的 HTTP API 有回應）、也沒有真實開機/reboot 流程可測。它驗證的
+    是「相依套件是否齊全、install script 能不能跑、文件步驟有沒有缺漏」，這正
+    是 Docker 測法的價值所在，但不能取代下面兩項乾淨 VM 待驗項目。
+- [x] `serialwrap service install --dry-run` 產出的 launchd plist（macOS，本機
+  原生跑，非容器）：`plutil -lint` 驗證合法 XML；內容含正確的
+  `ProgramArguments`（binary 絕對路徑 + `daemon`）、`RunAtLoad`/`KeepAlive`。
+- [x] `serialwrap service install --dry-run` 產出的 systemd user unit（Linux，
+  Docker）：內容含正確的 `ExecStart`（binary 絕對路徑 + `daemon`）、
+  `WantedBy=default.target`；`service install`（非 dry-run，假 `$HOME`）確認
+  檔案真的被寫入，且在容器內沒有真正 systemd session 時，`systemctl --user
+  daemon-reload` 失敗會回傳明確錯誤而不是靜默假裝成功。
+- [x] `cargo deb -p serialwrap` 產出的 `.deb`（Docker，`x86_64` 目標，與
+  release workflow 同架構）：`dpkg-deb -c`/`-I` 確認檔案佈局正確
+  （`usr/bin/serialwrap`、`lib/udev/rules.d/60-serialwrap.rules`、
+  `usr/share/doc/serialwrap/README.md`）與 control metadata 正確（package
+  name、maintainer、`Depends: libc6 (>= 2.39)` 自動偵測）。
+
+**仍待人工在真實環境驗證：**
+
+- [ ] 乾淨 macOS VM：完全沒跑過。本 session 沒有 macOS VM 可用，只能在「已經
+  裝好開發環境的本機」上驗證個別指令（`cargo build`、`service install
+  --dry-run` 等），無法驗證「從零開始的乾淨環境」這個條件本身，也無法驗證
+  CH340/CP210x 驅動安裝與核可流程（System Settings 的核可對話框）。
+  - 判定通過：照 README 從安裝到 GUI 看到 log ≤15 分鐘（實測計時＋畫面截圖）
+- [ ] 乾淨 Ubuntu VM（非容器，真實或虛擬機）：Docker 測法涵蓋了「相依套件／
+  安裝流程／文件完整性」，但沒有真實桌面 session、沒有真實 USB 裝置插拔、沒有
+  真實 `systemd --user` session（見上方限制說明）。
+  - 判定通過：照 README 從安裝到瀏覽器看到 GUI log ≤15 分鐘（實測計時＋畫面截圖），且用真實 USB-serial 裝置而非本 session 用的內部測試後門
+- [ ] 重開機後 daemon 自動啟動並恢復錄製 — macOS（launchd）
+  - 所需硬體/環境：乾淨 macOS 機器或 VM，登入 GUI session
+  - 判定通過：`serialwrap service install` 後重開機，不需手動操作，`serialwrap devices`/GUI 顯示 daemon 已在跑且先前錄製的資料還在
+- [ ] 重開機後 daemon 自動啟動並恢復錄製 — Linux（systemd --user）
+  - 所需硬體/環境：乾淨 Ubuntu 機器或 VM；須先跑過 `loginctl enable-linger
+    "$USER"`（README 已提示這一步，沒有它 user unit 只在有登入 session 時才會
+    啟動，不會在開機當下就跑）
+  - 判定通過：重開機（不登入任何 session）後 `systemctl --user status
+    com.serialwrap.daemon.service` 顯示 running，且先前錄製的資料還在
+- [ ] macOS 常見驅動（CH340/CP210x）指引本身是否對得上真實核可流程
+  - 判定通過：照 README「macOS: 常見 USB-serial 驅動」段落安裝後，`serialwrap devices` 真的看得到裝置；記下實際核可對話框的位置是否與文件描述相符（Apple 各版本措辭常變動）
+
 ---
 
 ## 其餘 `needs:hardware` 項目（收集自現有 issue，供後續任務認領時對照）
@@ -127,14 +188,6 @@ Linux 的 framing/overrun/parity error 計數走 `TIOCGICOUNT` ioctl；macOS 沒
 - [ ] macOS 實機驗證一律使用 `/dev/cu.*` 節點且開啟不阻塞（不是 `/dev/tty.*`）
   - 所需硬體：任意 USB-serial 轉接器
   - 判定通過：`serialwrapd` 開啟裝置時使用的路徑經確認是 `cu.*`；反覆插拔不出現因等待 DCD 而卡住的開啟
-
-### T6.1 打包與服務安裝 — [issue #23](https://github.com/SheldonChangL/serialwrap/issues/23)
-
-- [ ] 乾淨 macOS VM：照 README 從安裝到 GUI 看到 log ≤15 分鐘（實測計時）
-- [ ] 乾淨 Ubuntu VM：同上
-- [ ] 重開機後 daemon 自動啟動並恢復錄製（兩平台）
-  - 所需硬體/環境：乾淨的 macOS 與 Ubuntu VM 或實體機（不可用已裝過開發環境的機器，會遮蔽遺漏的相依套件）
-  - 判定通過：計時器與畫面截圖佐證
 
 ---
 

@@ -1098,6 +1098,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "directories",
  "mock-device",
  "nix 0.31.3",
  "serde_json",

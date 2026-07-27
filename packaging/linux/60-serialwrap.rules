@@ -1,0 +1,34 @@
+# udev rule template for serialwrap (TASKS.md T6.1, issue #23).
+#
+# What this is for: most distributions already ship a generic rule that
+# grants the `dialout` group read/write access to USB-serial nodes
+# (`ttyUSB*`/`ttyACM*`), and being in that group is the one thing that
+# actually matters — see README.md's "Linux: permissions" section
+# (`sudo usermod -aG dialout "$USER"`, then log out and back in). This file
+# is a second line of defense for the minority of setups where that generic
+# rule is absent or narrower than expected (minimal/hardened distros,
+# custom udev configs) — it explicitly grants dialout group access to the
+# specific USB-serial chips firmware developers hit most often.
+#
+# Install:
+#   sudo cp packaging/linux/60-serialwrap.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# This does not replace dialout group membership — GROUP="dialout" here
+# only has an effect if your own account is actually in that group.
+#
+# vendor:product pairs below (see `lsusb` to find your own adapter's ids if
+# it isn't listed — add a line with the same shape):
+#   1a86:7523  WCH CH340/CH341
+#   1a86:55d4  WCH CH9102 (newer CH340-family chips, e.g. many ESP32-C3 boards)
+#   10c4:ea60  Silicon Labs CP2102/CP2104/CP210x
+#   0403:6001  FTDI FT232R (see README.md's FTDI latency-timer section for
+#              why this specific chip also affects timestamp precision)
+#   0403:6015  FTDI FT230X/FT231X
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d4", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", GROUP="dialout", MODE="0660"

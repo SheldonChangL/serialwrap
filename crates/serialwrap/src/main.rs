@@ -47,6 +47,9 @@ enum Command {
     Audit(cli::audit::AuditArgs),
     /// List, approve, or deny pending write approvals (see TASKS.md T4.2).
     Approvals(cli::approvals::ApprovalsArgs),
+    /// Install or uninstall the launchd/systemd user service that runs
+    /// `serialwrap daemon` in the background (see TASKS.md T6.1).
+    Service(cli::service::ServiceArgs),
 }
 
 #[tokio::main]
@@ -64,5 +67,6 @@ async fn main() -> std::io::Result<()> {
         Command::Export(args) => cli::dispatch(cli::export::run(args).await),
         Command::Audit(args) => cli::dispatch(cli::audit::run(args).await),
         Command::Approvals(args) => cli::dispatch(cli::approvals::run(args).await),
+        Command::Service(args) => cli::dispatch(cli::service::run(args).await),
     }
 }

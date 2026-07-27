@@ -1,0 +1,189 @@
+name: Release
+
+# T6.1 (issue #23): the "cargo-dist or equivalent" packaging pipeline.
+# Triggered by pushing a `v*.*.*` tag (or manually via workflow_dispatch,
+# for a dry run that builds everything but skips creating a GitHub
+# Release). Publishes:
+#   - macOS tarballs (aarch64-apple-darwin, x86_64-apple-darwin)
+#   - a Linux tarball (x86_64-unknown-linux-gnu) and a .deb (via cargo-deb)
+#   - a SHA256SUMS file covering every published asset
+#
+# `packaging/linux/install.sh` downloads the Linux tarball by exactly the
+# name built here (`serialwrap-<tag>-<target-triple>.tar.gz`) - if that
+# naming ever changes, update both places together.
+#
+# The one failure mode this workflow exists specifically to prevent: a
+# release binary whose embedded web GUI is `crates/serialwrapd/build.rs`'s
+# placeholder page because `npm run build` never ran before `cargo build
+# --release` on a release runner (see that file's own doc comment - this
+# is called out there as "the easiest mistake to make and the hardest to
+# notice"). Every build job below runs the frontend build first, and the
+# `verify frontend is embedded, not the placeholder` step fails the whole
+# job outright if it isn't.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  build-macos:
+    name: Build macOS (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      # Must run before any cargo build - see this workflow's own header
+      # comment on why an embedded-placeholder release binary is exactly
+      # the failure this ordering prevents.
+      - name: Build web frontend
+        working-directory: webui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify frontend is embedded, not the placeholder
+        run: |
+          if grep -q "serialwrap-build-rs-placeholder" webui/dist/index.html; then
+            echo "::error::webui/dist/index.html is still build.rs's placeholder after npm run build - refusing to release a binary with a placeholder GUI" >&2
+            exit 1
+          fi
+
+      - name: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }} -p serialwrap
+
+      - name: Package tarball
+        id: package
+        run: |
+          tag="${GITHUB_REF_NAME:-dev}"
+          name="serialwrap-${tag}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/serialwrap" "dist/${name}/serialwrap"
+          cp README.md LICENSE "dist/${name}/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          shasum -a 256 "dist/${name}.tar.gz" > "dist/${name}.tar.gz.sha256"
+          echo "asset=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Build web frontend
+        working-directory: webui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify frontend is embedded, not the placeholder
+        run: |
+          if grep -q "serialwrap-build-rs-placeholder" webui/dist/index.html; then
+            echo "::error::webui/dist/index.html is still build.rs's placeholder after npm run build - refusing to release a binary with a placeholder GUI" >&2
+            exit 1
+          fi
+
+      - name: cargo build --release
+        run: cargo build --release -p serialwrap
+
+      - name: Package tarball
+        run: |
+          tag="${GITHUB_REF_NAME:-dev}"
+          name="serialwrap-${tag}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${name}"
+          cp target/release/serialwrap "dist/${name}/serialwrap"
+          cp README.md LICENSE "dist/${name}/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          sha256sum "dist/${name}.tar.gz" > "dist/${name}.tar.gz.sha256"
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      # `--no-build` (cargo-deb skips its own internal `cargo build
+      # --release`) because the release binary above was already built with
+      # the real frontend embedded - letting cargo-deb rebuild would just
+      # repeat that work to produce the same binary.
+      - name: Build .deb
+        run: cargo deb -p serialwrap --no-build --output dist/
+
+      - name: sha256sum the .deb
+        run: |
+          for f in dist/*.deb; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-unknown-linux-gnu
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.deb
+            dist/*.deb.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combined checksums
+        working-directory: dist
+        run: cat ./*.sha256 > SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.deb dist/SHA256SUMS \
+            --title "serialwrap ${GITHUB_REF_NAME}" \
+            --generate-notes
