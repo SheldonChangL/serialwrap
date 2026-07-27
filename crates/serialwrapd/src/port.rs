@@ -72,16 +72,17 @@
 //! is never throttled.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{self, Read};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::device_profile::{self, DeviceProfile, ProfileStore};
@@ -540,6 +541,235 @@ fn append_open_failed_event(
     Ok(())
 }
 
+/// Append a `lease_start` event: `device_id`, `path`, `command`, `pid` (the
+/// kernel-verified pid of the connection that requested the lease — see
+/// `protocol::session`'s `Request::LeaseAcquire` handler, not the pid of
+/// whatever the caller eventually execs, which the daemon has no way to
+/// know at acquire time), `token`, and `timeout_s` (`null` when none was
+/// given). `pub(crate)` rather than private: both this module's own lease
+/// state machine and `protocol::backend`'s `TestBackend` (a second,
+/// in-memory `DeviceBackend` impl used by tests) append this exact same
+/// event shape, so the schema can't drift between the two (`TASKS.md`
+/// T2.2, issue #9).
+pub(crate) fn append_lease_start_event(
+    recorder: &Recorder,
+    id: &DeviceId,
+    path: &Path,
+    command: &str,
+    pid: u32,
+    token: &str,
+    timeout_s: Option<f64>,
+) -> io::Result<()> {
+    let mut extra = Map::new();
+    extra.insert("device_id".to_string(), id.0.clone().into());
+    extra.insert(
+        "path".to_string(),
+        path.to_string_lossy().into_owned().into(),
+    );
+    extra.insert("command".to_string(), command.into());
+    extra.insert("pid".to_string(), pid.into());
+    extra.insert("token".to_string(), token.into());
+    extra.insert(
+        "timeout_s".to_string(),
+        match timeout_s {
+            Some(s) => s.into(),
+            None => Value::Null,
+        },
+    );
+    recorder.append_event("lease_start", extra)?;
+    Ok(())
+}
+
+/// Append a `lease_end` event: everything `lease_start` carries, plus
+/// `exit_code` (`null` for a daemon-initiated reclaim — a `timeout` or a
+/// residual lease found at startup, neither of which ever learns the
+/// child's real exit status), `duration_ms`, and `reason` (`"released"`,
+/// `"timeout"`, or `"daemon_restart"`). See [`append_lease_start_event`]
+/// for why this is `pub(crate)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_lease_end_event(
+    recorder: &Recorder,
+    id: &DeviceId,
+    path: Option<&Path>,
+    command: &str,
+    pid: u32,
+    token: &str,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    reason: &str,
+) -> io::Result<()> {
+    let mut extra = Map::new();
+    extra.insert("device_id".to_string(), id.0.clone().into());
+    if let Some(path) = path {
+        extra.insert(
+            "path".to_string(),
+            path.to_string_lossy().into_owned().into(),
+        );
+    }
+    extra.insert("command".to_string(), command.into());
+    extra.insert("pid".to_string(), pid.into());
+    extra.insert("token".to_string(), token.into());
+    extra.insert(
+        "exit_code".to_string(),
+        match exit_code {
+            Some(c) => c.into(),
+            None => Value::Null,
+        },
+    );
+    extra.insert("duration_ms".to_string(), duration_ms.into());
+    extra.insert("reason".to_string(), reason.into());
+    recorder.append_event("lease_end", extra)?;
+    Ok(())
+}
+
+/// Monotonically increasing counter backing [`generate_lease_token`] — only
+/// needs to be unique within one daemon process's lifetime (tokens are
+/// never persisted across a restart in a way that requires global
+/// uniqueness; see [`PersistedLease`]), so a plain counter plus this
+/// process's pid is sufficient without pulling in a UUID dependency.
+static LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh, opaque lease token, unique for this daemon process's lifetime.
+fn generate_lease_token() -> String {
+    let n = LEASE_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("lease-{}-{n}", std::process::id())
+}
+
+/// One device's currently-active lease, tracked only inside the poll
+/// thread's own state ([`HotplugDetector::leases`]) — never shared behind a
+/// `Mutex`, unlike [`SharedDeviceConfigs`]/[`SharedRecorders`] — because
+/// acquiring/releasing a lease must run on the one thread that already owns
+/// `tracked`/[`stop_and_join_reader`]/`attempt_open`'s reconnect machinery
+/// (see [`LeaseCommand`] for how a call from *outside* that thread reaches
+/// it).
+struct ActiveLease {
+    token: String,
+    command: String,
+    pid: u32,
+    started: Instant,
+    /// `None` when no `--lease-timeout`-equivalent was given — the lease
+    /// stays open until an explicit `LeaseCommand::Release`.
+    deadline: Option<Instant>,
+}
+
+/// On-disk record of an in-progress lease, at
+/// `<data_dir>/devices/<device_id>/lease.json` — written when a lease is
+/// acquired, deleted on a clean release. [`ActiveLease`] (in-memory,
+/// poll-thread-private) cannot survive a daemon crash/restart; this file is
+/// what lets a *fresh* `HotplugDetector` instance (a new daemon process,
+/// same `data_dir`) recognize "the previous process died while this device
+/// was leased" the first time it sees the device again (see
+/// [`HotplugDetector::recover_residual_lease`]) — the edge case `TASKS.md`
+/// T2.2 calls out by name ("daemon 自己重啟等邊角：啟動時檢查殘留 lease 並
+/// 收回"). `started_epoch_ms` (wall-clock, not `Instant`) is what makes
+/// `duration_ms` computable across that restart — `Instant` has no stable
+/// epoch and a fresh process can't compare its own `Instant`s against a
+/// previous process's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedLease {
+    token: String,
+    command: String,
+    pid: u32,
+    started_epoch_ms: u64,
+    timeout_s: Option<f64>,
+}
+
+/// Successful result of [`PortConfigApi::acquire_lease`]: the opaque token
+/// a later `release_lease` call identifies this lease by, and the device's
+/// current path — the caller (`serialwrap run`) needs this to hand to
+/// whatever external tool it spawns against the now-freed port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseAcquired {
+    pub token: String,
+    pub path: PathBuf,
+}
+
+/// Successful result of [`PortConfigApi::release_lease`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseReleased {
+    pub duration_ms: u64,
+}
+
+/// Everything that can go wrong acquiring/releasing a lease. Deliberately
+/// its own type rather than reusing `io::Error`/`io::ErrorKind`: unlike
+/// every other `PortConfigApi` method (which map cleanly onto
+/// `NotFound`/`NotConnected`), a lease call has a third failure mode with
+/// no matching `io::ErrorKind` — "a lease is already active" — and the wire
+/// layer needs to tell it apart from the other two to return the
+/// wiki-documented `lease_held` error code (see
+/// `protocol::session::lease_error_to_wire`) rather than a generic one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseError {
+    /// No such device id has ever been seen by this detector.
+    UnknownDevice,
+    /// The device is known but not currently connected — there is no fd to
+    /// hand off.
+    NotConnected,
+    /// This device already has an active lease. Carries a human-readable
+    /// description of the current holder (`pid`/`command`) — the wiki's
+    /// `lease_held` error code documents a `holder` field precisely so a
+    /// client sees *who* to blame, not just that it lost a race.
+    AlreadyLeased { holder: String },
+    /// `release_lease` was called with a token that doesn't match any
+    /// currently-active lease (already released, already timed out, or
+    /// simply never existed).
+    UnknownToken,
+    /// An I/O failure while acquiring/releasing (e.g. reopening the device
+    /// after release failed outright) or while talking to the poll thread
+    /// itself.
+    Io(String),
+}
+
+impl std::fmt::Display for LeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LeaseError::UnknownDevice => write!(f, "unknown device"),
+            LeaseError::NotConnected => write!(f, "device is not currently connected"),
+            LeaseError::AlreadyLeased { holder } => {
+                write!(f, "device already has an active lease (held by {holder})")
+            }
+            LeaseError::UnknownToken => write!(f, "no active lease for that token"),
+            LeaseError::Io(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for LeaseError {}
+
+/// A lease request submitted from outside the poll thread (via
+/// [`PortConfigApi::acquire_lease`]/[`PortConfigApi::release_lease`]) and
+/// processed synchronously inside it (see
+/// [`HotplugDetector::drain_lease_commands`]).
+///
+/// # Why a channel, not a shared `Mutex`
+///
+/// Acquiring a lease means stopping and joining a device's reader thread
+/// and clearing its live fd — exactly what [`stop_and_join_reader`] and
+/// [`HotplugDetector::clear_live_fd`] already do for a supersede/reconnect,
+/// both of which assume `&mut self.tracked` (poll-thread-private, moved
+/// into the background thread by [`HotplugDetector::spawn`]). Releasing a
+/// lease means reopening the device and re-arming a fresh reader thread —
+/// again `attempt_open`-shaped work needing the same `&mut self.tracked`
+/// plus `self.disconnect_tx`. Routing both through a command channel the
+/// poll thread already drains once per tick (same pattern as
+/// `DisconnectNotice`) reuses that existing, already-tested machinery
+/// as-is, rather than duplicating it behind a second lock or restructuring
+/// `ConnectionState` to be `Mutex`-shared just for this one feature.
+enum LeaseCommand {
+    Acquire {
+        id: DeviceId,
+        command: String,
+        pid: u32,
+        timeout_s: Option<f64>,
+        reply: mpsc::Sender<Result<LeaseAcquired, LeaseError>>,
+    },
+    Release {
+        token: String,
+        exit_code: i32,
+        reply: mpsc::Sender<Result<LeaseReleased, LeaseError>>,
+    },
+}
+
 /// A per-device reader thread's report that it stopped reading (EOF or a
 /// real I/O error) — the primary disconnect signal (see module docs).
 struct DisconnectNotice {
@@ -652,6 +882,17 @@ pub struct HotplugDetector {
     recorders: SharedRecorders,
     configs: SharedDeviceConfigs,
     profiles: Arc<ProfileStore>,
+    /// Lease requests submitted from outside the poll thread — see
+    /// [`LeaseCommand`].
+    lease_tx: mpsc::Sender<LeaseCommand>,
+    lease_rx: mpsc::Receiver<LeaseCommand>,
+    /// Devices with an active lease right now. Poll-thread-private (never
+    /// shared behind a `Mutex`) for the same reason `tracked` is — see
+    /// [`LeaseCommand`]'s docs. [`reconcile_present`]/[`reconcile_missing`]
+    /// skip any device_id present here entirely, which is what stops the
+    /// normal hotplug machinery from racing a lease holder to reopen the
+    /// port out from under it.
+    leases: HashMap<DeviceId, ActiveLease>,
 }
 
 impl HotplugDetector {
@@ -661,6 +902,7 @@ impl HotplugDetector {
         config: HotplugConfig,
     ) -> Self {
         let (disconnect_tx, disconnect_rx) = mpsc::channel();
+        let (lease_tx, lease_rx) = mpsc::channel();
         let data_dir = data_dir.into();
         let profiles = Arc::new(ProfileStore::new(data_dir.clone()));
         Self {
@@ -674,6 +916,9 @@ impl HotplugDetector {
             recorders: Arc::new(Mutex::new(HashMap::new())),
             configs: Arc::new(Mutex::new(HashMap::new())),
             profiles,
+            lease_tx,
+            lease_rx,
+            leases: HashMap::new(),
         }
     }
 
@@ -691,16 +936,20 @@ impl HotplugDetector {
             configs: Arc::clone(&self.configs),
             recorders: Arc::clone(&self.recorders),
             profiles: Arc::clone(&self.profiles),
+            lease_tx: self.lease_tx.clone(),
         }
     }
 
     /// Run exactly one enumerate-and-reconcile cycle: drain pending
-    /// disconnect notices, enumerate current devices, open/reconnect any
+    /// disconnect notices and lease commands, reclaim any lease whose
+    /// deadline has passed, enumerate current devices, open/reconnect any
     /// that need it, and mark anything no longer enumerated as
     /// disconnected. Safe to call directly in a tight loop from tests —
     /// see the module docs.
     pub fn poll_once(&mut self) -> io::Result<()> {
         self.drain_disconnect_notices();
+        self.drain_lease_commands();
+        self.reclaim_expired_leases();
 
         let snapshot = self.enumerator.enumerate()?;
         let mut seen = HashSet::with_capacity(snapshot.len());
@@ -722,6 +971,7 @@ impl HotplugDetector {
         let recorders = Arc::clone(&self.recorders);
         let configs = Arc::clone(&self.configs);
         let profiles = Arc::clone(&self.profiles);
+        let lease_tx = self.lease_tx.clone();
         let poll_interval = self.config.poll_interval;
 
         let join = thread::spawn(move || {
@@ -759,10 +1009,18 @@ impl HotplugDetector {
             recorders,
             configs,
             profiles,
+            lease_tx,
         }
     }
 
     fn reconcile_present(&mut self, id: DeviceId, dev: EnumeratedDevice) {
+        // A leased device is left entirely alone: it's still physically
+        // enumerated (nothing about a lease changes what's plugged in), but
+        // the poll loop must not reopen it out from under whatever
+        // currently holds the port — see `leases`' docs and `LeaseCommand`.
+        if self.leases.contains_key(&id) {
+            return;
+        }
         // Phase 1: decide what to do — this borrows `self.tracked`
         // immutably and produces a plain, borrow-free `PresentAction`, so
         // phase 2 below is free to take `&mut self` without any conflict.
@@ -832,6 +1090,12 @@ impl HotplugDetector {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.clone(), Arc::clone(&recorder));
+
+        // The first time this detector instance ever sees this device_id
+        // is exactly the right (and only) moment to check for a lease left
+        // dangling by a previous daemon process against the same
+        // `data_dir` — see [`Self::recover_residual_lease`].
+        self.recover_residual_lease(&id, &recorder);
 
         // Load this device's persisted profile (if any) the first time
         // it's ever seen — falls back to `DeviceProfile::default()` for a
@@ -1075,6 +1339,7 @@ impl HotplugDetector {
             .iter()
             .filter(|(id, t)| {
                 !seen.contains(*id)
+                    && !self.leases.contains_key(*id)
                     && matches!(
                         t.state,
                         ConnectionState::Connected { .. } | ConnectionState::OpenFailed { .. }
@@ -1138,6 +1403,405 @@ impl HotplugDetector {
         for id in &newly_disconnected {
             self.clear_live_fd(id);
         }
+    }
+
+    // ---- Lease mode (`TASKS.md` T2.2, issue #9) ------------------------
+
+    /// Drain every [`LeaseCommand`] queued by [`PortConfigApi::acquire_lease`]/
+    /// [`PortConfigApi::release_lease`] since the last call, processing each
+    /// synchronously (same drain-at-top-of-`poll_once` shape as
+    /// [`Self::drain_disconnect_notices`]) and replying on its channel.
+    fn drain_lease_commands(&mut self) {
+        while let Ok(cmd) = self.lease_rx.try_recv() {
+            match cmd {
+                LeaseCommand::Acquire {
+                    id,
+                    command,
+                    pid,
+                    timeout_s,
+                    reply,
+                } => {
+                    let result = self.handle_acquire_lease(&id, command, pid, timeout_s);
+                    let _ = reply.send(result);
+                }
+                LeaseCommand::Release {
+                    token,
+                    exit_code,
+                    reply,
+                } => {
+                    let result = self.handle_release_lease(&token, exit_code);
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    }
+
+    fn handle_acquire_lease(
+        &mut self,
+        id: &DeviceId,
+        command: String,
+        pid: u32,
+        timeout_s: Option<f64>,
+    ) -> Result<LeaseAcquired, LeaseError> {
+        if let Some(existing) = self.leases.get(id) {
+            return Err(LeaseError::AlreadyLeased {
+                holder: format!("pid {} running `{}`", existing.pid, existing.command),
+            });
+        }
+        let path = self.take_fd_for_lease(id).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => LeaseError::UnknownDevice,
+            io::ErrorKind::NotConnected => LeaseError::NotConnected,
+            _ => LeaseError::Io(e.to_string()),
+        })?;
+
+        let token = generate_lease_token();
+        let started = Instant::now();
+        let deadline = timeout_s
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .map(|s| started + Duration::from_secs_f64(s));
+        self.leases.insert(
+            id.clone(),
+            ActiveLease {
+                token: token.clone(),
+                command: command.clone(),
+                pid,
+                started,
+                deadline,
+            },
+        );
+
+        if let Err(e) = self.persist_lease(id, &token, &command, pid, timeout_s) {
+            eprintln!(
+                "serialwrapd: port: failed to persist lease state for {} (a daemon crash mid-\
+                 lease will not be auto-reclaimed on restart): {e}",
+                id.0
+            );
+        }
+        if let Some(recorder) = self.tracked.get(id).map(|t| Arc::clone(&t.recorder)) {
+            if let Err(e) =
+                append_lease_start_event(&recorder, id, &path, &command, pid, &token, timeout_s)
+            {
+                eprintln!(
+                    "serialwrapd: port: failed to append lease_start event for {}: {e}",
+                    id.0
+                );
+            }
+        }
+        Ok(LeaseAcquired { token, path })
+    }
+
+    fn handle_release_lease(
+        &mut self,
+        token: &str,
+        exit_code: i32,
+    ) -> Result<LeaseReleased, LeaseError> {
+        let Some(id) = self
+            .leases
+            .iter()
+            .find(|(_, l)| l.token == token)
+            .map(|(id, _)| id.clone())
+        else {
+            return Err(LeaseError::UnknownToken);
+        };
+        let lease = self.leases.remove(&id).expect("just located above");
+        let duration_ms = self.finish_lease(&id, &lease, Some(exit_code), "released");
+        Ok(LeaseReleased { duration_ms })
+    }
+
+    /// Check every currently-active lease's deadline (if any) and reclaim
+    /// any that has passed — the daemon's own safety net for
+    /// `--lease-timeout`, independent of whether the client that acquired
+    /// the lease is still around to call `release_lease` itself (see
+    /// `TASKS.md` T2.2's "`--lease-timeout` 逾時...daemon 收回" acceptance
+    /// criterion). Runs every [`Self::poll_once`] tick, so the worst-case
+    /// delay past the deadline is one `poll_interval` — comfortably inside
+    /// the 1-second bound the issue's acceptance criteria set.
+    fn reclaim_expired_leases(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<DeviceId> = self
+            .leases
+            .iter()
+            .filter(|(_, l)| l.deadline.is_some_and(|d| now >= d))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            if let Some(lease) = self.leases.remove(&id) {
+                self.finish_lease(&id, &lease, None, "timeout");
+            }
+        }
+    }
+
+    /// Shared tail end of both a client-requested release and a daemon-
+    /// initiated timeout reclaim: reopen the device, append `lease_end`,
+    /// and drop the persisted lease file. Returns the lease's held
+    /// duration in milliseconds. Best-effort on the reopen — matching this
+    /// module's general "config/connect problems don't fail the whole
+    /// operation" stance (see `port_io`'s module docs): if the path is
+    /// somehow still busy (e.g. an external tool that never actually let
+    /// go), the device is left `Disconnected` and the *normal* poll loop's
+    /// existing retry/cooldown machinery (no longer held back by `leases`,
+    /// since the entry was already removed by the caller) picks it back up
+    /// on a later tick.
+    fn finish_lease(
+        &mut self,
+        id: &DeviceId,
+        lease: &ActiveLease,
+        exit_code: Option<i32>,
+        reason: &str,
+    ) -> u64 {
+        let duration_ms = lease.started.elapsed().as_millis() as u64;
+        if let Err(e) = self.reopen_after_lease(id) {
+            eprintln!(
+                "serialwrapd: port: failed to reopen {} after its lease ended (will retry via \
+                 the normal reconnect path): {e}",
+                id.0
+            );
+        }
+        let recorder_and_path = {
+            let path = self
+                .configs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(id)
+                .and_then(|c| c.path.clone());
+            self.tracked
+                .get(id)
+                .map(|t| (Arc::clone(&t.recorder), path))
+        };
+        if let Some((recorder, path)) = recorder_and_path {
+            if let Err(e) = append_lease_end_event(
+                &recorder,
+                id,
+                path.as_deref(),
+                &lease.command,
+                lease.pid,
+                &lease.token,
+                exit_code,
+                duration_ms,
+                reason,
+            ) {
+                eprintln!(
+                    "serialwrapd: port: failed to append lease_end event for {}: {e}",
+                    id.0
+                );
+            }
+        }
+        self.remove_persisted_lease(id);
+        duration_ms
+    }
+
+    /// Stop and join `id`'s reader thread and clear its live fd (see
+    /// [`stop_and_join_reader`]/[`Self::clear_live_fd`]) without touching
+    /// `tracked`'s recorder or appending any connect/disconnect event —
+    /// this is a controlled handoff, not a disconnect. Returns the path
+    /// the device was open at, which the caller hands off to whatever
+    /// external process the lease is for.
+    fn take_fd_for_lease(&mut self, id: &DeviceId) -> io::Result<PathBuf> {
+        let Some(tracked) = self.tracked.get_mut(id) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown device {}", id.0),
+            ));
+        };
+        let path = match &tracked.state {
+            ConnectionState::Connected { path, .. } => path.clone(),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("{} is not currently connected", id.0),
+                ));
+            }
+        };
+        let old = std::mem::replace(
+            &mut tracked.state,
+            ConnectionState::Disconnected {
+                since: Instant::now(),
+                last_path: path.clone(),
+            },
+        );
+        stop_and_join_reader(old);
+        self.clear_live_fd(id);
+        Ok(path)
+    }
+
+    /// Reverse of [`Self::take_fd_for_lease`]: reopen the device at its
+    /// last-known path, re-arm a fresh reader thread, and restore
+    /// `Connected` state — everything [`Self::attempt_open`]'s success path
+    /// does, *except* appending a `connect`/`config_change` event, since
+    /// (per the lease-vs-disconnect distinction the wiki draws) this is a
+    /// resumption, not a fresh connection.
+    fn reopen_after_lease(&mut self, id: &DeviceId) -> io::Result<()> {
+        let (path, config) = {
+            let configs = self.configs.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = configs.get(id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("unknown device {}", id.0))
+            })?;
+            let path = entry.path.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} has no known path", id.0),
+                )
+            })?;
+            (path, entry.profile.config.clone())
+        };
+
+        let (file, config_err) = port_io::open_and_configure(&path, &config)?;
+        if let Some(e) = config_err {
+            eprintln!(
+                "serialwrapd: port: config application for {} did not fully apply after lease \
+                 release (device is still connected and recording): {e}",
+                id.0
+            );
+        }
+
+        let Some(recorder) = self.tracked.get(id).map(|t| Arc::clone(&t.recorder)) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown device {}", id.0),
+            ));
+        };
+
+        let file = Arc::new(file);
+        if let Some(entry) = self
+            .configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(id)
+        {
+            entry.fd = Some(Arc::clone(&file));
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+        let reader_tx = self.disconnect_tx.clone();
+        let reader_id = id.clone();
+        let reader_file = Arc::clone(&file);
+        let reader = thread::spawn(move || {
+            run_reader(reader_file, reader_id, recorder, reader_tx, reader_stop);
+        });
+
+        if let Some(tracked) = self.tracked.get_mut(id) {
+            tracked.state = ConnectionState::Connected { path, stop, reader };
+        }
+        Ok(())
+    }
+
+    fn lease_file_path(&self, id: &DeviceId) -> PathBuf {
+        self.data_dir.join("devices").join(&id.0).join("lease.json")
+    }
+
+    /// Persist a just-acquired lease to `<data_dir>/devices/<id>/lease.json`
+    /// (atomic write-then-rename, same pattern `device_profile::ProfileStore::save`
+    /// uses) — the durable record [`Self::recover_residual_lease`] reads
+    /// back after a crash/restart. Best-effort: a failure here is logged by
+    /// the caller, never fatal to the lease itself (the in-memory
+    /// `ActiveLease` is still fully functional for this process's
+    /// lifetime; only crash-recovery is degraded).
+    fn persist_lease(
+        &self,
+        id: &DeviceId,
+        token: &str,
+        command: &str,
+        pid: u32,
+        timeout_s: Option<f64>,
+    ) -> io::Result<()> {
+        let path = self.lease_file_path(id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let started_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let persisted = PersistedLease {
+            token: token.to_string(),
+            command: command.to_string(),
+            pid,
+            started_epoch_ms,
+            timeout_s,
+        };
+        let bytes = serde_json::to_vec(&persisted)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, &bytes)?;
+        fs::rename(&tmp_path, &path)?;
+        Ok(())
+    }
+
+    fn remove_persisted_lease(&self, id: &DeviceId) {
+        let path = self.lease_file_path(id);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "serialwrapd: port: failed to remove lease file for {}: {e}",
+                id.0
+            ),
+        }
+    }
+
+    /// Check for a lease file left behind by a previous daemon process
+    /// against this same `data_dir` (see [`PersistedLease`]'s docs) and, if
+    /// found, close it out: append a `lease_end` event with `reason:
+    /// "daemon_restart"` (an honest record that the previous process died
+    /// mid-lease, not a silent gap) and remove the file. Called from
+    /// [`Self::handle_new_device`] — the first (and only) moment a fresh
+    /// `HotplugDetector` instance sees this device_id, which is exactly
+    /// when "was this leased by whoever ran before me" needs answering.
+    /// Never touches `self.leases`/`self.tracked` — normal connect
+    /// processing (already in progress in the caller) proceeds exactly as
+    /// it would for a device with no residual lease at all.
+    fn recover_residual_lease(&self, id: &DeviceId, recorder: &Recorder) {
+        let path = self.lease_file_path(id);
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) => {
+                eprintln!(
+                    "serialwrapd: port: failed to read residual lease file for {}: {e}",
+                    id.0
+                );
+                return;
+            }
+        };
+        let persisted: PersistedLease = match serde_json::from_slice(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "serialwrapd: port: residual lease file for {} is corrupt, discarding: {e}",
+                    id.0
+                );
+                let _ = fs::remove_file(&path);
+                return;
+            }
+        };
+        let now_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let duration_ms = now_epoch_ms.saturating_sub(persisted.started_epoch_ms);
+        if let Err(e) = append_lease_end_event(
+            recorder,
+            id,
+            None,
+            &persisted.command,
+            persisted.pid,
+            &persisted.token,
+            None,
+            duration_ms,
+            "daemon_restart",
+        ) {
+            eprintln!(
+                "serialwrapd: port: failed to append recovery lease_end event for {}: {e}",
+                id.0
+            );
+        }
+        let _ = fs::remove_file(&path);
+        eprintln!(
+            "serialwrapd: port: reclaimed a residual lease for {} left by a previous daemon \
+             instance (token {})",
+            id.0, persisted.token
+        );
     }
 }
 
@@ -1244,6 +1908,7 @@ pub struct DetectorHandle {
     recorders: SharedRecorders,
     configs: SharedDeviceConfigs,
     profiles: Arc<ProfileStore>,
+    lease_tx: mpsc::Sender<LeaseCommand>,
 }
 
 impl DetectorHandle {
@@ -1259,6 +1924,7 @@ impl DetectorHandle {
             configs: Arc::clone(&self.configs),
             recorders: Arc::clone(&self.recorders),
             profiles: Arc::clone(&self.profiles),
+            lease_tx: self.lease_tx.clone(),
         }
     }
 
@@ -1300,6 +1966,9 @@ pub struct PortConfigApi {
     configs: SharedDeviceConfigs,
     recorders: SharedRecorders,
     profiles: Arc<ProfileStore>,
+    /// Submits lease acquire/release requests to the poll thread — see
+    /// [`LeaseCommand`].
+    lease_tx: mpsc::Sender<LeaseCommand>,
 }
 
 /// One device's summary for `list_devices` (`TASKS.md` T1.4): identity,
@@ -1479,6 +2148,69 @@ impl PortConfigApi {
     pub fn error_counts(&self, id: &DeviceId) -> io::Result<ErrorCounts> {
         let fd = self.live_fd(id)?;
         error_counts::read_error_counts(current_platform(), fd.as_raw_fd())
+    }
+
+    /// Write `data` to `id`'s physical port through the exact same shared
+    /// fd `set_dtr`/`dtr_pulse`/the reader thread already operate on (see
+    /// [`Self::live_fd`]) — never a second, independently opened fd. This
+    /// is what makes lease mode actually work: a lease's entire point is
+    /// that [`PortConfigApi::acquire_lease`] closes *every* fd this daemon
+    /// holds for the device, and it can only keep that promise if there is
+    /// exactly one fd to close in the first place (`TASKS.md` T2.2, issue
+    /// #9 — see `protocol::backend::LiveBackend::write_bytes`'s docs for
+    /// the T2.1-era second-fd workaround this replaces). Errors with
+    /// [`io::ErrorKind::NotConnected`] whenever there's no live fd to write
+    /// through — including, deliberately, for the entire duration of an
+    /// active lease.
+    pub fn write_bytes(&self, id: &DeviceId, data: &[u8]) -> io::Result<()> {
+        let fd = self.live_fd(id)?;
+        (&*fd).write_all(data)
+    }
+
+    /// Acquire an exclusive lease on `id`'s port: stop its reader thread,
+    /// close every fd this daemon holds for it, and mark it so the poll
+    /// loop leaves it alone until [`Self::release_lease`] (or the daemon's
+    /// own `timeout_s` deadline) ends the lease. Returns the device's
+    /// current path (for the caller to hand off to an external tool) and
+    /// an opaque `token` to release with later. See [`LeaseCommand`] for
+    /// why this round-trips through the poll thread rather than acting
+    /// directly.
+    pub fn acquire_lease(
+        &self,
+        id: &DeviceId,
+        command: &str,
+        pid: u32,
+        timeout_s: Option<f64>,
+    ) -> Result<LeaseAcquired, LeaseError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.lease_tx
+            .send(LeaseCommand::Acquire {
+                id: id.clone(),
+                command: command.to_string(),
+                pid,
+                timeout_s,
+                reply: reply_tx,
+            })
+            .map_err(|_| LeaseError::Io("the poll thread is not running".to_string()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| LeaseError::Io("the poll thread dropped the reply channel".to_string()))?
+    }
+
+    /// End a lease previously granted by [`Self::acquire_lease`], identified
+    /// by its opaque `token`. Reopens the device and resumes recording.
+    pub fn release_lease(&self, token: &str, exit_code: i32) -> Result<LeaseReleased, LeaseError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.lease_tx
+            .send(LeaseCommand::Release {
+                token: token.to_string(),
+                exit_code,
+                reply: reply_tx,
+            })
+            .map_err(|_| LeaseError::Io("the poll thread is not running".to_string()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| LeaseError::Io("the poll thread dropped the reply channel".to_string()))?
     }
 
     fn live_fd(&self, id: &DeviceId) -> io::Result<Arc<File>> {

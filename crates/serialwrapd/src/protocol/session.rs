@@ -38,7 +38,7 @@ use tokio::sync::Notify;
 
 use wrap_proto::{ErrorCode, HelloAck, HelloRequest, LineEnding, Permission, Request, WireError};
 
-use crate::port::DeviceId;
+use crate::port::{DeviceId, LeaseError};
 use crate::query::{OobRecord, QueryError, QueryPage, WaitForOutcome};
 
 use super::peer_cred;
@@ -155,6 +155,35 @@ fn backend_error_to_wire(e: &io::Error, device: &str) -> WireError {
         ),
         io::ErrorKind::InvalidInput => WireError::new(ErrorCode::InvalidRequest, e.to_string()),
         _ => WireError::new(ErrorCode::Internal, e.to_string()),
+    }
+}
+
+/// Map a [`LeaseError`] onto a structured wire error (`TASKS.md` T2.2,
+/// issue #9). `context` is the device name for [`LeaseError::UnknownDevice`]/
+/// [`LeaseError::NotConnected`]/[`LeaseError::AlreadyLeased`] (acquire-side
+/// errors, which always know the device), or the token for
+/// [`LeaseError::UnknownToken`] (release-side — a release request never
+/// names a device, only a token).
+fn lease_error_to_wire(e: &LeaseError, context: &str) -> WireError {
+    match e {
+        LeaseError::UnknownDevice => WireError::new(
+            ErrorCode::DeviceNotFound,
+            format!("no such device: {context}"),
+        ),
+        LeaseError::NotConnected => WireError::new(
+            ErrorCode::DeviceDisconnected,
+            format!("{context} is not currently attached"),
+        ),
+        LeaseError::AlreadyLeased { holder } => WireError::new(
+            ErrorCode::LeaseHeld,
+            format!("{context} already has an active lease, held by {holder}"),
+        )
+        .with("holder", holder.clone()),
+        LeaseError::UnknownToken => WireError::new(
+            ErrorCode::InvalidRequest,
+            format!("no active lease for token {context:?}"),
+        ),
+        LeaseError::Io(msg) => WireError::new(ErrorCode::Internal, msg.clone()),
     }
 }
 
@@ -326,6 +355,7 @@ pub async fn handle_connection(stream: UnixStream, shared: Arc<Shared>) {
         Arc::clone(&shared),
         client_id,
         changed_by,
+        peer_pid,
         tx,
         Arc::clone(&kill),
     )
@@ -363,6 +393,7 @@ async fn reader_loop(
     shared: Arc<Shared>,
     client_id: u64,
     changed_by: String,
+    peer_pid: u32,
     tx: UnboundedSender<String>,
     kill: Arc<Notify>,
 ) {
@@ -378,7 +409,7 @@ async fn reader_loop(
                 let changed_by = changed_by.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    handle_request(bytes, client_id, changed_by, shared, tx).await;
+                    handle_request(bytes, client_id, changed_by, peer_pid, shared, tx).await;
                 });
             }
             Ok(ReadLineResult::Eof) => return,
@@ -414,6 +445,7 @@ async fn handle_request(
     raw: Vec<u8>,
     client_id: u64,
     changed_by: String,
+    peer_pid: u32,
     shared: Arc<Shared>,
     tx: UnboundedSender<String>,
 ) {
@@ -463,7 +495,7 @@ async fn handle_request(
         }
     };
 
-    dispatch(id, request, client_id, &changed_by, &shared, &tx).await;
+    dispatch(id, request, client_id, &changed_by, peer_pid, &shared, &tx).await;
 }
 
 async fn dispatch(
@@ -471,6 +503,7 @@ async fn dispatch(
     request: Request,
     client_id: u64,
     changed_by: &str,
+    peer_pid: u32,
     shared: &Arc<Shared>,
     tx: &UnboundedSender<String>,
 ) {
@@ -992,30 +1025,66 @@ async fn dispatch(
                 ),
             }
         }
-        Request::LeaseAcquire { .. } => send(
-            shared,
-            client_id,
-            tx,
-            err_reply(
-                Some(id),
-                WireError::new(
-                    ErrorCode::PermissionDenied,
-                    "lease acquisition not implemented yet (see TASKS.md T2.2)",
+        Request::LeaseAcquire {
+            device,
+            command,
+            timeout_s,
+        } => {
+            // `pid` is this connection's own kernel-verified peer pid (the
+            // same value `changed_by`'s trailing `:pid` component already
+            // carries) — the process that *asked* for the lease, not
+            // necessarily the pid of whatever it execs afterward, which the
+            // daemon has no way to know at acquire time (see
+            // `port::append_lease_start_event`'s docs). Permission is
+            // deliberately unchecked here: every `ClientType`, including
+            // `tool` (whose only permission, `LeaseOnly`, exists
+            // specifically to act through a lease), is allowed to request
+            // one — narrowing that is T4.x's rule engine's job, not this
+            // task's (`TASKS.md` T2.2).
+            let dev = DeviceId(device.clone());
+            match shared
+                .backend
+                .acquire_lease(&dev, &command, peer_pid, timeout_s)
+            {
+                Ok(acquired) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    ok_reply(
+                        id,
+                        serde_json::json!({
+                            "token": acquired.token,
+                            "path": acquired.path.to_string_lossy(),
+                        }),
+                    ),
                 ),
-            ),
-        ),
-        Request::LeaseRelease { .. } => send(
-            shared,
-            client_id,
-            tx,
-            err_reply(
-                Some(id),
-                WireError::new(
-                    ErrorCode::PermissionDenied,
-                    "lease release not implemented yet (see TASKS.md T2.2)",
+                Err(e) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(Some(id), lease_error_to_wire(&e, &device)),
                 ),
-            ),
-        ),
+            }
+        }
+        Request::LeaseRelease { token, exit_code } => {
+            match shared.backend.release_lease(&token, exit_code) {
+                Ok(released) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    ok_reply(
+                        id,
+                        serde_json::json!({ "duration_ms": released.duration_ms }),
+                    ),
+                ),
+                Err(e) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(Some(id), lease_error_to_wire(&e, &token)),
+                ),
+            }
+        }
 
         Request::ListClients => {
             let clients: Vec<_> = shared

@@ -37,7 +37,7 @@ enum Command {
     Write(cli::write::WriteArgs),
     /// Take a temporary lease and run an external command against the device
     /// (see TASKS.md T2.2).
-    Run,
+    Run(cli::run::RunArgs),
     /// Read or update per-device configuration (see TASKS.md T2.3).
     Config(cli::config::ConfigArgs),
     /// List, kick, or demote connected clients (see TASKS.md T2.3).
@@ -59,7 +59,7 @@ async fn main() -> std::io::Result<()> {
         Command::Devices => cli::dispatch(cli::devices::run().await),
         Command::Tail(args) => cli::dispatch(cli::tail::run(args).await),
         Command::Write(args) => cli::dispatch(cli::write::run(args).await),
-        Command::Run => stub("run", "T2.2"),
+        Command::Run(args) => cli::dispatch(cli::run::run(args).await),
         Command::Config(args) => cli::dispatch(cli::config::run(args).await),
         Command::Clients(args) => cli::dispatch(cli::clients::run(args).await),
         Command::Export => stub("export", "T2.4"),
