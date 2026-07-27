@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # Kept in one place so the Rust job, the web-lint job, and the E2E job
+  # all install the same Node version (`webui/README.md` documents this as
+  # the minimum supported version too).
+  NODE_VERSION: "22"
+
 jobs:
   test:
     name: fmt, clippy, test (${{ matrix.os }})
@@ -25,6 +31,23 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      # `rust-embed` (T5.1, issue #18) reads `webui/dist` at compile time —
+      # this has to run before any cargo step below. It does *not* count
+      # against the "cargo test --all stays fast" budget: that's a
+      # separate, later step timed on its own.
+      - name: Build web frontend (embedded into the daemon binary)
+        working-directory: webui
+        run: |
+          npm ci
+          npm run build
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -36,3 +59,84 @@ jobs:
 
       - name: cargo test --all -- --ignored (long-running acceptance runs)
         run: cargo test --all -- --ignored
+
+  web-lint:
+    name: web lint, type-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: webui
+        run: npm ci
+
+      - name: ESLint
+        working-directory: webui
+        run: npm run lint
+
+      - name: svelte-check + tsc (frontend and e2e sources)
+        working-directory: webui
+        run: npm run check
+
+  e2e:
+    name: Playwright E2E
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: webui
+        run: npm ci
+
+      - name: Build web frontend
+        working-directory: webui
+        run: npm run build
+
+      # A release build so E2E measures/exercises the same artifact users
+      # actually run — also re-proves the "assets embedded" acceptance
+      # criterion on a from-scratch CI checkout, not just locally.
+      - name: Build release daemon binary (embeds the frontend above)
+        run: cargo build --release -p serialwrap
+
+      - name: Install Playwright's Chromium
+        working-directory: webui
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright E2E against the real daemon binary
+        working-directory: webui
+        run: npx playwright test --config=e2e/playwright.config.ts
+        env:
+          SERIALWRAP_PROFILE: release
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            webui/e2e/playwright-report/
+            webui/e2e/test-results/
+          retention-days: 7
+          if-no-files-found: ignore

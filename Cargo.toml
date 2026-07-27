@@ -29,9 +29,10 @@ clap = { version = "4", features = ["derive"] }
 # assembled lines, never partial ones (see `serialwrapd::query`).
 regex = "1"
 
-# Reserved for later milestones (T5.1 web GUI, T6.1 packaging). Listed here
-# now so the version is pinned workspace-wide, but no crate depends on them
-# yet at this skeleton stage.
+# The embedded web GUI (T5.1, issue #18): `serialwrapd::web` serves
+# `GET /api/*`/`WS /api/stream` with axum and embeds `webui/dist` (the
+# built frontend) with rust-embed. Still reserved here (not bumped) for
+# T6.1 packaging, which doesn't add a new crate dependent on either.
 axum = "0.8"
 rust-embed = "8"
 

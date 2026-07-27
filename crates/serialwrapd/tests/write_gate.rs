@@ -339,14 +339,26 @@ async fn timeout_denial_precision_is_within_one_second() {
     assert_eq!(reply["error"]["reason"], "timeout_1s", "{reply}");
 
     // The acceptance criterion allows ≤1s of error; asserted here with a
-    // much tighter margin (150ms) so this is a meaningful regression test
-    // of the timeout mechanism's own precision, not just confirmation that
-    // it's within the maximum the spec would tolerate anyway.
+    // tighter margin so this is a meaningful regression test of the
+    // timeout mechanism's own precision, not just confirmation that it's
+    // within the maximum the spec would tolerate anyway. That margin is
+    // 500ms, not the ~150ms this test originally used — 150ms turned out
+    // to be a CI-runner-noise floor, not a real precision requirement, and
+    // flaked on a loaded shared macOS/Linux CI runner (observed: 1.185s
+    // for a configured 1s, a 185ms error against a 150ms bound — see
+    // TASKS.md's "測試紀律" section and issue #39 for the same category of
+    // mistake: treating a shared runner's execution speed as a known
+    // quantity). 500ms is still 2x tighter than the ≤1s the spec actually
+    // promises, so it still catches a real regression (the mechanism
+    // silently doubling its timeout, or firing immediately without
+    // waiting at all) while leaving room for scheduler noise. Don't
+    // tighten this back down without re-deriving it from observed CI
+    // noise, not from "more precision would be nice to assert."
     let error = elapsed.as_secs_f64() - configured.as_secs_f64();
     assert!(
-        (0.0..=0.15).contains(&error),
+        (0.0..=0.5).contains(&error),
         "timeout fired {elapsed:?} after a configured {configured:?} (error {error:.3}s) — \
-         expected within [0, 150ms] of the configured value"
+         expected within [0, 500ms] of the configured value"
     );
     eprintln!("timeout precision: configured={configured:?} actual={elapsed:?} error={error:.4}s");
 }

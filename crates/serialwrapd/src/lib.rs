@@ -24,13 +24,20 @@ pub mod presentation;
 pub mod protocol;
 pub mod query;
 pub mod recorder;
+pub mod web;
 
 use std::sync::Arc;
 
 /// Entry point the `serialwrap daemon` subcommand calls: brings up hotplug
-/// detection (T1.1) against the real system enumerator and the UDS
-/// protocol server (T1.4) on the production socket path, and serves
-/// forever.
+/// detection (T1.1) against the real system enumerator, the UDS protocol
+/// server (T1.4) on the production socket path, and the embedded web GUI
+/// (T5.1, issue #18) on `127.0.0.1` — and serves forever.
+///
+/// The web listener's bind failure is propagated (`?`), not
+/// logged-and-skipped: per this project's stance against silently
+/// half-working state (see `web::serve_on`'s doc comment), a daemon that
+/// claims to have started but has no working browser endpoint is worse
+/// than one that fails loudly at startup.
 ///
 /// CLI-level concerns (daemonizing, PID files, log destinations) are
 /// T1.5's territory — this is the in-process daemon core only.
@@ -47,18 +54,42 @@ pub async fn run() -> std::io::Result<()> {
     ));
     let handle = detector.spawn();
 
+    // Bind the web listener *before* `protocol::server::bind`: the UDS
+    // bind is destructive — it unconditionally unlinks whatever socket
+    // file is already at that path, live daemon or not (see that
+    // function's own doc comment) — while a TCP bind failure just fails.
+    // Binding the safe one first means an accidental second `serialwrap
+    // daemon` (its web port already taken by the first instance) exits
+    // here, before ever touching the first instance's socket, instead of
+    // unlinking a socket a perfectly healthy daemon is still listening on.
+    let web_listener = tokio::net::TcpListener::bind(web::web_addr()).await?;
+
     let socket_path = protocol::default_socket_path()?;
     let listener = protocol::server::bind(&socket_path)?;
     let shared = Arc::new(
         protocol::Shared::new(backend, env!("CARGO_PKG_VERSION")).with_gate(production_gate()),
     );
+    let web_shared = Arc::clone(&shared);
 
-    protocol::server::serve(listener, shared).await;
+    // Both futures loop forever absent a fatal error of their own kind
+    // (an accept-loop failure for the UDS side, a bind/serve failure for
+    // the web side) — `select!` means either one returning at all ends
+    // `run`, which is intentional: neither half of "daemon" is optional.
+    tokio::select! {
+        () = protocol::server::serve(listener, shared) => {}
+        result = web::serve_on(web_listener, web_shared) => {
+            result?;
+        }
+    }
 
-    // Unreachable in practice (`serve` loops forever absent a fatal accept
-    // error, which it logs and continues past) — kept so `handle` has a
-    // clear owner and an explicit, orderly shutdown path exists if `serve`
-    // is ever changed to return.
+    // Unreachable in practice, same as the pre-T5.1 version of this
+    // function: both futures above loop forever absent a fatal error,
+    // which `?` already propagates before this line. Kept anyway (review
+    // finding #10 on PR #43 flagged the previous wording here as
+    // overclaiming — "an explicit, orderly shutdown path" reads as if this
+    // runs on normal shutdown, which it never does) purely so `handle` has
+    // a clear owner and there's *something* to run if `serve`/`serve_on`
+    // are ever changed to return `Ok` instead of only erroring.
     handle.stop();
     Ok(())
 }
