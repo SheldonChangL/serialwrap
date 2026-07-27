@@ -10,4 +10,30 @@ repository.workspace = true
 serialwrapd = { path = "../serialwrapd" }
 wrap-proto = { path = "../wrap-proto" }
 clap = { workspace = true }
-tokio = { workspace = true }
+# `signal` on top of the workspace's base feature set: `tail -f`'s Ctrl-C
+# handling (T1.5) uses `tokio::signal::ctrl_c()`.
+tokio = { workspace = true, features = ["signal"] }
+serde_json = { workspace = true }
+# RFC 3339 parsing/formatting for `tail`'s default timestamp display and
+# `--since` (T1.5) — the client-side read counterpart to the same crate's
+# `t_wall` encoding `serialwrapd` already relies on (T1.2).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+# Test-only PTY fixture (see TASKS.md T0.2), used by this crate's own
+# `devices`/`tail` integration tests (T1.5) the same way `serialwrapd`'s
+# tests use it — dev-dependency only, never linked into the release binary.
+mock-device = { path = "../mock-device" }
+tempfile = "3"
+# Decode `data_b64` when peeking at a test daemon's raw `Recorder` directly
+# (the S1 acceptance test, T1.5) — same version `serialwrapd` itself uses.
+base64 = "0.22"
+# Send a real SIGINT to a spawned `serialwrap tail -f` child process, to
+# test the Ctrl-C acceptance criterion (T1.5) against the actual compiled
+# binary rather than an in-process approximation.
+nix = { workspace = true, features = ["signal"] }
+# Spawn the compiled `serialwrap` binary as a child process from
+# integration tests (T1.5) — the base `[dependencies]` tokio feature set
+# doesn't include `process`, since production `devices`/`tail`/`daemon`
+# code never spawns a child itself.
+tokio = { workspace = true, features = ["process"] }

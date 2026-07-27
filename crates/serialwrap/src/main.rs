@@ -6,6 +6,10 @@
 
 use clap::{Parser, Subcommand};
 
+/// `devices`/`tail` (T1.5, issue #7) live in their own module tree rather
+/// than inline here — see `cli`'s module docs for why.
+mod cli;
+
 #[derive(Parser)]
 #[command(
     name = "serialwrap",
@@ -26,7 +30,7 @@ enum Command {
     /// List known devices (see TASKS.md T1.5).
     Devices,
     /// Tail a device's record stream (see TASKS.md T1.5).
-    Tail,
+    Tail(cli::tail::TailArgs),
     /// Write bytes to a device, subject to the write gate (see TASKS.md T2.1).
     Write,
     /// Take a temporary lease and run an external command against the device
@@ -50,8 +54,8 @@ async fn main() -> std::io::Result<()> {
     match cli.command {
         Command::Daemon => serialwrapd::run().await,
         Command::Mcp => stub("mcp", "T3.1"),
-        Command::Devices => stub("devices", "T1.5"),
-        Command::Tail => stub("tail", "T1.5"),
+        Command::Devices => cli::dispatch(cli::devices::run().await),
+        Command::Tail(args) => cli::dispatch(cli::tail::run(args).await),
         Command::Write => stub("write", "T2.1"),
         Command::Run => stub("run", "T2.2"),
         Command::Config => stub("config", "T2.3"),
