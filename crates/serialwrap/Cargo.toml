@@ -11,8 +11,10 @@ serialwrapd = { path = "../serialwrapd" }
 wrap-proto = { path = "../wrap-proto" }
 clap = { workspace = true }
 # `signal` on top of the workspace's base feature set: `tail -f`'s Ctrl-C
-# handling (T1.5) uses `tokio::signal::ctrl_c()`.
-tokio = { workspace = true, features = ["signal"] }
+# handling (T1.5) uses `tokio::signal::ctrl_c()`. `io-std` adds async
+# `tokio::io::{stdin, stdout}` (T3.1's MCP bridge is a stdio server —
+# `rpc.rs` reads requests from stdin and writes replies to stdout).
+tokio = { workspace = true, features = ["signal", "io-std"] }
 serde_json = { workspace = true }
 # RFC 3339 parsing/formatting for `tail`'s default timestamp display and
 # `--since` (T1.5) — the client-side read counterpart to the same crate's

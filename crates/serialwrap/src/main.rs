@@ -9,6 +9,8 @@ use clap::{Parser, Subcommand};
 /// `devices`/`tail` (T1.5, issue #7) live in their own module tree rather
 /// than inline here — see `cli`'s module docs for why.
 mod cli;
+/// `serialwrap mcp` (T3.1, issue #12) — see `mcp`'s module docs.
+mod mcp;
 
 #[derive(Parser)]
 #[command(
@@ -53,7 +55,7 @@ async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Daemon => serialwrapd::run().await,
-        Command::Mcp => stub("mcp", "T3.1"),
+        Command::Mcp => cli::dispatch(mcp::run().await),
         Command::Devices => cli::dispatch(cli::devices::run().await),
         Command::Tail(args) => cli::dispatch(cli::tail::run(args).await),
         Command::Write => stub("write", "T2.1"),
