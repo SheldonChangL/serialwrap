@@ -122,6 +122,12 @@ async fn run_with_test_backend(device_id: String) -> std::io::Result<()> {
 /// both forever. Identical to the body `run` had before T5.2 split it in
 /// two, modulo `backend` now being a parameter instead of always a
 /// freshly-built [`protocol::backend::LiveBackend`].
+///
+/// The web listener's bind failure is propagated (`?`), not
+/// logged-and-skipped: per this project's stance against silently
+/// half-working state (see `web::serve_on`'s doc comment), a daemon that
+/// claims to have started but has no working browser endpoint is worse
+/// than one that fails loudly at startup.
 async fn serve_forever(backend: Arc<dyn protocol::backend::DeviceBackend>) -> std::io::Result<()> {
     // Bind the web listener *before* `protocol::server::bind`: the UDS
     // bind is destructive — it unconditionally unlinks whatever socket
