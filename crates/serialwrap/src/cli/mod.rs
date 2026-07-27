@@ -14,6 +14,7 @@
 //! UDS socket, the same way any future MCP bridge or GUI client will.
 
 pub mod approvals;
+pub mod audit;
 pub mod client;
 pub mod clients;
 pub mod config;

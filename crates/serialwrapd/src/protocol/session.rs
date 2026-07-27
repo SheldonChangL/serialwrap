@@ -41,7 +41,7 @@ use wrap_proto::{
 };
 
 use crate::gate::approval::Decision as ApprovalDecision;
-use crate::gate::{GateDecision, RequesterCtx, DEFAULT_LOG_CONTEXT_LINES};
+use crate::gate::{dtr_pulse_gate_bytes, GateDecision, RequesterCtx, DEFAULT_LOG_CONTEXT_LINES};
 use crate::port::{DeviceId, LeaseError};
 use crate::query::{OobRecord, QueryError, QueryPage, WaitForOutcome};
 
@@ -688,26 +688,185 @@ async fn dispatch(
             device,
             duration_ms,
         } => {
+            // `TASKS.md` T4.4 (issue #17): `dtr_pulse` physically resets
+            // most boards — a hardware state change, not a display setting
+            // like `set_config` — so, per the Security-model wiki's policy
+            // table, an `agent` connection must go through the exact same
+            // gate a `write` request does, never straight to the backend.
+            // `human`/`tool` follow the identical permission split
+            // `Request::Write` already established: a human bypasses the
+            // gate (still fully audited via the `dtr_pulse` event
+            // `DeviceBackend::dtr_pulse` itself appends); a `tool` has no
+            // byte-level write path at all (`LeaseOnly` — see that
+            // handler's own doc comment) and dtr_pulse is no exception.
             let dev = DeviceId(device.clone());
-            match shared
-                .backend
-                .dtr_pulse(&dev, Duration::from_millis(duration_ms), changed_by)
-            {
-                Ok(()) => send(
+
+            let Some((client_type, permission)) = shared.clients.type_and_permission(client_id)
+            else {
+                send(
                     shared,
                     client_id,
                     tx,
-                    ok_reply(
-                        id,
-                        serde_json::json!({ "pulsed": true, "duration_ms": duration_ms }),
+                    err_reply(
+                        Some(id),
+                        WireError::new(ErrorCode::Internal, "client identity not found"),
                     ),
-                ),
-                Err(e) => send(
+                );
+                return;
+            };
+
+            if permission == Permission::LeaseOnly {
+                send(
                     shared,
                     client_id,
                     tx,
-                    err_reply(Some(id), backend_error_to_wire(&e, &device)),
-                ),
+                    err_reply(
+                        Some(id),
+                        WireError::new(
+                            ErrorCode::PermissionDenied,
+                            "tool clients have no dtr_pulse path — acquire a lease instead \
+                             (see `serialwrap run --`)",
+                        ),
+                    ),
+                );
+                return;
+            }
+
+            if permission == Permission::ReadWrite {
+                match shared
+                    .backend
+                    .dtr_pulse(&dev, Duration::from_millis(duration_ms), changed_by)
+                {
+                    Ok(()) => send(
+                        shared,
+                        client_id,
+                        tx,
+                        ok_reply(
+                            id,
+                            serde_json::json!({ "pulsed": true, "duration_ms": duration_ms }),
+                        ),
+                    ),
+                    Err(e) => send(
+                        shared,
+                        client_id,
+                        tx,
+                        err_reply(Some(id), backend_error_to_wire(&e, &device)),
+                    ),
+                }
+                return;
+            }
+
+            // Only `ReadGatedWrite` (an `agent`) reaches here.
+            let Some(recorder) = shared.backend.recorder(&dev) else {
+                send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(
+                        Some(id),
+                        WireError::new(
+                            ErrorCode::DeviceNotFound,
+                            format!("no such device: {device}"),
+                        ),
+                    ),
+                );
+                return;
+            };
+            let Some((name, pid, _)) = shared.clients.identity(client_id) else {
+                send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(
+                        Some(id),
+                        WireError::new(ErrorCode::Internal, "client identity not found"),
+                    ),
+                );
+                return;
+            };
+            let session_request_no = shared.clients.next_write_attempt(client_id);
+            let log_context = shared
+                .queries
+                .get_or_spawn(&dev, Arc::clone(&recorder))
+                .tail(DEFAULT_LOG_CONTEXT_LINES, None)
+                .map(|page| page.lines.into_iter().map(|l| l.text).collect())
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "serialwrapd: protocol: failed to fetch log context for a pending \
+                         dtr_pulse approval on {device}: {e:?}"
+                    );
+                    Vec::new()
+                });
+
+            let ctx = RequesterCtx {
+                device: device.clone(),
+                name,
+                pid,
+                client_type,
+                session_request_no,
+            };
+            // Synthetic "bytes" so the same whitelist/danger rule-matching
+            // `write` uses can also name `dtr_pulse` explicitly — see
+            // `gate::dtr_pulse_gate_bytes`'s doc comment. This never
+            // reaches `DeviceBackend::write_bytes`; only used to decide
+            // allow/pending/force-pending.
+            let gate_bytes = dtr_pulse_gate_bytes(duration_ms);
+            let (decision, rx) = shared
+                .gate
+                .submit_write(&recorder, &gate_bytes, ctx, log_context);
+            let matched_rule = match &decision {
+                GateDecision::ForcePending { matched_rule, .. } => Some(matched_rule.clone()),
+                GateDecision::Allow { .. } | GateDecision::Pending { .. } => None,
+            };
+            let resolution: Result<String, String> = match decision {
+                GateDecision::Allow { reason } => Ok(reason),
+                GateDecision::Pending { .. } | GateDecision::ForcePending { .. } => {
+                    let rx = rx.expect(
+                        "Gate::submit_write always returns a receiver for Pending/ForcePending",
+                    );
+                    match rx.await {
+                        Ok(ApprovalDecision::Approved { approved_by }) => {
+                            Ok(format!("approved_by:{approved_by}"))
+                        }
+                        Ok(ApprovalDecision::Denied { reason }) => Err(reason),
+                        Err(_) => Err("approval channel closed unexpectedly".to_string()),
+                    }
+                }
+            };
+
+            match resolution {
+                Ok(_gate_label) => match shared.backend.dtr_pulse(
+                    &dev,
+                    Duration::from_millis(duration_ms),
+                    changed_by,
+                ) {
+                    Ok(()) => send(
+                        shared,
+                        client_id,
+                        tx,
+                        ok_reply(
+                            id,
+                            serde_json::json!({ "pulsed": true, "duration_ms": duration_ms }),
+                        ),
+                    ),
+                    Err(e) => send(
+                        shared,
+                        client_id,
+                        tx,
+                        err_reply(Some(id), backend_error_to_wire(&e, &device)),
+                    ),
+                },
+                Err(reason) => {
+                    let mut err = WireError::new(
+                        ErrorCode::WriteDenied,
+                        format!("dtr_pulse denied: {reason}"),
+                    )
+                    .with("reason", reason);
+                    if let Some(rule) = matched_rule {
+                        err = err.with("matched_rule", rule);
+                    }
+                    send(shared, client_id, tx, err_reply(Some(id), err));
+                }
             }
         }
 

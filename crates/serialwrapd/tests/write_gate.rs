@@ -7,7 +7,10 @@
 //! against [`serialwrapd::gate::rules::RuleSet`] in `src/gate/rules.rs` —
 //! this file covers what only makes sense driven over the real wire
 //! protocol: the pending queue, timeouts, concurrent resolution,
-//! notification-failure isolation, and the log-context payload.
+//! notification-failure isolation, and the log-context payload. It also
+//! covers `Request::DtrPulse`'s own write-gate hookup (`TASKS.md` T4.4,
+//! issue #17) — same daemon/gate/`Client` machinery, just gating a
+//! `dtr_pulse` request instead of a `write` one.
 //!
 //! Every test here connects `agent` clients through the real gate — no
 //! fixed `sleep` is ever used as a synchronization mechanism (see
@@ -642,4 +645,155 @@ async fn approval_payload_includes_preceding_log_lines() {
     let deny_reply = admin.recv_for_id(wire_id).await;
     assert_eq!(deny_reply["ok"], true, "{deny_reply}");
     let _ = agent.recv_for_id(1).await;
+}
+
+// ---- T4.4 (issue #17): `Request::DtrPulse`'s write-gate hookup ----
+//
+// `TestBackend::dtr_pulse` doesn't need a PTY (unlike a real write, it
+// never calls `write_bytes`) — reuses this file's own `start_daemon`
+// regardless, ignoring its `master` (kept alive only so the PTY pair it
+// opens doesn't itself become a source of noise).
+
+fn dtr_pulse_request(wire_id: u64, device: &str, duration_ms: u64) -> Value {
+    json!({"id": wire_id, "op": "dtr_pulse", "device": device, "duration_ms": duration_ms})
+}
+
+fn dtr_pulse_events(recorder: &Recorder) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    recorder
+        .read_since(0, usize::MAX)
+        .unwrap()
+        .records
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Event { event, extra, .. } if event == "dtr_pulse" => Some(extra),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn agent_dtr_pulse_is_gated_and_approving_it_actually_pulses() {
+    let (sock_path, _sockdir, _datadir, recorder, _master) =
+        start_daemon("dev", short_timeout_gate(Duration::from_secs(5))).await;
+
+    let (mut agent, _ack) = Client::connect(&sock_path, "claude-code", "agent").await;
+    agent.send(dtr_pulse_request(1, "dev", 75)).await;
+
+    let (mut admin, _ack) = Client::connect(&sock_path, "operator", "human").await;
+    let mut next_wire_id = 100u64;
+    let entry = wait_until_pending(&mut admin, &mut next_wire_id, |a| {
+        a["bytes_text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("dtr_pulse"))
+    })
+    .await;
+    assert_eq!(entry["requester_type"], "agent", "{entry}");
+    assert_eq!(entry["bytes_text"], "dtr_pulse duration_ms=75", "{entry}");
+    assert!(
+        dtr_pulse_events(&recorder).is_empty(),
+        "the device must not be touched while the approval is still pending"
+    );
+
+    let approval_id = entry["id"].as_u64().expect("id");
+    let wire_id = next_wire_id;
+    admin
+        .send(json!({"id": wire_id, "op": "approval_approve", "approval_id": approval_id}))
+        .await;
+    let approve_reply = admin.recv_for_id(wire_id).await;
+    assert_eq!(approve_reply["ok"], true, "{approve_reply}");
+
+    let reply = agent.recv_for_id(1).await;
+    assert_eq!(
+        reply["ok"], true,
+        "dtr_pulse must succeed once approved: {reply}"
+    );
+    assert_eq!(reply["pulsed"], true, "{reply}");
+    assert_eq!(reply["duration_ms"], 75, "{reply}");
+
+    let events = dtr_pulse_events(&recorder);
+    assert_eq!(
+        events.len(),
+        1,
+        "expected exactly one dtr_pulse event: {events:?}"
+    );
+    assert_eq!(
+        events[0].get("duration_ms").and_then(|v| v.as_u64()),
+        Some(75)
+    );
+    let changed_by = events[0]
+        .get("changed_by")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        changed_by.starts_with("claude-code:"),
+        "changed_by must carry the agent's kernel-verified identity: {changed_by:?}"
+    );
+}
+
+#[tokio::test]
+async fn agent_dtr_pulse_denied_leaves_the_device_untouched() {
+    let (sock_path, _sockdir, _datadir, recorder, _master) =
+        start_daemon("dev", short_timeout_gate(Duration::from_secs(5))).await;
+
+    let (mut agent, _ack) = Client::connect(&sock_path, "claude-code", "agent").await;
+    agent.send(dtr_pulse_request(1, "dev", 50)).await;
+
+    let (mut admin, _ack) = Client::connect(&sock_path, "operator", "human").await;
+    let mut next_wire_id = 100u64;
+    let entry = wait_until_pending(&mut admin, &mut next_wire_id, |a| {
+        a["bytes_text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("dtr_pulse"))
+    })
+    .await;
+    let approval_id = entry["id"].as_u64().expect("id");
+
+    let wire_id = next_wire_id;
+    admin
+        .send(json!({"id": wire_id, "op": "approval_deny", "approval_id": approval_id}))
+        .await;
+    let deny_reply = admin.recv_for_id(wire_id).await;
+    assert_eq!(deny_reply["ok"], true, "{deny_reply}");
+
+    let reply = agent.recv_for_id(1).await;
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["error"]["code"], "write_denied", "{reply}");
+
+    assert!(
+        dtr_pulse_events(&recorder).is_empty(),
+        "a denied dtr_pulse must never actually reset the device"
+    );
+}
+
+#[tokio::test]
+async fn human_dtr_pulse_bypasses_the_gate_and_is_audited() {
+    let (sock_path, _sockdir, _datadir, recorder, _master) =
+        start_daemon("dev", short_timeout_gate(Duration::from_secs(5))).await;
+
+    let (mut human, _ack) = Client::connect(&sock_path, "sheldon", "human").await;
+    human.send(dtr_pulse_request(1, "dev", 42)).await;
+    let reply = human.recv_for_id(1).await;
+    assert_eq!(reply["ok"], true, "human bypasses the gate: {reply}");
+    assert_eq!(reply["pulsed"], true, "{reply}");
+
+    let events = dtr_pulse_events(&recorder);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        events[0].get("duration_ms").and_then(|v| v.as_u64()),
+        Some(42)
+    );
+}
+
+#[tokio::test]
+async fn tool_client_has_no_dtr_pulse_path() {
+    let (sock_path, _sockdir, _datadir, recorder, _master) =
+        start_daemon("dev", short_timeout_gate(Duration::from_secs(5))).await;
+
+    let (mut tool, _ack) = Client::connect(&sock_path, "esptool", "tool").await;
+    tool.send(dtr_pulse_request(1, "dev", 42)).await;
+    let reply = tool.recv_for_id(1).await;
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["error"]["code"], "permission_denied", "{reply}");
+
+    assert!(dtr_pulse_events(&recorder).is_empty());
 }

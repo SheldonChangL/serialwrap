@@ -22,16 +22,21 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use nix::pty::openpty;
+use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::task::JoinHandle;
 
+use serialwrapd::gate::rules::RuleSet;
+use serialwrapd::gate::Gate;
 use serialwrapd::port::DeviceId;
 use serialwrapd::protocol::backend::{testing::TestBackend, DeviceBackend};
 use serialwrapd::protocol::{server, Shared};
 use serialwrapd::recorder::{Recorder, RecorderConfig};
+use wrap_proto::Record;
 
 /// A running test daemon: the socket clients should connect to, plus
 /// whatever keeps it alive for the test's lifetime.
@@ -55,6 +60,158 @@ async fn start_daemon_with_device(device_id: &str, recorder: Arc<Recorder>) -> T
         socket_path: path,
         _dir: dir,
     }
+}
+
+// ---- T4.4 (issue #17) write-path test helpers ----
+//
+// A short-timeout `Gate` plus a raw PTY pair registered as the device's
+// writer -- so a `write` the gate ultimately allows can actually reach
+// something a test can read back. Same shape `serialwrapd/tests/write_gate.rs`'s
+// own `start_daemon` uses, duplicated here for the same reason every other
+// helper in this file is duplicated rather than shared (each `tests/*.rs`
+// file is its own crate).
+
+fn short_timeout_gate(timeout: Duration) -> Gate {
+    let mut rules = RuleSet::builtin();
+    rules.timeout = timeout;
+    Gate::new(rules, Arc::new(serialwrapd::gate::notify::DesktopNotifier))
+}
+
+fn open_raw_pty_pair() -> (std::fs::File, std::fs::File) {
+    let pair = openpty(None, None).expect("openpty");
+    let mut attrs = tcgetattr(&pair.slave).expect("tcgetattr");
+    cfmakeraw(&mut attrs);
+    tcsetattr(&pair.slave, SetArg::TCSANOW, &attrs).expect("tcsetattr");
+    (
+        std::fs::File::from(pair.master),
+        std::fs::File::from(pair.slave),
+    )
+}
+
+async fn start_daemon_with_gate_and_pty(
+    device_id: &str,
+    gate: Gate,
+) -> (TestDaemon, Arc<Recorder>, std::fs::File) {
+    let tmp_data = tempfile::tempdir().expect("tempdir");
+    let recorder = Arc::new(
+        Recorder::open(tmp_data.path(), device_id, RecorderConfig::default())
+            .expect("open recorder"),
+    );
+    let backend = Arc::new(TestBackend::new());
+    let id = DeviceId(device_id.to_string());
+    backend.register(id.clone(), Arc::clone(&recorder));
+    let (master, slave) = open_raw_pty_pair();
+    backend.register_writer(&id, slave);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("test.sock");
+    let listener = server::bind(&path).expect("bind test socket");
+    let shared = Arc::new(Shared::new(backend as Arc<dyn DeviceBackend>, "test").with_gate(gate));
+    tokio::spawn(server::serve(listener, shared));
+    // `tmp_data` must outlive the test (the recorder holds open fds into
+    // it) -- leak its lifetime, same reasoning as `start_daemon_with_empty_device`
+    // below.
+    std::mem::forget(tmp_data);
+    (
+        TestDaemon {
+            socket_path: path,
+            _dir: dir,
+        },
+        recorder,
+        master,
+    )
+}
+
+/// Block (on a blocking-pool thread) until exactly `n` bytes have been read
+/// from `file`, or `timeout` elapses -- same helper `write_gate.rs`/
+/// `protocol.rs` both use.
+async fn read_n_bytes(file: std::fs::File, n: usize, timeout: Duration) -> Vec<u8> {
+    use std::io::Read as _;
+    let task = tokio::task::spawn_blocking(move || {
+        let mut file = file;
+        let mut buf = vec![0u8; n];
+        file.read_exact(&mut buf)
+            .expect("read_exact from pty master");
+        buf
+    });
+    tokio::time::timeout(timeout, task)
+        .await
+        .unwrap_or_else(|_| panic!("expected {n} bytes on the pty master within {timeout:?}"))
+        .expect("blocking read task panicked")
+}
+
+/// Poll the real, compiled `serialwrap approvals` CLI until it lists at
+/// least one pending approval, then approve (or deny) the first one it
+/// sees -- exactly what an operator watching from another terminal would
+/// type. Every test that uses this only ever has one pending approval in
+/// flight at a time, so "the first one" is unambiguous.
+async fn decide_first_pending(socket: &Path, decision: &str) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let id = loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_serialwrap"))
+            .env("SERIALWRAP_SOCKET", socket)
+            .arg("approvals")
+            .output()
+            .await
+            .expect("run `serialwrap approvals`");
+        assert!(
+            output.status.success(),
+            "serialwrap approvals failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+        if let Some(first_line) = listing.lines().find(|l| {
+            l.split('\t')
+                .next()
+                .is_some_and(|id| id.parse::<u64>().is_ok())
+        }) {
+            let id: u64 = first_line
+                .split('\t')
+                .next()
+                .expect("checked above")
+                .parse()
+                .expect("checked above");
+            break id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no pending approval ever appeared in `serialwrap approvals`: {listing:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    let output = Command::new(env!("CARGO_BIN_EXE_serialwrap"))
+        .env("SERIALWRAP_SOCKET", socket)
+        .args(["approvals", decision, &id.to_string()])
+        .output()
+        .await
+        .unwrap_or_else(|e| panic!("run `serialwrap approvals {decision} {id}`: {e}"));
+    assert!(
+        output.status.success(),
+        "serialwrap approvals {decision} {id} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    id
+}
+
+fn tx_records(recorder: &Recorder) -> Vec<Record> {
+    recorder
+        .read_since(0, usize::MAX)
+        .unwrap()
+        .records
+        .into_iter()
+        .filter(|r| matches!(r, Record::Tx { .. }))
+        .collect()
+}
+
+fn gate_records(recorder: &Recorder) -> Vec<Record> {
+    recorder
+        .read_since(0, usize::MAX)
+        .unwrap()
+        .records
+        .into_iter()
+        .filter(|r| matches!(r, Record::Gate { .. }))
+        .collect()
 }
 
 async fn start_daemon_with_empty_device(device_id: &str) -> (TestDaemon, Arc<Recorder>) {
@@ -606,7 +763,12 @@ async fn binary_line_hex_is_derived_from_the_real_raw_b64_bytes_not_lossy_text()
 // ---- Acceptance criterion 5: tool descriptions carry the data-not-instruction notice ----
 
 #[tokio::test]
-async fn tools_list_registers_five_read_tools_each_with_the_data_not_instruction_notice() {
+async fn tools_list_registers_eight_tools_each_with_the_data_not_instruction_notice() {
+    // Originally "five read tools" (T3.1); T4.4 (issue #17) adds
+    // `write`/`set_config`/`dtr_pulse` to the same registered set, each
+    // still carrying the same data-not-instruction notice (see
+    // `mcp::tools`'s own unit tests for the write-path tools' *additional*
+    // human-approval notice, T4.4 acceptance criterion 9).
     let (daemon, _recorder) = start_daemon_with_empty_device("dev").await;
     let mut mcp = McpProcess::spawn(&daemon.socket_path);
     mcp.initialize().await;
@@ -621,7 +783,10 @@ async fn tools_list_registers_five_read_tools_each_with_the_data_not_instruction
             "get_config",
             "tail",
             "read_since",
-            "wait_for"
+            "wait_for",
+            "write",
+            "set_config",
+            "dtr_pulse",
         ],
         "unexpected tool set: {names:?}"
     );
@@ -643,15 +808,13 @@ async fn tools_list_registers_five_read_tools_each_with_the_data_not_instruction
         );
     }
 
-    // The write-path tools must not be advertised yet (T3.1 is read-only
-    // tools only -- see `tools::RESERVED_WRITE_TOOL_NAMES`).
-    for reserved in ["write", "set_config", "dtr_pulse", "export"] {
-        assert!(
-            !names.contains(&reserved),
-            "{reserved} must not be registered yet"
-        );
-    }
-    println!("acceptance #5 — all 5 tool descriptions carry the data-not-instruction notice");
+    // `export` (T2.4's still-unimplemented MCP tool) must not be advertised
+    // yet -- see `tools::RESERVED_WRITE_TOOL_NAMES`.
+    assert!(
+        !names.contains(&"export"),
+        "export must not be registered yet"
+    );
+    println!("acceptance #5 — all 8 tool descriptions carry the data-not-instruction notice");
 
     mcp.shutdown().await;
 }
@@ -1056,3 +1219,222 @@ async fn wait_for_matched_binary_line_carries_the_real_raw_hex_via_the_bridge() 
 
     mcp.shutdown().await;
 }
+
+// ---- T4.4 (issue #17): the MCP bridge's write-path tools ----
+//
+// Same discipline as the rest of this file, plus (for the human-operator
+// side of the write gate's approval flow) the *actual compiled*
+// `serialwrap approvals` CLI subcommand, never an in-process shortcut --
+// this is what a real "agent sends a dangerous command, a human approves it
+// from another terminal" session actually looks like end to end.
+
+// ---- T4.4 acceptance criterion 5: whitelisted command executes directly ----
+
+#[tokio::test]
+async fn agent_sends_a_whitelisted_command_and_it_executes_immediately() {
+    // Not anchored with a trailing `$`: `write`'s default `line_ending`
+    // appends a `\n` server-side (see `protocol::session`'s `Request::Write`
+    // handler), so the bytes the gate actually evaluates are `"status\n"`,
+    // not the bare `"status"` a `$`-anchored pattern would require.
+    let toml_text = "[approval]\ntimeout_s = 5\n[[whitelist]]\npattern = \"^status\"\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let rules_path = tmp.path().join("rules.toml");
+    std::fs::write(&rules_path, toml_text).unwrap();
+    let rules = RuleSet::load(&rules_path).expect("test rules.toml is valid");
+    let gate = Gate::new(rules, Arc::new(serialwrapd::gate::notify::DesktopNotifier));
+
+    let (daemon, recorder, master) = start_daemon_with_gate_and_pty("dev", gate).await;
+    let mut mcp = McpProcess::spawn(&daemon.socket_path);
+    mcp.initialize().await;
+
+    let result = mcp
+        .call_tool("write", json!({"device": "dev", "text": "status"}))
+        .await;
+    assert_eq!(result["result"], "allowed", "{result}");
+    assert_eq!(result["written"], 7, "{result}"); // "status\n"
+
+    let got = read_n_bytes(master, 7, Duration::from_secs(2)).await;
+    assert_eq!(got, b"status\n");
+
+    let txs = tx_records(&recorder);
+    assert_eq!(txs.len(), 1, "{txs:?}");
+    match &txs[0] {
+        Record::Tx { gate, .. } => assert!(
+            gate.starts_with("whitelist:"),
+            "expected an immediate whitelist allow, got gate={gate:?}"
+        ),
+        other => panic!("expected Tx, got {other:?}"),
+    }
+    println!("acceptance #5 (T4.4) — whitelisted `status` executed immediately via MCP write");
+
+    mcp.shutdown().await;
+}
+
+// ---- T4.4 acceptance criterion 6 (the headline scenario): S4 ----
+//
+// agent sends flash_erase -> blocked -> denied by timeout -> agent sends it
+// again -> a human approves via the real `serialwrap approvals` CLI ->
+// execution succeeds. Both decisions, both replies, and the audit trail
+// must all be traceable.
+
+#[tokio::test]
+async fn s4_flash_erase_denied_by_timeout_then_approved_on_retry() {
+    let (daemon, recorder, master) =
+        start_daemon_with_gate_and_pty("dev", short_timeout_gate(Duration::from_secs(1))).await;
+    let mut mcp = McpProcess::spawn(&daemon.socket_path);
+    mcp.initialize().await;
+
+    // --- First decision: force-pended by the built-in `erase` danger rule,
+    // then denied by the 1s fail-safe timeout. This call genuinely blocks
+    // for ~1s -- that's the real gate timeout firing, not a test sleep.
+    let first = mcp
+        .call_tool("write", json!({"device": "dev", "text": "flash_erase"}))
+        .await;
+    assert_eq!(first["result"], "denied", "{first}");
+    assert_eq!(first["reason"], "timeout_1s", "{first}");
+    assert_eq!(first["matched_rule"], "danger:erase", "{first}");
+
+    // --- Second decision: the same command again, this time approved by a
+    // human via the real, compiled `serialwrap approvals` CLI running
+    // concurrently with the (blocked) MCP call.
+    let approver_socket = daemon.socket_path.clone();
+    let approver =
+        tokio::spawn(async move { decide_first_pending(&approver_socket, "approve").await });
+
+    let second = mcp
+        .call_tool("write", json!({"device": "dev", "text": "flash_erase"}))
+        .await;
+    let approved_id = approver.await.expect("approver task panicked");
+
+    assert_eq!(second["result"], "allowed", "{second}");
+    assert_eq!(second["written"], "flash_erase\n".len(), "{second}");
+
+    let got = read_n_bytes(master, "flash_erase\n".len(), Duration::from_secs(2)).await;
+    assert_eq!(got, b"flash_erase\n");
+
+    // --- Full traceability, per T4.4/T4.3: both decisions and the eventual
+    // successful write are all recoverable from the one event stream.
+    let gates = gate_records(&recorder);
+    let (request_records, deny_records, approve_records): (Vec<_>, Vec<_>, Vec<_>) = {
+        let mut req = Vec::new();
+        let mut deny = Vec::new();
+        let mut appr = Vec::new();
+        for g in &gates {
+            if let Record::Gate { action, .. } = g {
+                match action.as_str() {
+                    "request" => req.push(g.clone()),
+                    "deny" => deny.push(g.clone()),
+                    "approve" => appr.push(g.clone()),
+                    _ => {}
+                }
+            }
+        }
+        (req, deny, appr)
+    };
+    assert_eq!(
+        request_records.len(),
+        2,
+        "expected two separate gate requests (one per attempt): {gates:?}"
+    );
+    assert_eq!(
+        deny_records.len(),
+        1,
+        "expected exactly one deny (the timeout): {gates:?}"
+    );
+    assert_eq!(
+        approve_records.len(),
+        1,
+        "expected exactly one approve (the human decision): {gates:?}"
+    );
+    match &deny_records[0] {
+        Record::Gate { reason, .. } => assert_eq!(reason, "timeout_1s"),
+        _ => unreachable!(),
+    }
+    match &approve_records[0] {
+        Record::Gate { reason, .. } => assert!(
+            reason.starts_with("approved_by:"),
+            "decision-maker recoverable from the approve record: {reason:?}"
+        ),
+        _ => unreachable!(),
+    }
+
+    // The final tx record (the only one that ever executes) is tagged
+    // `approved_by`, matching the same `approved_id` a human just decided.
+    let txs = tx_records(&recorder);
+    assert_eq!(txs.len(), 1, "{txs:?}");
+    match &txs[0] {
+        Record::Tx { gate, client, .. } => {
+            assert!(gate.starts_with("approved_by:"), "{gate}");
+            // The MCP bridge self-identifies as "serialwrap-mcp" over its
+            // daemon connection (see `mcp::tools::ToolRegistry::connected_daemon`)
+            // -- distinct from whichever agent host/model is driving it.
+            assert!(client.starts_with("serialwrap-mcp:"), "{client}");
+        }
+        other => panic!("expected Tx, got {other:?}"),
+    }
+    println!(
+        "acceptance #6 (T4.4, S4) — flash_erase: denied by timeout (id irrelevant to caller), \
+         then approved on retry (approval id {approved_id}), both decisions traceable"
+    );
+
+    mcp.shutdown().await;
+}
+
+// ---- T4.4 acceptance criterion 7: set_config takes effect and is logged ----
+
+#[tokio::test]
+async fn agent_changes_baud_and_it_takes_effect_and_is_logged() {
+    let (daemon, recorder, _master) =
+        start_daemon_with_gate_and_pty("dev", short_timeout_gate(Duration::from_secs(5))).await;
+    let mut mcp = McpProcess::spawn(&daemon.socket_path);
+    mcp.initialize().await;
+
+    let result = mcp
+        .call_tool("set_config", json!({"device": "dev", "baud": 74880}))
+        .await;
+    assert_eq!(result["result"], "allowed", "{result}");
+    assert_eq!(result["config"]["baud"], 74880, "{result}");
+
+    // Immediately verifiable by the same agent, via the read-only
+    // `get_config` tool -- exactly the "agent doubts the baud, checks its
+    // own hypothesis" flow this feature exists for.
+    let config = mcp.call_tool("get_config", json!({"device": "dev"})).await;
+    assert_eq!(config["config"]["baud"], 74880, "{config}");
+
+    let records = recorder.read_since(0, usize::MAX).unwrap().records;
+    let config_change = records
+        .iter()
+        .find_map(|r| match r {
+            Record::Event { event, extra, .. } if event == "config_change" => Some(extra.clone()),
+            _ => None,
+        })
+        .expect("expected a config_change event");
+    assert_eq!(
+        config_change
+            .get("new")
+            .and_then(|v| v.get("baud"))
+            .and_then(|v| v.as_u64()),
+        Some(74880)
+    );
+    println!("acceptance #7 (T4.4) — agent's baud change took effect and was logged");
+
+    mcp.shutdown().await;
+}
+
+// ---- T4.4 acceptance criterion 8: dtr_pulse requires approval ----
+//
+// The full gated/approved/denied/bypassed behavior behind `dtr_pulse` is
+// already proven at the protocol level, against every permission class, in
+// `serialwrapd/tests/write_gate.rs` (the daemon-side mechanism the MCP tool
+// calls into verbatim -- `mcp::tools::ToolRegistry::dtr_pulse` does no
+// translation beyond building the same `Request::DtrPulse` and reading the
+// same `write_denied`/success reply shape `write`'s tool already handles,
+// both covered by `mcp::tools`'s own unit tests, e.g.
+// `dtr_pulse_requires_duration_ms`/`denied_result_carries_reason_and_matched_rule`).
+// A dedicated MCP-subprocess-level reproduction of the same scenario would
+// add real wall-clock cost (spawning `serialwrap mcp` plus polling
+// `serialwrap approvals` via repeated subprocess spawns) without covering
+// any code path the above two layers don't already exercise, so it's left
+// out here to keep this file's contribution to `cargo test --all`'s ~10s
+// budget (T4.3/T4.4 acceptance criterion 11) proportionate to what it
+// actually adds.
