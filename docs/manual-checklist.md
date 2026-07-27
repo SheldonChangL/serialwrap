@@ -63,11 +63,19 @@ DTR/RTS」模式必須讓 daemon 開啟 port 時完全不改變這兩條控制�
 
 Lease 機制（daemon 讓出 port fd 給子行程獨佔）只有跑一次真正的燒錄流程才能
 證明「daemon 收回 port、恢復錄製、期間其他 client 沒有斷線」全部成立；mock
-device 治具能測狀態機（fd 讓出/收回的時序），但測不出 esptool 這種真實工具
-對 port 的實際操作模式是否被正確相容。
+device 治具（`crates/serialwrapd/tests/lease.rs`、`lease_protocol.rs`、
+`crates/serialwrap/tests/run_cli.rs`）已經涵蓋狀態機（fd 讓出/收回的時序、
+含共享 fd 斷言）、事件欄位與起訖時間、follow 不斷線、子行程 SIGKILL、
+`--lease-timeout`、daemon 重啟後殘留 lease 收回——這些都不必重複用實機驗證。
+這裡剩下、也只有實機才測得出來的，是 esptool 這種真實工具對 port 的實際
+操作模式（開啟方式、DTR/RTS timing、baud 切換順序等）是否被正確相容。
 
 - [ ] macOS：`serialwrap run -- esptool.py write_flash ...` 完整燒錄一次成功
   - 所需硬體：ESP8266/ESP32 開發板
+  - 前置注意：`serialwrap run` 不會自動幫 esptool 補上 `--port`；它會把 daemon
+    交出的裝置路徑存進子行程的 `SERIALWRAP_LEASE_PATH` 環境變數，實測時自己組
+    指令，例如 `serialwrap run -- esptool.py --port "$SERIALWRAP_LEASE_PATH" write_flash 0x0 firmware.bin`
+    （或直接手動填已知的 `/dev/cu.*`／`/dev/ttyUSB*` 路徑）。
   - 判定通過：燒錄完成、esptool 回報成功；燒錄後裝置 boot log 被完整錄到（對應 S3 出口情境）；燒錄期間另一個 client 的 `tail -f` 收到 lease 事件而非斷線
   - 驗證紀錄：
 - [ ] Linux：同上

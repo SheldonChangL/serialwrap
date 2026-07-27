@@ -19,6 +19,7 @@ pub mod config;
 pub mod devices;
 pub mod error;
 pub mod render;
+pub mod run;
 pub mod tail;
 pub mod time;
 pub mod write;

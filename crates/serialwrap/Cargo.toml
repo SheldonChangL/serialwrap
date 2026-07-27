@@ -13,8 +13,10 @@ clap = { workspace = true }
 # `signal` on top of the workspace's base feature set: `tail -f`'s Ctrl-C
 # handling (T1.5) uses `tokio::signal::ctrl_c()`. `io-std` adds async
 # `tokio::io::{stdin, stdout}` (T3.1's MCP bridge is a stdio server —
-# `rpc.rs` reads requests from stdin and writes replies to stdout).
-tokio = { workspace = true, features = ["signal", "io-std"] }
+# `rpc.rs` reads requests from stdin and writes replies to stdout). `process`
+# is `serialwrap run`'s own child-process spawning (T2.2, issue #9) — the
+# external tool a lease is acquired for.
+tokio = { workspace = true, features = ["signal", "io-std", "process"] }
 serde_json = { workspace = true }
 # RFC 3339 parsing/formatting for `tail`'s default timestamp display and
 # `--since` (T1.5) — the client-side read counterpart to the same crate's
@@ -40,8 +42,8 @@ tempfile = "3"
 # assertions need the PTY master read directly, which `mock-device`'s
 # line-based command-responder API can't give a test).
 nix = { workspace = true, features = ["signal", "term"] }
-# Spawn the compiled `serialwrap` binary as a child process from
-# integration tests (T1.5) — the base `[dependencies]` tokio feature set
-# doesn't include `process`, since production `devices`/`tail`/`daemon`
-# code never spawns a child itself.
-tokio = { workspace = true, features = ["process"] }
+# Spawning the compiled `serialwrap` binary as a child process from
+# integration tests (T1.5) needs tokio's `process` feature — now also part
+# of the main `[dependencies]` tokio entry above (`serialwrap run`, T2.2,
+# spawns a child in production too), so nothing extra is needed here beyond
+# what's already pulled in.

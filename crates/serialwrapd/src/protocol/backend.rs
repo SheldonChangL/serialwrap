@@ -23,7 +23,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error_counts::ErrorCounts;
-use crate::port::{DeviceId, DeviceSummary, PortConfigApi, SharedRecorders};
+use crate::port::{
+    DeviceId, DeviceSummary, LeaseAcquired, LeaseError, LeaseReleased, PortConfigApi,
+    SharedRecorders,
+};
 use crate::port_config::PortConfig;
 use crate::recorder::Recorder;
 
@@ -64,6 +67,30 @@ pub trait DeviceBackend: Send + Sync {
     /// since only the caller knows the requesting client's identity and
     /// the gate decision that authorized the write).
     fn write_bytes(&self, id: &DeviceId, data: &[u8]) -> io::Result<()>;
+
+    /// Acquire a temporary, exclusive lease on `id`'s port for `command`
+    /// (`TASKS.md` T2.2, issue #9): closes every fd this backend holds open
+    /// for the device, appends a `lease_start` event, and returns the
+    /// device's current path plus an opaque `token` for
+    /// [`Self::release_lease`]. `pid` is the kernel-verified pid of the
+    /// connection making the request (see `protocol::session`'s
+    /// `Request::LeaseAcquire` handler) — not necessarily the pid of
+    /// whatever the caller eventually execs, which the backend has no way
+    /// to know at acquire time. `timeout_s`, if given, bounds how long the
+    /// lease can stay open before the backend reclaims it on its own.
+    fn acquire_lease(
+        &self,
+        id: &DeviceId,
+        command: &str,
+        pid: u32,
+        timeout_s: Option<f64>,
+    ) -> Result<LeaseAcquired, LeaseError>;
+
+    /// End a lease previously granted by [`Self::acquire_lease`], identified
+    /// by its opaque `token`. Reopens the device and resumes recording,
+    /// appends a `lease_end` event (`reason: "released"`), and returns how
+    /// long the lease was held.
+    fn release_lease(&self, token: &str, exit_code: i32) -> Result<LeaseReleased, LeaseError>;
 }
 
 /// Merge a partial JSON config patch onto `current`, producing a new,
@@ -156,51 +183,31 @@ impl DeviceBackend for LiveBackend {
         self.config_api.error_counts(id)
     }
 
-    /// # Known limitation: a second, independent fd
-    ///
-    /// This task's scope deliberately excludes touching `port.rs` (see
-    /// `TASKS.md` T2.1's boundaries), so this cannot reach into
-    /// `PortConfigApi`'s already-open, shared fd (the one
-    /// `HotplugDetector`'s reader thread and every `set_dtr`/`dtr_pulse`
-    /// ioctl already share). Instead this opens a *fresh*, independent,
-    /// write-only fd at the device's current path — the same thing
-    /// `mock_device::MockDevice::open_slave`'s docs describe as "as the
-    /// daemon would when it opens a device node" — writes `data`, and lets
-    /// it close again. This is safe (a tty's termios/baud/parity is a
-    /// property of the line discipline itself, not of any one fd, so a
-    /// freshly opened fd inherits whatever the shared fd already
-    /// configured) but not ideal: a follow-up should instead expose the
-    /// already-open fd through `PortConfigApi`, the same way
-    /// `set_dtr`/`dtr_pulse` already do, and drop this second-fd approach.
+    /// Writes through `PortConfigApi`'s already-open, shared fd — the same
+    /// one `HotplugDetector`'s reader thread and every `set_dtr`/`dtr_pulse`
+    /// ioctl already operate on (see `port::PortConfigApi::write_bytes`'s
+    /// docs). Never a second, independently opened fd: T2.1's original
+    /// implementation did open one (scope at the time excluded touching
+    /// `port.rs`), but T2.2 (issue #9) needed that fixed first — lease
+    /// mode's entire premise is that acquiring a lease closes *every* fd
+    /// this daemon holds for the device, which a second write-path fd would
+    /// silently defeat.
     fn write_bytes(&self, id: &DeviceId, data: &[u8]) -> io::Result<()> {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
+        self.config_api.write_bytes(id, data)
+    }
 
-        let summary = self
-            .config_api
-            .list_devices()
-            .into_iter()
-            .find(|d| &d.id == id)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("no such device: {}", id.0))
-            })?;
-        if !summary.connected {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                format!("{} is not currently attached", id.0),
-            ));
-        }
-        let path = summary.path.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                format!("{} has no known device path", id.0),
-            )
-        })?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOCTTY)
-            .open(&path)?;
-        file.write_all(data)
+    fn acquire_lease(
+        &self,
+        id: &DeviceId,
+        command: &str,
+        pid: u32,
+        timeout_s: Option<f64>,
+    ) -> Result<LeaseAcquired, LeaseError> {
+        self.config_api.acquire_lease(id, command, pid, timeout_s)
+    }
+
+    fn release_lease(&self, token: &str, exit_code: i32) -> Result<LeaseReleased, LeaseError> {
+        self.config_api.release_lease(token, exit_code)
     }
 }
 
@@ -213,7 +220,21 @@ pub mod testing {
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::Write as _;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::time::Instant;
+
+    /// [`TestBackend`]'s in-memory stand-in for `port::ActiveLease` (which
+    /// is private to `port.rs`'s poll thread) — same fields, no channel
+    /// round-trip needed since `TestBackend` has no poll thread at all.
+    struct TestLease {
+        token: String,
+        command: String,
+        pid: u32,
+        started: Instant,
+        deadline: Option<Instant>,
+    }
 
     struct Entry {
         recorder: Arc<Recorder>,
@@ -226,7 +247,13 @@ pub mod testing {
         /// side. `None` until a test opts in; `write_bytes` errors clearly
         /// rather than silently discarding bytes when it is.
         writer: Option<Mutex<File>>,
+        /// This device's active lease, if any — see [`TestBackend::acquire_lease`].
+        lease: Option<TestLease>,
     }
+
+    /// Backs [`TestBackend`]'s lease tokens — only needs to be unique
+    /// within one test process, same reasoning as `port::generate_lease_token`.
+    static TEST_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     /// A device registry with no real hardware underneath: tests
     /// `register()` a `Recorder` (typically backed by a `MockDevice` PTY —
@@ -256,8 +283,23 @@ pub mod testing {
                         path: None,
                         connected: true,
                         writer: None,
+                        lease: None,
                     },
                 );
+        }
+
+        /// Set `id`'s reported device path — what [`TestBackend::acquire_lease`]
+        /// hands back to a caller as the path to run an external tool
+        /// against. A no-op if `id` was never `register`ed.
+        pub fn set_path(&self, id: &DeviceId, path: PathBuf) {
+            if let Some(entry) = self
+                .devices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(id)
+            {
+                entry.path = Some(path);
+            }
         }
 
         /// Give `id` a real fd to write to, so `write_bytes` has somewhere
@@ -286,10 +328,63 @@ pub mod testing {
                 entry.connected = connected;
             }
         }
+
+        /// If `id` has an active lease whose deadline has passed, end it
+        /// exactly the way [`Self::release_lease`] would (reopen — here,
+        /// just flip `connected` back on — append `lease_end` with
+        /// `reason: "timeout"`, drop the lease). `TestBackend` has no
+        /// background poll thread to drive this on its own (unlike
+        /// `port::HotplugDetector`, which checks every tick — see
+        /// `reclaim_expired_leases`'s docs), so callers that need to
+        /// observe a timeout must poll a method that calls this, which
+        /// [`Self::list_devices`] does.
+        fn maybe_expire_lease(&self, id: &DeviceId) {
+            let (recorder, lease, path) = {
+                let mut devices = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(entry) = devices.get_mut(id) else {
+                    return;
+                };
+                let expired = entry
+                    .lease
+                    .as_ref()
+                    .and_then(|l| l.deadline)
+                    .is_some_and(|d| Instant::now() >= d);
+                if !expired {
+                    return;
+                }
+                let lease = entry.lease.take().expect("checked above");
+                entry.connected = true;
+                (Arc::clone(&entry.recorder), lease, entry.path.clone())
+            };
+            let duration_ms = lease.started.elapsed().as_millis() as u64;
+            if let Err(e) = crate::port::append_lease_end_event(
+                &recorder,
+                id,
+                path.as_deref(),
+                &lease.command,
+                lease.pid,
+                &lease.token,
+                None,
+                duration_ms,
+                "timeout",
+            ) {
+                eprintln!("TestBackend: failed to append lease_end (timeout) event: {e}");
+            }
+        }
     }
 
     impl DeviceBackend for TestBackend {
         fn list_devices(&self) -> Vec<DeviceSummary> {
+            let ids: Vec<DeviceId> = self
+                .devices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .cloned()
+                .collect();
+            for id in &ids {
+                self.maybe_expire_lease(id);
+            }
             self.devices
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -432,6 +527,82 @@ pub mod testing {
                     id.0
                 ))),
             }
+        }
+
+        fn acquire_lease(
+            &self,
+            id: &DeviceId,
+            command: &str,
+            pid: u32,
+            timeout_s: Option<f64>,
+        ) -> Result<LeaseAcquired, LeaseError> {
+            let (recorder, path, token) = {
+                let mut devices = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = devices.get_mut(id).ok_or(LeaseError::UnknownDevice)?;
+                if let Some(existing) = &entry.lease {
+                    return Err(LeaseError::AlreadyLeased {
+                        holder: format!("pid {} running `{}`", existing.pid, existing.command),
+                    });
+                }
+                if !entry.connected {
+                    return Err(LeaseError::NotConnected);
+                }
+                let n = TEST_LEASE_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let token = format!("test-lease-{n}");
+                let path = entry
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(format!("/test/{}", id.0)));
+                let started = Instant::now();
+                let deadline = timeout_s
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .map(|s| started + std::time::Duration::from_secs_f64(s));
+                entry.connected = false;
+                entry.lease = Some(TestLease {
+                    token: token.clone(),
+                    command: command.to_string(),
+                    pid,
+                    started,
+                    deadline,
+                });
+                (Arc::clone(&entry.recorder), path, token)
+            };
+            if let Err(e) = crate::port::append_lease_start_event(
+                &recorder, id, &path, command, pid, &token, timeout_s,
+            ) {
+                eprintln!("TestBackend: failed to append lease_start event: {e}");
+            }
+            Ok(LeaseAcquired { token, path })
+        }
+
+        fn release_lease(&self, token: &str, exit_code: i32) -> Result<LeaseReleased, LeaseError> {
+            let (id, recorder, lease, path) = {
+                let mut devices = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+                let id = devices
+                    .iter()
+                    .find(|(_, e)| e.lease.as_ref().is_some_and(|l| l.token == token))
+                    .map(|(id, _)| id.clone())
+                    .ok_or(LeaseError::UnknownToken)?;
+                let entry = devices.get_mut(&id).expect("found by the search above");
+                let lease = entry.lease.take().expect("found by the search above");
+                entry.connected = true;
+                (id, Arc::clone(&entry.recorder), lease, entry.path.clone())
+            };
+            let duration_ms = lease.started.elapsed().as_millis() as u64;
+            if let Err(e) = crate::port::append_lease_end_event(
+                &recorder,
+                &id,
+                path.as_deref(),
+                &lease.command,
+                lease.pid,
+                &lease.token,
+                Some(exit_code),
+                duration_ms,
+                "released",
+            ) {
+                eprintln!("TestBackend: failed to append lease_end event: {e}");
+            }
+            Ok(LeaseReleased { duration_ms })
         }
     }
 }
