@@ -9,8 +9,24 @@
 
   interface Props {
     deviceId: string;
+    /** T5.5 (issue #22): forwarded a copy of every timeline drag-selection
+     * this view produces, so a sibling `ExportDialog` (owned by `App.svelte`,
+     * not this component) can offer it as an export source. This component
+     * still keeps its own `timelineSelection` copy too (for the inline
+     * "selected seq…" info line below the timeline) — the two are
+     * deliberately kept in sync rather than one replacing the other, since
+     * this component has no reason to depend on `App.svelte`'s state and
+     * vice versa. */
+    onTimelineSelect?: (selection: TimelineSelection | null) => void;
+    /** T5.5 (issue #22): called once on mount with this component's own
+     * `jumpToSeq` function, so `App.svelte` can route an audit panel's
+     * "jump to log" click into the exact same jump/highlight behavior the
+     * timeline's own click-to-jump already uses — an imperative handle
+     * rather than a reactive prop, since "jump to this seq" is a one-shot
+     * command, not a value this component's rendering depends on. */
+    registerJumpToSeq?: (fn: (seq: number) => void) => void;
   }
-  const { deviceId }: Props = $props();
+  const { deviceId, onTimelineSelect, registerJumpToSeq }: Props = $props();
 
   /** Fixed row height, in px — see `liveLog.ts`'s module doc comment and
    * this project's virtual-scroll design note: every row (data, event,
@@ -282,6 +298,7 @@
     });
     void stream.start();
     refreshConfig();
+    registerJumpToSeq?.(jumpToSeq);
   });
 
   onDestroy(() => {
@@ -358,7 +375,10 @@
     items={buffer.items}
     {version}
     onJump={jumpToSeq}
-    onRangeSelect={(selection) => (timelineSelection = selection)}
+    onRangeSelect={(selection) => {
+      timelineSelection = selection;
+      onTimelineSelect?.(selection);
+    }}
   />
   {#if timelineSelection}
     <div class="timeline-selection-info" data-testid="timeline-selection">

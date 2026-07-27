@@ -9,6 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import * as net from "node:net";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -243,4 +244,125 @@ export async function runCli(daemon: DaemonHandle, args: string[]): Promise<CliR
       });
     });
   });
+}
+
+/**
+ * Where a `startDaemon`-spawned instance's UDS socket lives, given the same
+ * `HOME`/`XDG_RUNTIME_DIR` env block `startDaemon` sets (T5.5, issue #22) —
+ * mirrors `serialwrapd::protocol::server::default_socket_path`'s own
+ * platform split (Linux: `$XDG_RUNTIME_DIR/serialwrap.sock`; macOS:
+ * `~/.serialwrap/serialwrap.sock`) the same way `rulesTomlPath` above
+ * mirrors `gate::rules::default_rules_path`'s split, so a raw client
+ * connects to the exact socket this specific daemon instance is listening
+ * on (never a stale or unrelated one).
+ */
+function udsSocketPath(daemon: DaemonHandle): string {
+  if (process.platform === "darwin") {
+    return path.join(daemon.home, ".serialwrap", "serialwrap.sock");
+  }
+  return path.join(daemon.home, "serialwrap.sock");
+}
+
+export interface RawClientOptions {
+  name: string;
+  type: "human" | "agent" | "tool";
+  version?: string;
+}
+
+/**
+ * A hand-rolled UDS client speaking the raw newline-delimited-JSON wire
+ * protocol directly (`crates/serialwrapd/src/protocol/session.rs`) — used
+ * only where the browser genuinely cannot stand in for a real MCP/CLI
+ * client (T5.5, issue #22's kick/S2 acceptance criteria: observing a real
+ * connection's own socket close, and a real agent-typed `tail`/`read_since`
+ * read against the same stream a GUI tab observes). Same "a real MCP/UDS
+ * client is impractical to open from a browser test" stance
+ * `approval-card.spec.ts`'s module doc comment already states for a
+ * different criterion — this is the raw-socket escape hatch that doc
+ * comment says doesn't exist yet, added here rather than duplicated per
+ * spec file.
+ */
+export interface RawClient {
+  /** Send one request object — `id`/`op`/fields flattened onto one JSON
+   * line, matching `wrap_proto::Request`'s own wire shape. */
+  send(body: Record<string, unknown>): void;
+  /** Resolves with the next full newline-delimited JSON message received
+   * (FIFO — a message already buffered before this call resolves
+   * immediately). */
+  nextMessage(): Promise<Record<string, unknown>>;
+  /** The kernel-verified pid `SO_PEERCRED`/`LOCAL_PEERPID` reported for
+   * this connection, from its own `HelloAck` — since this test process
+   * connects directly (no subprocess in between), this is simply
+   * `process.pid`, but reading it back from the daemon's own reply (rather
+   * than assuming) is the point: it proves the daemon is reporting a real
+   * kernel fact, not trusting `send`'s `name`. */
+  pid: number;
+  /** Resolves once the underlying socket actually closes (kicked, denied,
+   * or closed locally) — never resolves on its own otherwise. */
+  waitForClose(): Promise<void>;
+  /** `true` once the socket has closed (from either end). */
+  isClosed(): boolean;
+  close(): void;
+}
+
+export async function connectRawClient(daemon: DaemonHandle, opts: RawClientOptions): Promise<RawClient> {
+  const socket = net.createConnection({ path: udsSocketPath(daemon) });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", () => resolve());
+    socket.once("error", reject);
+  });
+
+  let buffer = "";
+  const queued: Record<string, unknown>[] = [];
+  const waiters: Array<(msg: Record<string, unknown>) => void> = [];
+  let closed = false;
+  const closeWaiters: Array<() => void> = [];
+
+  socket.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let idx = buffer.indexOf("\n");
+    while (idx !== -1) {
+      const line = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 1);
+      idx = buffer.indexOf("\n");
+      if (line.length === 0) continue;
+      const msg = JSON.parse(line) as Record<string, unknown>;
+      const waiter = waiters.shift();
+      if (waiter) waiter(msg);
+      else queued.push(msg);
+    }
+  });
+  const onClose = (): void => {
+    closed = true;
+    for (const w of closeWaiters.splice(0)) w();
+  };
+  socket.once("close", onClose);
+  socket.once("error", () => {}); // observed via close()/waitForClose(), not surfaced as an unhandled error
+
+  function send(body: Record<string, unknown>): void {
+    socket.write(`${JSON.stringify(body)}\n`);
+  }
+
+  function nextMessage(): Promise<Record<string, unknown>> {
+    const already = queued.shift();
+    if (already) return Promise.resolve(already);
+    return new Promise((resolve) => waiters.push(resolve));
+  }
+
+  send({ op: "hello", name: opts.name, type: opts.type, version: opts.version ?? "0.1.0" });
+  const ack = await nextMessage();
+
+  return {
+    send,
+    nextMessage,
+    pid: ack.pid as number,
+    waitForClose: () =>
+      closed
+        ? Promise.resolve()
+        : new Promise((resolve) => {
+            closeWaiters.push(resolve);
+          }),
+    isClosed: () => closed,
+    close: () => socket.destroy(),
+  };
 }
