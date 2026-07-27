@@ -198,9 +198,10 @@ async fn two_concurrent_tail_f_clients_produce_identical_output() {
     // Wait for *actual evidence* both clients have already printed their
     // initial `-n 5` history before appending anything else — this is
     // what makes "which of the two clients' code paths (initial history
-    // vs. follow poll) picks up a given line" deterministic, rather than
-    // assuming a fixed sleep is long enough (which was observed to be
-    // flaky under a fully loaded `cargo test --all` run).
+    // vs. the live `subscribe` push that follows it) picks up a given
+    // line" deterministic, rather than assuming a fixed sleep is long
+    // enough (which was observed to be flaky under a fully loaded
+    // `cargo test --all` run).
     let history_timeout = Duration::from_secs(5);
     c1.wait_until_stdout_contains("boot ok", history_timeout)
         .await;
@@ -545,6 +546,53 @@ async fn binary_content_renders_as_length_plus_hex_never_raw_control_bytes() {
         "expected a hex preview in the binary summary: {text:?}"
     );
     println!("acceptance #5 — binary rendering:\n{text}");
+}
+
+// ---- Issue #32 acceptance criterion 3: hex preview is the real device bytes ----
+
+#[tokio::test]
+async fn binary_hex_preview_matches_the_exact_bytes_written_not_the_lossy_text() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let recorder = Arc::new(
+        Recorder::open(data_dir.path(), "dev", RecorderConfig::default()).expect("open recorder"),
+    );
+    // Same shape as the criterion-5 test (ESC sequence + non-UTF-8 bytes),
+    // but this test checks the *exact* hex value, not just "some hex
+    // appeared" — the whole point of issue #32's fix.
+    let mut payload = vec![0x1b, b'[', b'3', b'1', b'm'];
+    payload.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x01]);
+    let mut with_newline = payload.clone();
+    with_newline.push(b'\n');
+    recorder
+        .append_rx(&with_newline)
+        .expect("append binary payload");
+    let daemon = start_daemon_with_device("dev", recorder).await;
+
+    let output = cli(&daemon.socket_path, &["tail", "-n", "10", "dev"])
+        .output()
+        .await
+        .expect("run tail");
+    assert!(output.status.success(), "stderr: {}", stderr_text(&output));
+    let text = stdout_text(&output);
+
+    let expected_hex = payload
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains(&expected_hex),
+        "rendered hex must be the exact bytes written ({expected_hex:?}), got: {text:?}"
+    );
+    assert!(
+        text.contains(&format!("{} bytes binary", payload.len())),
+        "expected the exact byte count ({}), got: {text:?}",
+        payload.len()
+    );
+    // The lossy U+FFFD replacement text must never leak into the CLI's
+    // rendered output.
+    assert!(!text.contains('\u{FFFD}'), "rendered was: {text:?}");
+    println!("acceptance (issue #32) #3 — exact hex preview:\n{text}");
 }
 
 // ---- Acceptance criterion 6: actionable error when the daemon isn't running ----

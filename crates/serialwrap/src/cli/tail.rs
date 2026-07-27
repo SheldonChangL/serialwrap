@@ -4,10 +4,9 @@
 //! events are visually distinguishable (see `cli::render`'s module docs
 //! for why that's a correctness requirement, not decoration) and nothing
 //! here embellishes or guesses at daemon state — it only ever prints what
-//! `tail`/`read_since` actually returned.
+//! `tail`/`read_since`/`subscribe` actually returned.
 
 use std::io::{self, Write};
-use std::time::Duration;
 
 use clap::Args;
 use serde_json::Value;
@@ -26,9 +25,10 @@ pub struct TailArgs {
     /// exactly one device is known to the daemon.
     pub device: Option<String>,
 
-    /// Keep following: after printing history, poll for new records until
-    /// interrupted with Ctrl-C. Exiting never affects the daemon or any
-    /// other client — this process only ever closes its own connection.
+    /// Keep following: after printing history, subscribe to new records
+    /// until interrupted with Ctrl-C. Exiting never affects the daemon or
+    /// any other client — this process only ever closes its own
+    /// connection.
     #[arg(short = 'f', long)]
     pub follow: bool,
 
@@ -45,29 +45,6 @@ pub struct TailArgs {
     pub since: Option<String>,
 }
 
-/// How often `-f` re-polls `read_since` for new data.
-///
-/// The wire also has `subscribe` (server push), but it cannot be
-/// seamlessly chained onto an initial `tail`/history fetch without a gap:
-/// `serialwrapd::protocol::session::dispatch`'s `Request::Subscribe` arm
-/// snapshots its starting point (`state.line_count()`/`event_count()`) at
-/// the moment the daemon *processes* the subscribe request, not from any
-/// cursor the client supplies — there is no way to say "start pushing from
-/// seq C". Any client that first calls `tail` for history and only then
-/// calls `subscribe` to keep watching has an unavoidable window between
-/// those two calls where new data can arrive and be missed by both.
-///
-/// Polling `read_since(cursor)` instead has no such gap: it takes the same
-/// `seq`-based cursor `tail`'s own reply already returns, so resuming from
-/// it can never skip or duplicate a record — the daemon's own
-/// `read_since_cursor_always_advances_and_never_drops_a_record` guarantee
-/// (`crates/serialwrapd/src/query.rs`) covers this exactly. The cost is up
-/// to one poll interval of added latency versus a true push. For a
-/// debugging floor tool — whose entire premise (issue #7) is "never lose
-/// or misrepresent what the daemon recorded" — that trade is the right
-/// one.
-const FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
 pub async fn run(args: TailArgs) -> io::Result<()> {
     let socket_path = resolve_socket_path()?;
     let (mut client, _ack) = DaemonClient::connect(&socket_path, "serialwrap-tail", "human")
@@ -79,7 +56,7 @@ pub async fn run(args: TailArgs) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    let mut cursor = if let Some(raw) = &args.since {
+    let cursor = if let Some(raw) = &args.since {
         let threshold = parse_since(raw).map_err(|msg| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("--since: {msg}"))
         })?;
@@ -89,7 +66,7 @@ pub async fn run(args: TailArgs) -> io::Result<()> {
     };
 
     if args.follow {
-        follow(&mut client, &device, &mut cursor, &mut out).await?;
+        follow(&mut client, &device, cursor, &mut out).await?;
     }
     Ok(())
 }
@@ -180,39 +157,48 @@ async fn print_history_since(
     Ok(cursor)
 }
 
-/// Poll `read_since(cursor)` at [`FOLLOW_POLL_INTERVAL`] and print
-/// anything new, until interrupted with Ctrl-C. Returning here only ever
-/// drops this process's own `DaemonClient` connection — the daemon's
+/// `subscribe(since_cursor=cursor)` and print every push as it arrives,
+/// until interrupted with Ctrl-C. Returning here only ever drops this
+/// process's own `DaemonClient` connection — the daemon's
 /// `reader_loop`/`writer_loop` (`serialwrapd::protocol::session`) treat
 /// that exactly like any other client disconnecting: it unregisters this
 /// client and nothing else, never touching the daemon or any other
 /// connection.
+///
+/// This used to poll `read_since(cursor)` on a fixed interval instead,
+/// because `subscribe` had no way to say "start from seq C" and so could
+/// not be chained onto an initial `tail`/history fetch without a gap
+/// between the two calls. Issue #32 added `since_cursor` with exactly
+/// `read_since`'s own cursor semantics, which closes that gap — the first
+/// thing this subscription ever pushes is exactly what
+/// `read_since(cursor)` would have returned at that same instant (see
+/// `serialwrapd::query::DeviceQueryState::cursor_from_seq`'s docs) — so
+/// there is no longer a correctness reason to prefer polling, and push
+/// removes the up-to-one-poll-interval latency the old approach paid on
+/// every new line.
 async fn follow(
     client: &mut DaemonClient,
     device: &str,
-    cursor: &mut u64,
+    cursor: u64,
     out: &mut impl Write,
 ) -> io::Result<()> {
+    client
+        .send(Request::Subscribe {
+            device: device.to_string(),
+            filter: None,
+            since_cursor: Some(cursor),
+        })
+        .await?;
+
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     loop {
-        tokio::select! {
+        let reply = tokio::select! {
             _ = &mut ctrl_c => return Ok(()),
-            _ = tokio::time::sleep(FOLLOW_POLL_INTERVAL) => {}
-        }
-        let reply = client
-            .call(Request::ReadSince {
-                device: device.to_string(),
-                cursor: *cursor,
-                max_bytes: None,
-                filter: None,
-            })
-            .await?;
+            reply = client.read_push() => reply?,
+        };
         check_ok(&reply, Some(device))?;
         print_records(out, &reply, None)?;
-        if let Some(next) = reply["cursor"].as_u64() {
-            *cursor = next;
-        }
     }
 }
 
@@ -271,7 +257,7 @@ fn print_records(
             }
         }
         let rendered = match item {
-            Item::Line(v) => render_data_line(t_wall, v["text"].as_str().unwrap_or("")),
+            Item::Line(v) => render_data_line(t_wall, v),
             Item::Event(v) => render_event_line(t_wall, v),
         };
         writeln!(out, "{rendered}")?;

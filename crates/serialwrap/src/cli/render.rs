@@ -13,31 +13,26 @@
 //!   #7 calls out: bytes from the board are data, broker events are
 //!   system truth, and the two must stay visually distinguishable.
 //!
-//! # Known limitation: binary rendering is best-effort, not byte-exact
+//! # Byte-exact binary rendering
 //!
-//! The wire's `tail`/`read_since` replies carry only
-//! [`serialwrapd::query::AssembledLine::text`] — a `String` produced by
-//! `String::from_utf8_lossy` over the original device bytes (see that
-//! module's `ingest`). By the time a line reaches this CLI, any byte
-//! sequence that wasn't valid UTF-8 has *already* been replaced with
-//! U+FFFD server-side; the original bytes are gone and there is no wire op
-//! that returns them (`Tail`/`ReadSince`/`Subscribe` all return assembled
-//! *lines*, never a raw record). So "binary 不污染終端" is implemented
-//! here as: detect a line that isn't safely printable (contains a
-//! replacement character or a non-tab control byte) and render *the
-//! lossy-decoded text's own bytes* as a length + hex preview, using the
-//! same "length plus 64-byte hex preview" convention the [Client protocol
+//! Issue #32 fixed the protocol layer's own byte fidelity: a `tail`/
+//! `read_since`/`subscribe` line reply now carries `raw_b64` — the line's
+//! exact original bytes, base64-encoded — whenever those bytes weren't
+//! valid UTF-8 (see `serialwrapd::query::AssembledLine` and
+//! `serialwrapd::protocol::session::line_json`'s docs for the presence
+//! rule and why not every line needs it). [`line_bytes`] is what recovers
+//! the real device bytes for a line from that wire shape: `raw_b64` when
+//! present, otherwise `text`'s own UTF-8 bytes — which, for a line the
+//! server found to already be valid UTF-8, *are* the original bytes
+//! verbatim (nothing was lost turning them into `text` in the first
+//! place). Either way this CLI now renders the same bytes the device
+//! actually sent, never a lossy stand-in, matching the "length plus
+//! 64-byte hex preview" convention the [Client protocol
 //! wiki](https://github.com/SheldonChangL/serialwrap/wiki/Client-protocol)
-//! documents for the MCP tool surface's binary regions. This achieves the
-//! acceptance criterion's actual goal — never blast raw control bytes/
-//! escape sequences at the user's terminal — but is not byte-for-byte
-//! identical to what the device originally sent. A future task that wants
-//! true byte-exact binary display would need `AssembledLine` (and the
-//! `tail`/`read_since` wire reply) to carry the original bytes alongside
-//! `text`, which is a `serialwrapd`/`wrap-proto` change out of this
-//! issue's scope (see issue #7: "不要修改 crates/serialwrapd/ 或
-//! crates/wrap-proto/").
+//! documents for the MCP tool surface's binary regions.
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde_json::Value;
 
 use crate::cli::time::format_timestamp;
@@ -49,8 +44,15 @@ use crate::cli::time::format_timestamp;
 const HEX_PREVIEW_BYTES: usize = 64;
 
 /// Render one assembled data line (`kind: rx`): `<timestamp> <content>`.
-pub fn render_data_line(t_wall: &str, text: &str) -> String {
-    format!("{} {}", format_timestamp(t_wall), render_data_content(text))
+/// `line` is the wire's JSON object for one assembled line (`text`, `seq`,
+/// `t_mono`, `t_wall`, and optionally `raw_b64`) — see the module docs and
+/// [`line_bytes`] for how the real device bytes are recovered from it.
+pub fn render_data_line(t_wall: &str, line: &Value) -> String {
+    format!(
+        "{} {}",
+        format_timestamp(t_wall),
+        render_data_content(&line_bytes(line))
+    )
 }
 
 /// Render one out-of-band record (`event`/`gate`): `# <timestamp>
@@ -59,14 +61,35 @@ pub fn render_event_line(t_wall: &str, record: &Value) -> String {
     format!("# {} {}", format_timestamp(t_wall), event_content(record))
 }
 
-/// `text` if it's safe to print directly to a terminal, otherwise a
-/// `[N bytes binary — hex...]` summary. See the module docs for exactly
-/// what "binary" means here and its known limitation.
-fn render_data_content(text: &str) -> String {
-    if is_terminal_safe(text) {
-        return text.to_string();
+/// Recover a line's exact original device bytes from the wire's JSON
+/// shape: `raw_b64`, base64-decoded, when present; otherwise `text`'s own
+/// UTF-8 bytes. See the module docs for why the latter is still
+/// byte-exact, not an approximation, whenever `raw_b64` is absent.
+fn line_bytes(line: &Value) -> Vec<u8> {
+    if let Some(b64) = line.get("raw_b64").and_then(Value::as_str) {
+        if let Ok(bytes) = BASE64.decode(b64) {
+            return bytes;
+        }
+        // Malformed `raw_b64` from a future/misbehaving daemon build:
+        // fall through to `text` rather than losing the line entirely.
     }
-    let bytes = text.as_bytes();
+    line.get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .as_bytes()
+        .to_vec()
+}
+
+/// `bytes` rendered as text if it's safe to print directly to a terminal,
+/// otherwise a `[N bytes binary — hex...]` summary of those same bytes —
+/// see the module docs for why this is always the device's real bytes now,
+/// never a lossy stand-in.
+fn render_data_content(bytes: &[u8]) -> String {
+    if is_terminal_safe(bytes) {
+        // Safe by construction: `is_terminal_safe` only returns `true`
+        // after confirming `bytes` is valid UTF-8.
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
     let preview: Vec<String> = bytes
         .iter()
         .take(HEX_PREVIEW_BYTES)
@@ -80,15 +103,16 @@ fn render_data_content(text: &str) -> String {
     }
 }
 
-/// A line is terminal-safe when it contains no U+FFFD (this CLI's only
-/// remaining signal that the original bytes weren't valid UTF-8 — see the
-/// module docs) and no control character other than tab (control
-/// characters — especially ESC — can reprogram the terminal itself, which
-/// is exactly the "binary 不污染終端" failure mode this guards against).
-fn is_terminal_safe(text: &str) -> bool {
-    !text
-        .chars()
-        .any(|c| c == '\u{FFFD}' || (c.is_control() && c != '\t'))
+/// `bytes` is terminal-safe when it's valid UTF-8 and contains no control
+/// byte other than tab (control bytes — especially ESC — can reprogram the
+/// terminal itself, which is exactly the "binary 不污染終端" failure mode
+/// this guards against). Invalid UTF-8 is never safe: it can't be
+/// meaningfully rendered as text at all, byte-exact or otherwise.
+fn is_terminal_safe(bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => !s.chars().any(|c| c.is_control() && c != '\t'),
+        Err(_) => false,
+    }
 }
 
 /// Render an out-of-band record's content: its event/gate label, plus
@@ -144,9 +168,27 @@ fn scalar(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    /// Build a wire-shaped line `Value` the way a real `tail`/`read_since`
+    /// reply would: `text` always, plus `raw_b64` only when `raw` isn't
+    /// valid UTF-8 — mirroring `serialwrapd::protocol::session::line_json`'s
+    /// presence rule, so these tests exercise the real wire shape rather
+    /// than a shortcut.
+    fn line_value(raw: &[u8]) -> Value {
+        let text = String::from_utf8_lossy(raw).into_owned();
+        let mut obj = serde_json::Map::new();
+        obj.insert("text".to_string(), text.into());
+        obj.insert("seq".to_string(), 0.into());
+        obj.insert("t_mono".to_string(), 0.0.into());
+        obj.insert("t_wall".to_string(), "2026-07-27T10:34:12.443+08:00".into());
+        if std::str::from_utf8(raw).is_err() {
+            obj.insert("raw_b64".to_string(), BASE64.encode(raw).into());
+        }
+        Value::Object(obj)
+    }
+
     #[test]
     fn data_line_has_no_hash_prefix() {
-        let line = render_data_line("2026-07-27T10:34:12.443+08:00", "boot ok");
+        let line = render_data_line("2026-07-27T10:34:12.443+08:00", &line_value(b"boot ok"));
         assert!(!line.starts_with('#'), "line was: {line}");
         assert!(line.ends_with("boot ok"), "line was: {line}");
     }
@@ -177,25 +219,66 @@ mod tests {
 
     #[test]
     fn printable_text_renders_unchanged() {
-        assert_eq!(render_data_content("Temp: 25.7 C"), "Temp: 25.7 C");
+        assert_eq!(render_data_content(b"Temp: 25.7 C"), "Temp: 25.7 C");
     }
 
     #[test]
-    fn replacement_character_triggers_binary_rendering() {
-        let text = "\u{FFFD}\u{FFFD}\u{FFFD}";
-        let rendered = render_data_content(text);
-        assert!(rendered.starts_with('['), "rendered was: {rendered}");
+    fn line_bytes_prefers_raw_b64_over_the_lossy_text_field() {
+        // Invalid UTF-8 mixed with ordinary text — exactly what
+        // `String::from_utf8_lossy` cannot round-trip. `raw_b64` must carry
+        // the true bytes regardless of what `text` looks like.
+        let original: Vec<u8> = {
+            let mut v = b"a-".to_vec();
+            v.extend_from_slice(&[0xFF, 0xFE]);
+            v.extend_from_slice(b"-b");
+            v
+        };
+        let line = line_value(&original);
         assert!(
-            rendered.contains("bytes binary"),
+            line.get("raw_b64").is_some(),
+            "invalid-UTF-8 line must carry raw_b64: {line}"
+        );
+        assert_eq!(
+            line_bytes(&line),
+            original,
+            "line_bytes must recover the exact original bytes, not the lossy text"
+        );
+    }
+
+    #[test]
+    fn line_bytes_falls_back_to_text_when_raw_b64_is_absent() {
+        let line = line_value(b"plain ascii");
+        assert!(line.get("raw_b64").is_none());
+        assert_eq!(line_bytes(&line), b"plain ascii");
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_trigger_binary_rendering_with_the_exact_hex() {
+        let original: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01];
+        let line = line_value(&original);
+        let rendered = render_data_line("2026-07-27T10:34:12.443+08:00", &line);
+        assert!(
+            rendered.contains("4 bytes binary"),
             "rendered was: {rendered}"
         );
-        assert!(!rendered.contains('\u{FFFD}'));
+        let expected_hex = original
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            rendered.contains(&expected_hex),
+            "rendered was: {rendered}, expected hex {expected_hex}"
+        );
+        // The lossy U+FFFD replacement text must never leak into the
+        // rendered output — only the real bytes' hex.
+        assert!(!rendered.contains('\u{FFFD}'), "rendered was: {rendered}");
     }
 
     #[test]
     fn control_bytes_never_reach_the_terminal_raw() {
-        let text = "before\x1b[31mred\x1b[0mafter";
-        let rendered = render_data_content(text);
+        let bytes = b"before\x1b[31mred\x1b[0mafter";
+        let rendered = render_data_content(bytes);
         assert!(!rendered.contains('\x1b'), "rendered was: {rendered:?}");
         assert!(
             rendered.contains("bytes binary"),
@@ -205,10 +288,9 @@ mod tests {
 
     #[test]
     fn binary_preview_is_capped_at_64_bytes_of_hex() {
-        let text: String = "\u{FFFD}".repeat(100);
-        let rendered = render_data_content(&text);
-        // Each U+FFFD is 3 bytes in UTF-8, so 100 of them is 300 bytes —
-        // well past the 64-byte preview cap.
+        // 300 invalid-UTF-8 bytes — well past the 64-byte preview cap.
+        let bytes: Vec<u8> = vec![0xFFu8; 300];
+        let rendered = render_data_content(&bytes);
         assert!(
             rendered.contains("300 bytes binary"),
             "rendered was: {rendered}"
@@ -230,10 +312,29 @@ mod tests {
             byte_count, HEX_PREVIEW_BYTES,
             "hex section was: {hex_section:?}"
         );
+        // And the hex itself must be the real bytes (all 0xff), not a
+        // stand-in derived from a lossy-decoded string.
+        assert!(
+            hex_section.split_whitespace().all(|h| h == "ff"),
+            "hex section was: {hex_section:?}"
+        );
     }
 
     #[test]
     fn tab_alone_is_still_terminal_safe() {
-        assert!(is_terminal_safe("a\tb"));
+        assert!(is_terminal_safe(b"a\tb"));
+    }
+
+    #[test]
+    fn valid_utf8_containing_the_actual_replacement_character_is_still_terminal_safe() {
+        // A device that deliberately emits the U+FFFD glyph as valid UTF-8
+        // (EF BF BD) is not the same thing as invalid bytes that got
+        // lossily replaced — now that byte-exactness no longer depends on
+        // spotting U+FFFD as a heuristic, this must render as plain text,
+        // not trigger a false-positive binary summary.
+        let bytes = "temp=\u{FFFD}C".as_bytes();
+        assert!(std::str::from_utf8(bytes).is_ok());
+        assert!(is_terminal_safe(bytes));
+        assert_eq!(render_data_content(bytes), "temp=\u{FFFD}C");
     }
 }

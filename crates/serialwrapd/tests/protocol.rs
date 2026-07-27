@@ -14,7 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -544,4 +547,235 @@ async fn wait_for_does_not_block_other_requests_on_the_same_connection() {
         elapsed < Duration::from_millis(500),
         "list_devices must not be blocked by the in-flight wait_for (took {elapsed:?})"
     );
+}
+
+// ---- Issue #32 acceptance criterion 1: byte-exact round trip over the wire ----
+
+#[tokio::test]
+async fn a_line_with_invalid_utf8_round_trips_byte_exact_via_raw_b64() {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    // Ordinary text with a deliberately invalid UTF-8 run spliced in --
+    // exactly what `String::from_utf8_lossy` folds into U+FFFD and cannot
+    // reconstruct.
+    let mut original = b"prefix-".to_vec();
+    original.extend_from_slice(&[0xFF, 0xFE, 0x80, 0x2A]);
+    original.extend_from_slice(b"-suffix");
+    let mut with_newline = original.clone();
+    with_newline.push(b'\n');
+    recorder.append_rx(&with_newline).unwrap();
+
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "reader", "human").await;
+
+    c.send(json!({"id": 1, "op": "tail", "device": "dev", "n": 10}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "tail failed: {reply}");
+    let lines = reply["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 1);
+    let line = &lines[0];
+
+    let raw_b64 = line["raw_b64"]
+        .as_str()
+        .unwrap_or_else(|| panic!("invalid-UTF-8 line must carry raw_b64: {line}"));
+    let decoded = BASE64
+        .decode(raw_b64)
+        .expect("raw_b64 must be valid base64");
+    assert_eq!(
+        decoded, original,
+        "decoded raw_b64 must be byte-for-byte identical to what was written"
+    );
+
+    let mut original_hasher = Sha256::new();
+    original_hasher.update(&original);
+    let mut decoded_hasher = Sha256::new();
+    decoded_hasher.update(&decoded);
+    assert_eq!(
+        format!("{:x}", original_hasher.finalize()),
+        format!("{:x}", decoded_hasher.finalize()),
+        "sha256(original) must match sha256(decoded raw_b64)"
+    );
+
+    // The lossy `text` field is still present (as a display convenience)
+    // but must not be mistaken for byte-exact — it contains the
+    // replacement character where the invalid bytes were.
+    assert!(
+        line["text"].as_str().unwrap().contains('\u{FFFD}'),
+        "text field: {line}"
+    );
+
+    println!("acceptance (issue #32) #1 — raw_b64 byte-exact round trip: sha256 matched");
+}
+
+#[tokio::test]
+async fn a_valid_utf8_line_never_carries_a_redundant_raw_b64() {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    recorder.append_rx(b"perfectly ordinary text\n").unwrap();
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "reader", "human").await;
+
+    c.send(json!({"id": 1, "op": "tail", "device": "dev", "n": 10}))
+        .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "tail failed: {reply}");
+    let lines = reply["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].get("raw_b64").is_none(),
+        "a line that's already valid UTF-8 must not pay the raw_b64 bandwidth cost: {}",
+        lines[0]
+    );
+}
+
+// ---- Issue #32 acceptance criterion 2: subscribe(since_cursor) has no gap ----
+
+#[tokio::test]
+async fn subscribe_since_cursor_has_no_gap_and_matches_read_since() {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    for i in 0..10 {
+        recorder
+            .append_rx(format!("line-{i}\n").as_bytes())
+            .unwrap();
+    }
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+
+    // tail "reads to seq 9" (10 lines, seq 0..=9) and gets back the cursor
+    // to resume from — 10, one past the last seq it saw.
+    let (mut reader, _ack) = Client::connect(&sock_path, "reader", "human").await;
+    reader
+        .send(json!({"id": 1, "op": "tail", "device": "dev", "n": 20}))
+        .await;
+    let tail_reply = reader.recv().await;
+    assert_eq!(tail_reply["ok"], true, "tail failed: {tail_reply}");
+    assert_eq!(tail_reply["lines"].as_array().unwrap().len(), 10);
+    let cursor = tail_reply["cursor"].as_u64().expect("cursor");
+    assert_eq!(cursor, 10, "cursor must be last_seq(9) + 1");
+
+    // Subscribe from exactly that cursor, on a separate connection (this is
+    // the realistic "tail, then hand the cursor to a follower" shape).
+    let (mut subscriber, _ack) = Client::connect(&sock_path, "subscriber", "agent").await;
+    subscriber
+        .send(json!({"id": 1, "op": "subscribe", "device": "dev", "since_cursor": cursor}))
+        .await;
+    // Let the subscribe task actually reach its snapshot-then-wait point
+    // before anything new is appended, so the append below can't race
+    // ahead of the subscription being registered (same pattern
+    // `eight_concurrent_subscribers_see_identical_seq_and_bytes` already
+    // uses for the same reason).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for i in 10..15 {
+        recorder
+            .append_rx(format!("line-{i}\n").as_bytes())
+            .unwrap();
+    }
+
+    let mut pushed: Vec<(u64, String)> = Vec::new();
+    while pushed.len() < 5 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), subscriber.recv())
+            .await
+            .expect("subscribe push within 2s");
+        for l in msg["lines"].as_array().expect("lines array") {
+            pushed.push((
+                l["seq"].as_u64().expect("seq"),
+                l["text"].as_str().expect("text").to_string(),
+            ));
+        }
+    }
+
+    assert_eq!(
+        pushed[0],
+        (10, "line-10".to_string()),
+        "first pushed record must be seq cursor (=10), not a repeat of 0..=9 or a gap past it"
+    );
+    let expected: Vec<(u64, String)> = (10..15).map(|i| (i, format!("line-{i}"))).collect();
+    assert_eq!(
+        pushed, expected,
+        "subscribe(since_cursor) must push exactly the new records, no gap, no dupe"
+    );
+
+    // And it must match `read_since(cursor)` called fresh, right now, over
+    // the exact same range — proving "since_cursor 語意與 read_since 一致".
+    reader
+        .send(json!({"id": 2, "op": "read_since", "device": "dev", "cursor": cursor}))
+        .await;
+    let read_since_reply = reader.recv().await;
+    assert_eq!(
+        read_since_reply["ok"], true,
+        "read_since: {read_since_reply}"
+    );
+    let read_since_lines: Vec<(u64, String)> = read_since_reply["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            (
+                l["seq"].as_u64().unwrap(),
+                l["text"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pushed, read_since_lines,
+        "subscribe(since_cursor) and read_since(cursor) must agree exactly"
+    );
+
+    println!(
+        "acceptance (issue #32) #2 — subscribe(since_cursor={cursor}) first push {:?}, matches read_since({cursor}): {read_since_lines:?}",
+        pushed[0]
+    );
+}
+
+#[tokio::test]
+async fn subscribe_since_cursor_below_the_retained_floor_is_a_structured_data_aged_out_not_a_hang()
+{
+    let tmp_data = tempfile::tempdir().unwrap();
+    // Tiny ring so a handful of appends actually evict old segments.
+    let tiny = RecorderConfig {
+        segment_bytes: 300,
+        ring_bytes: 900,
+        checkpoint_every: 3,
+        checkpoint_bytes: 100,
+        fsync_interval: Duration::from_secs(3600),
+    };
+    let recorder = Arc::new(Recorder::open(tmp_data.path(), "dev", tiny).unwrap());
+    for i in 0..200 {
+        recorder
+            .append_rx(format!("payload-{i:04}\n").as_bytes())
+            .unwrap();
+    }
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "reader", "human").await;
+
+    // Let the background poller ingest everything (and its own
+    // `DeviceQueryState::oldest_seq` floor get set) before subscribing with
+    // a since_cursor of 0, which is now guaranteed to be aged out.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    c.send(json!({"id": 1, "op": "subscribe", "device": "dev", "since_cursor": 0}))
+        .await;
+    let reply = tokio::time::timeout(Duration::from_secs(2), c.recv())
+        .await
+        .expect("an aged-out since_cursor must reply promptly, never hang");
+    assert_eq!(reply["ok"], false, "reply: {reply}");
+    assert_eq!(reply["error"]["code"], "data_aged_out", "reply: {reply}");
+    assert!(
+        reply["error"]["oldest_available_seq"].as_u64().unwrap() > 0,
+        "reply: {reply}"
+    );
+    println!("acceptance (issue #32) #2 (edge case) — aged-out since_cursor: {reply}");
 }

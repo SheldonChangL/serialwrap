@@ -18,6 +18,10 @@ serde_json = { workspace = true }
 # `--since` (T1.5) — the client-side read counterpart to the same crate's
 # `t_wall` encoding `serialwrapd` already relies on (T1.2).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Decode a line's `raw_b64` field (issue #32) back into the exact original
+# device bytes for byte-exact hex-preview rendering (`cli::render`) — same
+# version `serialwrapd` itself uses to encode it.
+base64 = "0.22"
 
 [dev-dependencies]
 # Test-only PTY fixture (see TASKS.md T0.2), used by this crate's own
@@ -25,9 +29,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # tests use it — dev-dependency only, never linked into the release binary.
 mock-device = { path = "../mock-device" }
 tempfile = "3"
-# Decode `data_b64` when peeking at a test daemon's raw `Recorder` directly
-# (the S1 acceptance test, T1.5) — same version `serialwrapd` itself uses.
-base64 = "0.22"
 # Send a real SIGINT to a spawned `serialwrap tail -f` child process, to
 # test the Ctrl-C acceptance criterion (T1.5) against the actual compiled
 # binary rather than an in-process approximation.
