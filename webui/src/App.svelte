@@ -4,6 +4,7 @@
   import ConnectionStatus from "./lib/ConnectionStatus.svelte";
   import DeviceList from "./lib/DeviceList.svelte";
   import LiveLog from "./lib/LiveLog.svelte";
+  import ApprovalCardHost from "./lib/ApprovalCardHost.svelte";
   import { fetchDevices } from "./lib/api";
 
   const connection = new Connection();
@@ -50,11 +51,13 @@
   </header>
 
   <p class="tagline">
-    Web GUI foundation (T5.1) plus the live log view (T5.2). Timeline,
-    approval cards, and clients/audit/export panels land in later tasks.
+    Web GUI foundation (T5.1), the live log view (T5.2), the timeline and
+    port settings popover (T5.3), and the approval card (T5.4). Clients,
+    audit, and export panels land in T5.5.
   </p>
 
   {#if primaryDeviceId}
+    <ApprovalCardHost deviceId={primaryDeviceId} />
     <LiveLog deviceId={primaryDeviceId} />
   {/if}
 

@@ -1,31 +1,60 @@
 <script lang="ts">
   import type { LogItem } from "./liveLog";
+  import { setDeviceConfig } from "./logStream";
 
   interface Props {
     item: LogItem;
     timestamp: string;
     expanded: boolean;
     onToggleExpand: (id: number) => void;
+    /** Needed only for the `config_change` row's "還原" (revert) button
+     * (T5.3, issue #20) — every other row kind ignores this. */
+    deviceId?: string;
+    /** Flashes a highlight after a timeline jump lands on this row (T5.3
+     * acceptance criterion 1) — see `LiveLog.svelte`'s `jumpToSeq`. */
+    highlighted?: boolean;
+    onReverted?: () => void;
   }
 
-  const { item, timestamp, expanded, onToggleExpand }: Props = $props();
+  const { item, timestamp, expanded, onToggleExpand, deviceId, highlighted = false, onReverted }: Props = $props();
 
   function fmtCount(n: number): string {
     return n.toLocaleString();
   }
+
+  let reverting = $state(false);
+  let revertError = $state<string | null>(null);
+
+  async function revertConfigChange(): Promise<void> {
+    if (item.kind !== "event" || !deviceId) return;
+    const old = item.extra.old;
+    if (old === null || old === undefined) return;
+    reverting = true;
+    revertError = null;
+    try {
+      await setDeviceConfig(deviceId, old as Record<string, unknown>);
+      onReverted?.();
+    } catch (e) {
+      revertError = e instanceof Error ? e.message : String(e);
+    } finally {
+      reverting = false;
+    }
+  }
 </script>
 
 {#if item.kind === "gap"}
-  <div class="row gap" data-testid="log-row" data-row-kind="gap">
+  <div class="row gap" data-testid="log-row" data-row-kind="gap" data-highlighted={highlighted}>
     <span class="chip">+{item.deltaS.toFixed(1)}s</span>
   </div>
 {:else if item.kind === "line"}
   <div
     class="row data"
     class:folded={item.folded}
+    class:highlighted
     data-testid="log-row"
     data-row-kind="line"
     data-folded={item.folded}
+    data-highlighted={highlighted}
     data-binary={item.render.kind === "binary_summary" || (item.render.kind === "text" && item.render.rawHex !== null)}
   >
     <span class="ts">{timestamp}</span>
@@ -68,7 +97,7 @@
     {/if}
   </div>
 {:else if item.kind === "tx"}
-  <div class="row event tx" data-testid="log-row" data-row-kind="tx">
+  <div class="row event tx" class:highlighted data-testid="log-row" data-row-kind="tx" data-highlighted={highlighted}>
     <span class="ts">{timestamp}</span>
     <span class="bar" aria-hidden="true"></span>
     <span class="label">TX &middot; {item.client} ({item.clientType})</span>
@@ -76,14 +105,42 @@
     <span class="gate-badge">{item.gate}</span>
   </div>
 {:else if item.kind === "event"}
-  <div class="row event" data-testid="log-row" data-row-kind="event" data-event-name={item.name}>
+  <div
+    class="row event"
+    class:highlighted
+    data-testid="log-row"
+    data-row-kind="event"
+    data-event-name={item.name}
+    data-highlighted={highlighted}
+  >
     <span class="ts">{timestamp}</span>
     <span class="bar" aria-hidden="true"></span>
     <span class="label">{item.name}</span>
     <span class="text">{JSON.stringify(item.extra)}</span>
+    {#if item.name === "config_change" && deviceId}
+      <button
+        type="button"
+        class="revert-btn"
+        data-testid="config-revert"
+        disabled={reverting || item.extra.old === null || item.extra.old === undefined}
+        onclick={revertConfigChange}
+      >
+        {reverting ? "reverting…" : "revert"}
+      </button>
+      {#if revertError}
+        <span class="revert-error">{revertError}</span>
+      {/if}
+    {/if}
   </div>
 {:else}
-  <div class="row event gate" data-testid="log-row" data-row-kind="gate" data-gate-action={item.action}>
+  <div
+    class="row event gate"
+    class:highlighted
+    data-testid="log-row"
+    data-row-kind="gate"
+    data-gate-action={item.action}
+    data-highlighted={highlighted}
+  >
     <span class="ts">{timestamp}</span>
     <span class="bar" aria-hidden="true"></span>
     <span class="label">gate: {item.action}</span>
@@ -194,5 +251,39 @@
 
   .folded .bar {
     background: var(--border);
+  }
+
+  .highlighted {
+    animation: highlight-flash 1.2s ease-out 2;
+  }
+
+  @keyframes highlight-flash {
+    0% {
+      background-color: rgba(88, 166, 255, 0.35);
+    }
+    100% {
+      background-color: transparent;
+    }
+  }
+
+  .revert-btn {
+    flex: none;
+    font: inherit;
+    font-size: 0.7rem;
+    padding: 0.05rem 0.4rem;
+    border-radius: 0.3rem;
+    border: 1px solid var(--border);
+    background: var(--surface-raised);
+    color: inherit;
+    cursor: pointer;
+  }
+  .revert-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .revert-error {
+    color: var(--dot-closed);
+    font-size: 0.7rem;
   }
 </style>

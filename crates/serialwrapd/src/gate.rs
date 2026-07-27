@@ -196,6 +196,12 @@ impl Gate {
             danger_reason: danger_reason.clone(),
             log_context,
             recorder: Arc::clone(recorder),
+            // See `ApprovalSnapshot::timeout_s`'s doc comment (T5.4, issue
+            // #21): the same `self.rules.timeout` value that already governs
+            // the real timeout race below, also carried into the snapshot
+            // purely so a card (GUI or CLI) can render "how much is left"
+            // instead of assuming a fixed duration.
+            timeout_s: self.rules.timeout.as_secs_f64(),
         });
 
         // Audit the request itself — the one on-disk trace of a write
