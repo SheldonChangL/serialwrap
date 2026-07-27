@@ -44,6 +44,8 @@ pub mod rules;
 
 use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use wrap_proto::ClientType;
 
 use crate::recorder::Recorder;
@@ -172,11 +174,16 @@ impl Gate {
         };
 
         // Grabbed before `ctx` is partially moved into `NewPending` below —
-        // both are `Copy`/cheap to clone and still needed afterward (the
-        // notification body, keyed by device+pid for a human glancing at a
-        // popup, not by the daemon-internal `client_id`).
+        // all four are `Copy`/cheap-to-clone and still needed afterward: the
+        // notification body (keyed by device+pid for a human glancing at a
+        // popup, not by the daemon-internal `client_id`), and the
+        // `write_request` audit event below (T4.3, issue #16), which needs
+        // the full requester identity alongside the bytes.
         let device = ctx.device.clone();
         let pid = ctx.pid;
+        let requester_name = ctx.name.clone();
+        let requester_type = ctx.client_type;
+        let session_request_no = ctx.session_request_no;
 
         let (id, rx) = self.queue.submit(NewPending {
             device: ctx.device,
@@ -186,7 +193,7 @@ impl Gate {
             session_request_no: ctx.session_request_no,
             bytes: bytes.to_vec(),
             matched_rule: matched_rule.clone(),
-            danger_reason,
+            danger_reason: danger_reason.clone(),
             log_context,
             recorder: Arc::clone(recorder),
         });
@@ -203,6 +210,54 @@ impl Gate {
         if let Err(e) = recorder.append_gate("request", request_label, id) {
             eprintln!(
                 "serialwrapd: gate: failed to append gate request audit record for pending \
+                 {id}: {e}"
+            );
+        }
+
+        // Full-payload audit trail (`TASKS.md` T4.3, issue #16): a denied or
+        // timed-out write never produces a `tx` record at all (see
+        // `protocol::session`'s `write_and_reply` doc comment — only an
+        // eventual *successful* write gets one), so without this, the one
+        // thing an operator most wants to know after a denial — "what did
+        // it actually try to send?" — would be unrecoverable the moment
+        // this pending entry resolves and drops out of
+        // `PendingQueue::list`. Deliberately *not* a new field on
+        // `Record::Gate` (which would mean extending `recorder.rs`'s/
+        // `wrap-proto`'s on-disk schema): `Recorder::append_event` already
+        // accepts arbitrary `extra` fields, so a distinctly-named event
+        // carries the full requester identity + bytes with no schema
+        // change at all — exactly the "audit is a query view over the
+        // existing stream, not a second store" stance this task's own docs
+        // insist on. `request_id` mirrors `request_seq` above: the same
+        // correlation id a `serialwrap audit` view joins the eventual
+        // approve/deny `gate` record against.
+        let mut request_extra = serde_json::Map::new();
+        request_extra.insert("request_id".to_string(), id.into());
+        request_extra.insert("device".to_string(), device.clone().into());
+        request_extra.insert("requester_name".to_string(), requester_name.into());
+        request_extra.insert("requester_pid".to_string(), pid.into());
+        request_extra.insert(
+            "requester_type".to_string(),
+            serde_json::to_value(requester_type).unwrap_or(serde_json::Value::Null),
+        );
+        request_extra.insert("session_request_no".to_string(), session_request_no.into());
+        request_extra.insert("bytes_b64".to_string(), BASE64.encode(bytes).into());
+        request_extra.insert(
+            "matched_rule".to_string(),
+            matched_rule
+                .clone()
+                .map(Into::into)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        request_extra.insert(
+            "danger_reason".to_string(),
+            danger_reason
+                .map(Into::into)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        if let Err(e) = recorder.append_event("write_request", request_extra) {
+            eprintln!(
+                "serialwrapd: gate: failed to append write_request audit record for pending \
                  {id}: {e}"
             );
         }
@@ -265,6 +320,29 @@ impl Default for Gate {
     fn default() -> Self {
         Self::builtin()
     }
+}
+
+/// Synthetic "bytes" [`Gate::submit_write`] matches a `dtr_pulse` request
+/// against (`TASKS.md` T4.4, issue #17) — see `protocol::session`'s
+/// `Request::DtrPulse` handler, the only caller. A `dtr_pulse` request is
+/// not itself a byte payload sent to the device (it never reaches
+/// `protocol::backend::DeviceBackend::write_bytes`; once allowed/approved,
+/// the handler calls `DeviceBackend::dtr_pulse` directly, which appends its
+/// own `dtr_pulse` event via `device_profile::append_dtr_pulse_event`) —
+/// this string exists purely so the *same* whitelist/danger rule-matching
+/// machinery `write` uses can also name `dtr_pulse` explicitly (e.g. an
+/// operator's own `pattern = "dtr_pulse"` in `rules.toml`), per the
+/// Security-model wiki's policy table ("Toggle DTR/RTS, dtr_pulse: Gated —
+/// physically resets most boards") and this task's own reasoning for why
+/// `dtr_pulse` is a distinct, named action rather than a `set_config`
+/// parameter: "這樣規則引擎能單獨比對它，稽核讀起來是「reset 了板子」而不是
+/// 「設了一條控制線」". With no rule matching it at all (the built-in
+/// default, no `rules.toml`), this always falls through to
+/// [`rules::RuleVerdict::Pending`] — approval required by default, exactly
+/// the "Gated" policy — while still leaving an operator free to whitelist
+/// it explicitly for a rig where an agent-triggered reset is routine.
+pub fn dtr_pulse_gate_bytes(duration_ms: u64) -> Vec<u8> {
+    format!("dtr_pulse duration_ms={duration_ms}").into_bytes()
 }
 
 #[cfg(test)]
@@ -332,6 +410,147 @@ mod tests {
             Decision::Approved { approved_by } => assert_eq!(approved_by, "sheldon:1000"),
             other => panic!("expected Approved, got {other:?}"),
         }
+    }
+
+    // ---- T4.3 acceptance criteria 1 & 2 (issue #16): full traceability, and
+    // a denied request keeps its full payload ----
+
+    #[tokio::test]
+    async fn a_denied_write_keeps_full_traceability_via_the_write_request_and_gate_events() {
+        let (recorder, _dir) = test_recorder();
+        let gate = Gate::new(
+            rules_with(&[], &["erase"]),
+            Arc::new(notify::DesktopNotifier),
+        );
+        let (decision, rx) = gate.submit_write(&recorder, b"flash_erase all", ctx(3), vec![]);
+        let id = match decision {
+            GateDecision::ForcePending { id, matched_rule } => {
+                assert_eq!(matched_rule, "danger:erase");
+                id
+            }
+            other => panic!("expected ForcePending, got {other:?}"),
+        };
+        gate.decide(
+            id,
+            Decision::Denied {
+                reason: "denied_by_operator:sheldon:1000".to_string(),
+            },
+        )
+        .expect("decide succeeds");
+        rx.expect("force_pending returns a receiver").await.unwrap();
+
+        let records = recorder.read_since(0, usize::MAX).unwrap().records;
+
+        // The full payload + requester identity + judgment path survive as
+        // a `write_request` event — this is the one place a *denied*
+        // write's bytes are recoverable from at all (no `tx` record is
+        // ever produced for it).
+        let write_request = records
+            .iter()
+            .find_map(|r| match r {
+                wrap_proto::Record::Event { event, extra, .. } if event == "write_request" => {
+                    Some(extra.clone())
+                }
+                _ => None,
+            })
+            .expect("expected a write_request event");
+        assert_eq!(
+            write_request.get("request_id").and_then(|v| v.as_u64()),
+            Some(id)
+        );
+        assert_eq!(
+            write_request.get("device").and_then(|v| v.as_str()),
+            Some("dev")
+        );
+        assert_eq!(
+            write_request.get("requester_name").and_then(|v| v.as_str()),
+            Some("claude-code")
+        );
+        assert_eq!(
+            write_request.get("requester_pid").and_then(|v| v.as_u64()),
+            Some(4242)
+        );
+        assert_eq!(
+            write_request.get("requester_type").and_then(|v| v.as_str()),
+            Some("agent")
+        );
+        assert_eq!(
+            write_request
+                .get("session_request_no")
+                .and_then(|v| v.as_u64()),
+            Some(3)
+        );
+        assert_eq!(
+            write_request.get("matched_rule").and_then(|v| v.as_str()),
+            Some("danger:erase")
+        );
+        let bytes_b64 = write_request
+            .get("bytes_b64")
+            .and_then(|v| v.as_str())
+            .expect("bytes_b64 present");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(bytes_b64)
+            .unwrap();
+        assert_eq!(
+            bytes, b"flash_erase all",
+            "the full, unmangled payload the agent tried to send must survive the denial"
+        );
+
+        // The decision-maker + decision path: the `gate` `request`/`deny`
+        // records correlate back to the same `write_request` via
+        // `request_seq`/`request_id`.
+        let gate_records: Vec<&wrap_proto::Record> = records
+            .iter()
+            .filter(|r| matches!(r, wrap_proto::Record::Gate { .. }))
+            .collect();
+        let request_record = gate_records
+            .iter()
+            .find(|r| matches!(r, wrap_proto::Record::Gate { action, request_seq, .. } if action == "request" && *request_seq == id))
+            .expect("expected the request gate record");
+        let deny_record = gate_records
+            .iter()
+            .find(|r| matches!(r, wrap_proto::Record::Gate { action, request_seq, .. } if action == "deny" && *request_seq == id))
+            .expect("expected the deny gate record");
+        match (request_record, deny_record) {
+            (
+                wrap_proto::Record::Gate {
+                    reason: req_reason, ..
+                },
+                wrap_proto::Record::Gate {
+                    reason: deny_reason,
+                    seq: deny_seq,
+                    ..
+                },
+            ) => {
+                assert_eq!(req_reason, "danger:erase", "judgment path recoverable");
+                assert_eq!(
+                    deny_reason, "denied_by_operator:sheldon:1000",
+                    "decision-maker recoverable from the deny record's own reason"
+                );
+                // The record's own `seq` *is* the corresponding log offset
+                // — no separate index/join needed, per the "audit is a
+                // view over the one event stream" design.
+                assert!(
+                    *deny_seq < recorder.read_since(0, usize::MAX).unwrap().records.len() as u64
+                );
+            }
+            _ => unreachable!("filtered to Gate records above"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dtr_pulse_gate_bytes_default_pends_with_no_rules_configured() {
+        // Default (built-in) rules never mention "dtr_pulse" at all, so a
+        // dtr_pulse request must fall through to default-pending — approval
+        // required by default, per the Security-model wiki's "Gated" policy
+        // for dtr_pulse (T4.4, issue #17).
+        let set = RuleSet::builtin();
+        let bytes = dtr_pulse_gate_bytes(50);
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            "dtr_pulse duration_ms=50"
+        );
+        assert_eq!(set.evaluate(&bytes), RuleVerdict::Pending);
     }
 
     fn rules_with(whitelist: &[&str], danger: &[&str]) -> RuleSet {
