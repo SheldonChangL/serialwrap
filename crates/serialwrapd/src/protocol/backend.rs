@@ -288,20 +288,6 @@ pub mod testing {
                 );
         }
 
-        /// Set `id`'s reported device path — what [`TestBackend::acquire_lease`]
-        /// hands back to a caller as the path to run an external tool
-        /// against. A no-op if `id` was never `register`ed.
-        pub fn set_path(&self, id: &DeviceId, path: PathBuf) {
-            if let Some(entry) = self
-                .devices
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(id)
-            {
-                entry.path = Some(path);
-            }
-        }
-
         /// Give `id` a real fd to write to, so `write_bytes` has somewhere
         /// to send bytes a test can read back independently (e.g. a raw
         /// PTY pair's slave side, with the test reading the master side) —
