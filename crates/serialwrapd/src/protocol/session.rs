@@ -36,8 +36,12 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 
-use wrap_proto::{ErrorCode, HelloAck, HelloRequest, LineEnding, Permission, Request, WireError};
+use wrap_proto::{
+    ClientType, ErrorCode, HelloAck, HelloRequest, LineEnding, Permission, Request, WireError,
+};
 
+use crate::gate::approval::Decision as ApprovalDecision;
+use crate::gate::{GateDecision, RequesterCtx, DEFAULT_LOG_CONTEXT_LINES};
 use crate::port::{DeviceId, LeaseError};
 use crate::query::{OobRecord, QueryError, QueryPage, WaitForOutcome};
 
@@ -463,6 +467,70 @@ async fn reader_loop(
 fn send(shared: &Shared, client_id: u64, tx: &UnboundedSender<String>, line: String) {
     shared.clients.add_bytes_out(client_id, line.len() as u64);
     let _ = tx.send(line);
+}
+
+/// Everything [`write_and_reply`] needs about *this connection and this
+/// request* — bundled into one struct (rather than eight separate
+/// parameters) purely to stay under clippy's `too_many_arguments`; every
+/// field here is identical across both of `Request::Write`'s call sites
+/// into `write_and_reply` (the `human` bypass and an `agent` write the
+/// gate ultimately allowed), only `bytes`/`gate_label` differ per call.
+struct WriteReplyCtx<'a> {
+    shared: &'a Shared,
+    client_id: u64,
+    tx: &'a UnboundedSender<String>,
+    id: u64,
+    dev: &'a DeviceId,
+    device: &'a str,
+    changed_by: &'a str,
+    client_type: ClientType,
+}
+
+/// Actually send `bytes` out `dev`'s port, append the audit `tx` record,
+/// and reply — the one place both the `human` bypass path and an `agent`
+/// write the gate ultimately let through (whitelisted or human-approved)
+/// converge, so this "write, then audit, then reply" sequence and its
+/// error handling exist exactly once (`TASKS.md` T2.1/T4.1/T4.2). Mirrors
+/// this endpoint's original human-only body verbatim, generalized only by
+/// taking `gate_label` as a parameter instead of hardcoding `"human_rw"`:
+/// `"human_rw"` for the human bypass, `"whitelist:<pattern>"` for an
+/// agent's immediately-allowed write, or `"approved_by:<name:pid>"` for one
+/// a human approved out of the pending queue (`TASKS.md` T4.2 acceptance
+/// criterion 7).
+fn write_and_reply(ctx: &WriteReplyCtx, bytes: &[u8], gate_label: &str) {
+    match ctx.shared.backend.write_bytes(ctx.dev, bytes) {
+        Ok(()) => {
+            // Record the tx event *after* the bytes are actually out the
+            // port — see this function's callers' doc comments for
+            // `gate_label`'s three possible shapes. A failure to append is
+            // logged, not returned as an error to the client: the write
+            // itself already succeeded, and reporting it as failed would
+            // invite a duplicate retry that writes the same bytes to the
+            // device twice.
+            if let Some(recorder) = ctx.shared.backend.recorder(ctx.dev) {
+                if let Err(e) =
+                    recorder.append_tx(bytes, ctx.changed_by, ctx.client_type, gate_label)
+                {
+                    eprintln!(
+                        "serialwrapd: protocol: failed to append tx record for {}: {e}",
+                        ctx.device
+                    );
+                }
+            }
+            send(
+                ctx.shared,
+                ctx.client_id,
+                ctx.tx,
+                ok_reply(ctx.id, serde_json::json!({ "written": bytes.len() })),
+            );
+        }
+        Err(e) => send(
+            ctx.shared,
+            ctx.client_id,
+            ctx.tx,
+            err_reply(Some(ctx.id), backend_error_to_wire(&e, ctx.device)),
+        ),
+    }
 }
 
 async fn handle_request(
@@ -937,17 +1005,12 @@ async fn dispatch(
                 return;
             };
 
-            // The one write-gate rule this task implements (`TASKS.md`
-            // T2.1, issue #8): a `human` client's `ReadWrite` permission
-            // passes straight through — per the Security-model wiki's
-            // policy table, "human is the authority the gate answers to;
-            // gating them only lets a human turn the gate off". Every
-            // other permission level (`agent`'s `ReadGatedWrite`, `tool`'s
-            // `LeaseOnly`) still gets exactly the same structured
-            // `permission_denied` this endpoint has always returned — the
-            // real whitelist/danger/pending rule engine is T4.1's job, not
-            // this one's.
-            if permission != Permission::ReadWrite {
+            // `tool`'s `LeaseOnly` permission has no byte-level write path
+            // at all, gate or no gate (`TASKS.md` T4.1's client-type
+            // policy: "tool 只能走 lease") — checked before ever decoding
+            // the payload, same fail-fast-on-permission order this handler
+            // has always used.
+            if permission == Permission::LeaseOnly {
                 send(
                     shared,
                     client_id,
@@ -956,7 +1019,8 @@ async fn dispatch(
                         Some(id),
                         WireError::new(
                             ErrorCode::PermissionDenied,
-                            "write gate not implemented yet (see TASKS.md T4.1)",
+                            "tool clients have no byte-level write path — acquire a lease \
+                             instead (see `serialwrap run --`)",
                         ),
                     ),
                 );
@@ -967,7 +1031,15 @@ async fn dispatch(
             // exactly as given, no line ending appended: a caller who
             // spelled out exact bytes wants exactly those bytes on the
             // wire. `text` gets `line_ending`'s bytes appended server-side
-            // — the wire contract the Client-protocol wiki documents.
+            // — the wire contract the Client-protocol wiki documents. This
+            // decode step runs identically for every remaining permission
+            // level and strictly *before* the gate ever sees anything
+            // (`TASKS.md` T4.1 acceptance criterion 3, the hex-bypass
+            // guard): `crate::gate::rules::RuleSet::evaluate` only ever
+            // matches against these already-decoded bytes, never the wire
+            // encoding a client chose — see that module's docs for why
+            // that's what closes a `--hex`-encoded danger command sailing
+            // past a rule that would catch its plain-text equivalent.
             let bytes = match (data_b64, text) {
                 (Some(b64), _) => match BASE64.decode(&b64) {
                     Ok(bytes) => bytes,
@@ -1010,43 +1082,151 @@ async fn dispatch(
             };
 
             let dev = DeviceId(device.clone());
-            match shared.backend.write_bytes(&dev, &bytes) {
-                Ok(()) => {
-                    // Record the tx event *after* the bytes are actually
-                    // out the port, carrying this write's identity
-                    // (`changed_by` is already this connection's
-                    // `"name:pid"` string — the same kernel-verified-pid
-                    // convention `config_change`'s `changed_by` uses),
-                    // type, and the `"human_rw"` gate label the
-                    // Security-model wiki documents for a human's
-                    // always-audited-never-gated write. A failure to
-                    // append is logged, not returned as an error to the
-                    // client: the write itself already succeeded, and
-                    // reporting it as failed would invite a duplicate
-                    // retry that writes the same bytes to the device
-                    // twice.
-                    if let Some(recorder) = shared.backend.recorder(&dev) {
-                        if let Err(e) =
-                            recorder.append_tx(&bytes, changed_by, client_type, "human_rw")
-                        {
-                            eprintln!(
-                                "serialwrapd: protocol: failed to append tx record for {device}: {e}"
-                            );
-                        }
-                    }
-                    send(
+
+            if permission == Permission::ReadWrite {
+                // Human bypass (`TASKS.md` T2.1, issue #8): per the
+                // Security-model wiki's policy table, "human is the
+                // authority the gate answers to; gating them only lets a
+                // human turn the gate off" — always audited (the
+                // `"human_rw"` gate label), never blocked, never routed
+                // through the gate at all.
+                write_and_reply(
+                    &WriteReplyCtx {
                         shared,
                         client_id,
                         tx,
-                        ok_reply(id, serde_json::json!({ "written": bytes.len() })),
-                    );
-                }
-                Err(e) => send(
+                        id,
+                        dev: &dev,
+                        device: &device,
+                        changed_by,
+                        client_type,
+                    },
+                    &bytes,
+                    "human_rw",
+                );
+                return;
+            }
+
+            // Only `ReadGatedWrite` (an `agent`) can reach here: `LeaseOnly`
+            // returned above, `ReadWrite` just returned too.
+            let Some(recorder) = shared.backend.recorder(&dev) else {
+                send(
                     shared,
                     client_id,
                     tx,
-                    err_reply(Some(id), backend_error_to_wire(&e, &device)),
+                    err_reply(
+                        Some(id),
+                        WireError::new(
+                            ErrorCode::DeviceNotFound,
+                            format!("no such device: {device}"),
+                        ),
+                    ),
+                );
+                return;
+            };
+            let Some((name, pid, _)) = shared.clients.identity(client_id) else {
+                // Same unreachable-in-practice defensive branch as the
+                // `type_and_permission` lookup above.
+                send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(
+                        Some(id),
+                        WireError::new(ErrorCode::Internal, "client identity not found"),
+                    ),
+                );
+                return;
+            };
+            let session_request_no = shared.clients.next_write_attempt(client_id);
+            // Preceding log context for the approval payload (`TASKS.md`
+            // T4.2, issue #15) — fetched via the same per-device query
+            // state `Tail`/`ReadSince`/`WaitFor` already share, *before*
+            // the gate runs, so it's genuinely "the log right before this
+            // request" and never includes this write's own eventual `tx`
+            // record. A query failure here (e.g. a transient
+            // `data_aged_out`, vanishingly unlikely against a fresh
+            // `tail`) degrades to an empty context rather than failing the
+            // whole write — this is supplementary operator context, not
+            // something the gate's correctness depends on.
+            let log_context = shared
+                .queries
+                .get_or_spawn(&dev, Arc::clone(&recorder))
+                .tail(DEFAULT_LOG_CONTEXT_LINES, None)
+                .map(|page| page.lines.into_iter().map(|l| l.text).collect())
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "serialwrapd: protocol: failed to fetch log context for a pending \
+                         approval on {device}: {e:?}"
+                    );
+                    Vec::new()
+                });
+
+            let ctx = RequesterCtx {
+                device: device.clone(),
+                name,
+                pid,
+                client_type,
+                session_request_no,
+            };
+            let (decision, rx) = shared
+                .gate
+                .submit_write(&recorder, &bytes, ctx, log_context);
+            let matched_rule = match &decision {
+                GateDecision::ForcePending { matched_rule, .. } => Some(matched_rule.clone()),
+                GateDecision::Allow { .. } | GateDecision::Pending { .. } => None,
+            };
+            let resolution: Result<String, String> = match decision {
+                GateDecision::Allow { reason } => Ok(reason),
+                GateDecision::Pending { .. } | GateDecision::ForcePending { .. } => {
+                    let rx = rx.expect(
+                        "Gate::submit_write always returns a receiver for Pending/ForcePending",
+                    );
+                    match rx.await {
+                        Ok(ApprovalDecision::Approved { approved_by }) => {
+                            Ok(format!("approved_by:{approved_by}"))
+                        }
+                        Ok(ApprovalDecision::Denied { reason }) => Err(reason),
+                        // The sender side is only ever dropped by
+                        // `PendingQueue::decide` sending first — this arm
+                        // is unreachable in practice, handled defensively
+                        // rather than panicking a whole connection over it.
+                        Err(_) => Err("approval channel closed unexpectedly".to_string()),
+                    }
+                }
+            };
+
+            match resolution {
+                Ok(gate_label) => write_and_reply(
+                    &WriteReplyCtx {
+                        shared,
+                        client_id,
+                        tx,
+                        id,
+                        dev: &dev,
+                        device: &device,
+                        changed_by,
+                        client_type,
+                    },
+                    &bytes,
+                    &gate_label,
                 ),
+                Err(reason) => {
+                    // Structured, never silent (`TASKS.md` T4.2 acceptance
+                    // criterion 6): `reason` is a distinct field a caller
+                    // can branch on programmatically (e.g. `"timeout_60s"`,
+                    // or an operator's own denial text), separate from
+                    // `message`'s human-readable sentence. `matched_rule` is
+                    // only present when a danger rule is what forced this
+                    // to approval in the first place.
+                    let mut err =
+                        WireError::new(ErrorCode::WriteDenied, format!("write denied: {reason}"))
+                            .with("reason", reason);
+                    if let Some(rule) = matched_rule {
+                        err = err.with("matched_rule", rule);
+                    }
+                    send(shared, client_id, tx, err_reply(Some(id), err));
+                }
             }
         }
         Request::LeaseAcquire {
@@ -1296,6 +1476,90 @@ async fn dispatch(
                         ),
                     ),
                 );
+            }
+        }
+
+        Request::ApprovalsList => {
+            // Same op `serialwrap approvals` (T4.2, issue #15) and the
+            // future GUI approval card (T5.4) both call — see
+            // `crate::gate`'s module docs.
+            let approvals = shared.gate.list();
+            send(
+                shared,
+                client_id,
+                tx,
+                ok_reply(id, serde_json::json!({ "approvals": approvals })),
+            );
+        }
+
+        Request::ApprovalApprove { approval_id } => {
+            // The approving identity is always this connection's own
+            // kernel-verified `name:pid` (`changed_by`), never a
+            // client-supplied field — same convention every other
+            // `changed_by` use in this file already follows.
+            match shared.gate.decide(
+                approval_id,
+                ApprovalDecision::Approved {
+                    approved_by: changed_by.to_string(),
+                },
+            ) {
+                // `"approval_id"`, not `"id"`: `ok_reply` always inserts
+                // its own top-level `"id"` (the wire reply-correlation
+                // id, echoing the request's own) into this body — a key
+                // named `"id"` here would just get silently overwritten by
+                // that insert, same collision `Request::ApprovalApprove`
+                // itself is named `approval_id` to avoid (see that
+                // variant's doc comment). Same reasoning every other
+                // reply body in this file already follows (`Kick`'s
+                // `"kicked"`, `Demote`'s `"client_id"` — never `"id"`).
+                Ok(()) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    ok_reply(
+                        id,
+                        serde_json::json!({ "approval_id": approval_id, "decision": "approved" }),
+                    ),
+                ),
+                Err(e) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(
+                        Some(id),
+                        WireError::new(ErrorCode::InvalidRequest, e.to_string()),
+                    ),
+                ),
+            }
+        }
+
+        Request::ApprovalDeny {
+            approval_id,
+            reason,
+        } => {
+            let reason = reason.unwrap_or_else(|| format!("denied_by_operator:{changed_by}"));
+            match shared
+                .gate
+                .decide(approval_id, ApprovalDecision::Denied { reason })
+            {
+                Ok(()) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    ok_reply(
+                        id,
+                        serde_json::json!({ "approval_id": approval_id, "decision": "denied" }),
+                    ),
+                ),
+                Err(e) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(
+                        Some(id),
+                        WireError::new(ErrorCode::InvalidRequest, e.to_string()),
+                    ),
+                ),
             }
         }
     }

@@ -19,8 +19,13 @@ libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Platform data-dir resolution (`~/.local/share/serialwrap`, `~/Library/
 # Application Support/serialwrap`) — recorder callers use this by default;
-# tests always inject an explicit tempdir instead (T1.2).
+# tests always inject an explicit tempdir instead (T1.2). Also used for the
+# write gate's `rules.toml` config-dir resolution (T4.1, issue #14): see
+# `gate::rules::default_rules_path`.
 directories = "5"
+# `rules.toml` parsing (T4.1, issue #14) — whitelist/danger regex lists and
+# the approval timeout, hand-authored by an operator.
+toml = "0.8"
 # Device enumeration (vid/pid/serial_number, per-platform port paths) for
 # hotplug detection (T1.1). See the workspace `[workspace.dependencies]`
 # entry for why `default-features` is disabled.

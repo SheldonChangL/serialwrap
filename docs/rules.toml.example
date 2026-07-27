@@ -1,0 +1,89 @@
+# serialwrap write-gate policy (`TASKS.md` T4.1, issue #14).
+#
+# Copy this file to the daemon's config directory to customize it:
+#   Linux:  ~/.config/serialwrap/rules.toml   ($XDG_CONFIG_HOME/serialwrap/rules.toml)
+#   macOS:  ~/Library/Application Support/serialwrap/rules.toml
+# (see `serialwrapd::gate::rules::default_rules_path` — the same
+# `directories::ProjectDirs` crate `recorder::default_data_dir` already
+# uses, just `config_dir()` instead of `data_dir()`: this file is
+# hand-authored operator policy, not recorded device data, so it lives
+# wherever this platform's convention puts user config rather than
+# alongside the ring-buffered event stream.)
+#
+# If this file is missing, the daemon falls back to the built-in danger
+# patterns below with an empty whitelist and a 60-second approval timeout —
+# see `RuleSet::builtin`. If this file exists but fails to parse (bad TOML,
+# an invalid regex, a nonsensical timeout), the daemon logs a warning and
+# falls back to the same built-in defaults rather than refusing to start —
+# see `RuleSet::load`'s doc comment.
+#
+# DECISION PRIORITY: danger > whitelist > default-pending, and NOT
+# overridable by a whitelist match. A byte string matching a `[[danger]]`
+# pattern is *always* forced to a human approval, even if it also matches a
+# `[[whitelist]]` entry — see `RuleSet::evaluate`'s doc comment for why
+# that's a hard rule, not a default. If you decide a pattern below is too
+# broad for your hardware, the sanctioned fix is editing it here (a
+# deliberate, considered admin action) — never a runtime "approve and
+# whitelist forever" checkbox at decision time, which this project
+# intentionally does not offer for danger-class matches.
+#
+# MATCHING: every pattern below is a case-insensitive, unanchored (substring)
+# regex, matched against the *decoded* bytes of a write request — the same
+# bytes that would actually go out the port, regardless of whether the
+# client sent them as `text` or as `--hex`-encoded `data_b64`. Anchor a
+# pattern yourself (`^status$`) if you want an exact-line match instead.
+
+[approval]
+# Seconds to wait for a human decision before auto-denying (fail-safe:
+# timeout always denies, never allows — this direction is not configurable,
+# only the number of seconds is). Reasonable range: 10-300s in practice.
+timeout_s = 60
+
+# Whitelist: writes matching any of these are allowed immediately, no
+# approval needed, still fully audited (see the `tx` record's own `gate`
+# field: `"whitelist:<pattern>"`). Empty by default — add the read-only or
+# routine commands your own firmware/toolchain actually uses. A few
+# illustrative examples (commented out):
+
+# [[whitelist]]
+# pattern = '^status$'
+#
+# [[whitelist]]
+# pattern = '^AT\+'
+#
+# [[whitelist]]
+# pattern = '^get_'
+
+# Danger: writes matching any of these are *always* forced to human
+# approval, regardless of any whitelist match (see the decision-priority
+# note above). The five built-in categories below ship even if this file
+# doesn't exist at all — they're reproduced here, editable, so an operator
+# who does write a rules.toml can see and adjust them rather than have them
+# be invisible hardcoded behavior. Add more `[[danger]]` entries below these
+# for anything specific to your own hardware/firmware command set.
+
+[[danger]]
+pattern = "erase"
+reason = "Flash erase destroys firmware; recovery needs a reflash."
+
+[[danger]]
+pattern = "(fuse|otp|efuse)"
+reason = "One-time-programmable writes are permanent by definition."
+
+[[danger]]
+pattern = "(unlock|lock)"
+reason = "Debug-port lock can permanently prevent recovery."
+
+[[danger]]
+pattern = "(bootloader|dfu[-_]?mode|download[-_]?mode)"
+reason = "Leaves the device in a state where normal commands do not apply."
+
+[[danger]]
+pattern = "(format|factory_reset)"
+reason = "Destroys calibration and provisioning data."
+
+# Example of a project-specific addition:
+#
+# [[danger]]
+# pattern = "reflow_start"
+# reason = "Starts an irreversible physical reflow-oven cycle on the test rig."

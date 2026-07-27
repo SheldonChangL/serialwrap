@@ -102,10 +102,14 @@ pub enum Request {
         #[serde(default)]
         until_seq: Option<u64>,
     },
-    /// Interface only at this stage (`TASKS.md` T4.1 is the real write
-    /// gate): the daemon accepts this shape and returns a structured
-    /// `permission_denied` for every request, so the wire contract is fixed
-    /// before the rule engine lands.
+    /// `TASKS.md` T4.1/T4.2 (issues #14/#15): what happens to the decoded
+    /// bytes depends on the connection's [`Permission`] — `human`
+    /// (`ReadWrite`) passes straight through, always audited; `agent`
+    /// (`ReadGatedWrite`) goes through `serialwrapd::gate`'s rule engine
+    /// (allow / pending / force-pending, the last two blocking this
+    /// request's reply until a decision or timeout); `tool` (`LeaseOnly`)
+    /// still gets a structured `permission_denied` — it has no byte-level
+    /// write path at all, only `LeaseAcquire`.
     Write {
         device: String,
         #[serde(default)]
@@ -158,6 +162,46 @@ pub enum Request {
         to: Option<ExportBound>,
         #[serde(default)]
         filter: Option<Filter>,
+    },
+    /// List every write currently sitting in the gate's pending-approval
+    /// queue (`TASKS.md` T4.2, issue #15). The one op `serialwrap approvals`
+    /// and the future GUI approval card (T5.4) both call — see
+    /// `serialwrapd::gate`'s module docs for why list/approve/deny are kept
+    /// as this same small API both consume.
+    ApprovalsList,
+    /// Approve a pending write by its gate-assigned `approval_id` (from
+    /// `ApprovalsList`'s reply — never a recorder `seq` or a `client_id`).
+    ///
+    /// Deliberately named `approval_id`, not `id`: every request already
+    /// carries a top-level `id` used purely for reply correlation (see
+    /// `Request`'s own module docs — it's kept out of this enum's shape
+    /// generically, but stays present as a sibling field on the same flat
+    /// wire object `serde` deserializes this enum from). A field on
+    /// *this* variant also named `id` would collide with that — same JSON
+    /// key, two different meanings — silently forcing a caller to always
+    /// pick its own request-tracking id equal to the approval id it's
+    /// acting on. `approval_id` keeps the two namespaces independent: a
+    /// GUI (T5.4) can track this request under whatever `id` its own
+    /// bookkeeping wants while still naming any pending approval it likes.
+    ///
+    /// The approving identity is always the daemon's own kernel-verified
+    /// `name:pid` for this connection, never a client-supplied field — same
+    /// convention `changed_by` uses everywhere else.
+    ApprovalApprove {
+        approval_id: u64,
+    },
+    /// Deny a pending write by its gate-assigned `approval_id` (see
+    /// `ApprovalApprove`'s doc comment for why not `id`), with an optional
+    /// human-readable reason (a generic operator-denied label is used if
+    /// omitted — see `serialwrapd::gate::Decision::Denied`). Also how a
+    /// timed-out request resolves internally, with reason `"timeout_60s"`
+    /// (or whatever `rules.toml`'s `[approval] timeout_s` is configured
+    /// to) — never silently, per the Security-model wiki's "denial is
+    /// never silent".
+    ApprovalDeny {
+        approval_id: u64,
+        #[serde(default)]
+        reason: Option<String>,
     },
 }
 
@@ -348,6 +392,56 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ExportFormat::Bin).unwrap(),
             "\"bin\""
+        );
+    }
+
+    #[test]
+    fn approvals_list_has_no_extra_fields() {
+        let json = r#"{"op":"approvals_list"}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(req, Request::ApprovalsList);
+    }
+
+    #[test]
+    fn approval_approve_round_trips() {
+        let json = r#"{"op":"approval_approve","approval_id":42}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(req, Request::ApprovalApprove { approval_id: 42 });
+    }
+
+    #[test]
+    fn approval_approve_field_is_named_approval_id_not_id() {
+        // The whole reason it's not called `id`: a full request line also
+        // carries a top-level `id` for reply correlation (see
+        // `protocol::session::handle_request`), alongside `op` and this
+        // variant's own fields, all flattened into one JSON object. If
+        // this field were also named `id`, that single JSON key would have
+        // to serve both purposes at once.
+        let json = r#"{"id":5,"op":"approval_approve","approval_id":42}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(req, Request::ApprovalApprove { approval_id: 42 });
+    }
+
+    #[test]
+    fn approval_deny_defaults_reason_to_none_and_round_trips_when_given() {
+        let json = r#"{"op":"approval_deny","approval_id":7}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req,
+            Request::ApprovalDeny {
+                approval_id: 7,
+                reason: None
+            }
+        );
+
+        let json = r#"{"op":"approval_deny","approval_id":7,"reason":"not right now"}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req,
+            Request::ApprovalDeny {
+                approval_id: 7,
+                reason: Some("not right now".to_string())
+            }
         );
     }
 

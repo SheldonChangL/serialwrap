@@ -49,7 +49,9 @@ pub async fn run() -> std::io::Result<()> {
 
     let socket_path = protocol::default_socket_path()?;
     let listener = protocol::server::bind(&socket_path)?;
-    let shared = Arc::new(protocol::Shared::new(backend, env!("CARGO_PKG_VERSION")));
+    let shared = Arc::new(
+        protocol::Shared::new(backend, env!("CARGO_PKG_VERSION")).with_gate(production_gate()),
+    );
 
     protocol::server::serve(listener, shared).await;
 
@@ -59,4 +61,25 @@ pub async fn run() -> std::io::Result<()> {
     // is ever changed to return.
     handle.stop();
     Ok(())
+}
+
+/// Build the write gate's production [`gate::Gate`]: `rules.toml` at
+/// [`gate::rules::default_rules_path`] if one exists and parses, falling
+/// back to [`gate::rules::RuleSet::builtin`] otherwise — including on a
+/// malformed file, deliberately fail-safe rather than refusing to start the
+/// whole daemon over a typo in an operator's hand-edited danger list (see
+/// `RuleSet::load`'s doc comment). Either way the built-in danger patterns
+/// are never less protected than "falls back to them", only ever extended
+/// by whatever `rules.toml` adds.
+fn production_gate() -> gate::Gate {
+    let rules = gate::rules::default_rules_path()
+        .and_then(|path| gate::rules::RuleSet::load(&path))
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "serialwrapd: gate: could not load rules.toml ({e}); falling back to built-in \
+                 danger patterns with no whitelist"
+            );
+            gate::rules::RuleSet::builtin()
+        });
+    gate::Gate::new(rules, std::sync::Arc::new(gate::notify::DesktopNotifier))
 }

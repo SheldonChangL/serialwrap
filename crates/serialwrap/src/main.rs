@@ -46,8 +46,8 @@ enum Command {
     Export(cli::export::ExportArgs),
     /// Query the audit view over the record stream (see TASKS.md T4.3).
     Audit,
-    /// Manage pending write approvals (see TASKS.md T4.2).
-    Approvals,
+    /// List, approve, or deny pending write approvals (see TASKS.md T4.2).
+    Approvals(cli::approvals::ApprovalsArgs),
 }
 
 #[tokio::main]
@@ -64,7 +64,7 @@ async fn main() -> std::io::Result<()> {
         Command::Clients(args) => cli::dispatch(cli::clients::run(args).await),
         Command::Export(args) => cli::dispatch(cli::export::run(args).await),
         Command::Audit => stub("audit", "T4.3"),
-        Command::Approvals => stub("approvals", "T4.2"),
+        Command::Approvals(args) => cli::dispatch(cli::approvals::run(args).await),
     }
 }
 
