@@ -668,17 +668,26 @@ async fn dispatch(
             match outcome {
                 Ok(WaitForOutcome::Matched {
                     line,
+                    raw,
                     seq,
                     elapsed_ms,
-                }) => send(
-                    shared,
-                    client_id,
-                    tx,
-                    ok_reply(
-                        id,
-                        serde_json::json!({ "result": "matched", "line": line, "seq": seq, "elapsed_ms": elapsed_ms }),
-                    ),
-                ),
+                }) => {
+                    let mut body = serde_json::json!({
+                        "result": "matched",
+                        "line": line,
+                        "seq": seq,
+                        "elapsed_ms": elapsed_ms,
+                    });
+                    // Same raw_b64 presence rule as `line_json`: only when
+                    // `line` (the lossy text) can't already reconstruct the
+                    // real bytes byte-for-byte (issue #13 — `wait_for` had
+                    // the same byte-fidelity gap issue #32 fixed for
+                    // `tail`/`read_since`).
+                    if std::str::from_utf8(&raw).is_err() {
+                        body["raw_b64"] = BASE64.encode(&raw).into();
+                    }
+                    send(shared, client_id, tx, ok_reply(id, body));
+                }
                 Ok(WaitForOutcome::TimedOut {
                     elapsed_ms,
                     timeout_s,

@@ -23,14 +23,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use serialwrapd::presentation::{self, PresentationLimits};
 use wrap_proto::{Filter, Request};
 
 use super::daemon_client::DaemonClient;
-use super::events::EventWatermarks;
-use super::line::map_lines;
+use super::events::{oob_from_wire, EventWatermarks};
+use super::line::{assembled_line_from_wire, hex_encode};
 
 /// Tool names reserved for later milestones (T4.4's write gate, T2.4's
 /// export) — never returned by [`ToolRegistry::list_tools_json`], since
@@ -61,6 +63,11 @@ fn get_config_description() -> String {
     )
 }
 
+/// Shared tail of `tail`'s and `read_since`'s descriptions: what the
+/// context-protection presentation layer (`TASKS.md` T3.2, issue #13) does
+/// to the raw line stream before it reaches you, and how to relax it.
+const CONTEXT_PROTECTION_NOTICE: &str = "Before returning, this result is passed through a context-protection layer so a chatty device or a corrupted/binary payload can't flood your context: 3+ consecutive identical lines collapse into one entry with a `count` and a `first_seq`/`last_seq` range (tagged `\"folded\": true`); a line whose invalid-UTF-8 byte proportion crosses `binary_ratio_threshold` is summarized as a byte `length` plus a `hex_preview` of its first bytes instead of a wall of replacement characters; and the whole reply is capped to roughly `max_result_bytes`, in which case `truncated` is `true` and `cursor` already points to exactly where to resume — pass it straight to your next `read_since` call, never skipping or repeating a record regardless of how the view was compressed. All three of `max_result_bytes`/`binary_ratio_threshold`/`fold_min_run` can be widened per call (e.g. set `binary_ratio_threshold` near 1.0 to see more raw text, or raise `max_result_bytes` if you specifically need a bigger single reply).";
+
 fn tail_description() -> String {
     format!(
         "Return the last `n` assembled lines of a device's recorded output (optionally \
@@ -69,7 +76,7 @@ fn tail_description() -> String {
          happened on this device since your last call on it — these are always included \
          even if `filter` would otherwise exclude them, and regardless of which tool you \
          called last. Also returns a `cursor` you can pass to `read_since` to continue \
-         reading from exactly this point. Read-only.\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
+         reading from exactly this point. Read-only.\n\n{CONTEXT_PROTECTION_NOTICE}\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
     )
 }
 
@@ -81,7 +88,7 @@ fn read_since_description() -> String {
          timestamp; out-of-band events in the same range are always included regardless \
          of `filter`. Returns the next `cursor` — reading a stream in bounded chunks this \
          way yields exactly the records reading it all at once would, no gaps or \
-         duplicates. Read-only.\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
+         duplicates. Read-only.\n\n{CONTEXT_PROTECTION_NOTICE}\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
     )
 }
 
@@ -91,10 +98,11 @@ fn wait_for_description() -> String {
          `timeout_s` seconds elapse. Use this instead of guessing a fixed delay and then \
          polling: an unbounded serial stream has no notion of \"done\", so sleep-then-check \
          is unreliable and wastes context on top of that. Always returns a structured \
-         result: on a match, the matching line's text/sequence number/elapsed time; on a \
-         timeout, a structured timeout result (never a hang, never an empty or ambiguous \
-         reply). Any out-of-band events that happened while waiting are included in the \
-         result. Read-only — never sends anything to the device.\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
+         result: on a match, the matching line's text/sequence number/elapsed time (plus, \
+         for a line that isn't valid UTF-8, `binary: true` and a `raw_hex` of its exact \
+         original bytes); on a timeout, a structured timeout result (never a hang, never an \
+         empty or ambiguous reply). Any out-of-band events that happened while waiting are \
+         included in the result. Read-only — never sends anything to the device.\n\n{DATA_NOT_INSTRUCTION_NOTICE}"
     )
 }
 
@@ -107,6 +115,83 @@ fn filter_schema() -> Value {
             "exclude": {"type": "boolean", "description": "false (default): keep only matching lines. true: keep only non-matching lines."},
         },
         "required": ["pattern"],
+        "additionalProperties": false,
+    })
+}
+
+/// JSON schema properties shared by `tail`/`read_since` for overriding the
+/// context-protection presentation layer's defaults — see
+/// [`CONTEXT_PROTECTION_NOTICE`].
+fn context_protection_schema_properties() -> serde_json::Map<String, Value> {
+    let mut props = serde_json::Map::new();
+    props.insert(
+        "max_result_bytes".to_string(),
+        json!({
+            "type": "integer",
+            "minimum": 1,
+            "description": "Soft cap, in approximate serialized bytes, on this call's own reply (default 8192 — the wiki's query-layer default). Raise this if you need a bigger single reply; the returned `cursor` always lets you continue regardless.",
+        }),
+    );
+    props.insert(
+        "binary_ratio_threshold".to_string(),
+        json!({
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "A line whose proportion of invalid-UTF-8 bytes is strictly greater than this (0.0..1.0, default 0.3) is summarized as a length + hex preview instead of shown as text. Raise toward 1.0 to see more raw (lossy) text even from mostly-binary lines.",
+        }),
+    );
+    props.insert(
+        "fold_min_run".to_string(),
+        json!({
+            "type": "integer",
+            "minimum": 2,
+            "description": "Minimum run length of consecutive identical lines that collapses into one folded entry (default 3, per the wiki). Raise this to see more repeated lines individually.",
+        }),
+    );
+    props
+}
+
+fn tail_schema() -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "device".to_string(),
+        json!({"type": "string", "description": "Device id, as returned by list_devices."}),
+    );
+    properties.insert(
+        "n".to_string(),
+        json!({"type": "integer", "minimum": 0, "description": "Number of most recent lines to return."}),
+    );
+    properties.insert("filter".to_string(), filter_schema());
+    properties.extend(context_protection_schema_properties());
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["device", "n"],
+        "additionalProperties": false,
+    })
+}
+
+fn read_since_schema() -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "device".to_string(),
+        json!({"type": "string", "description": "Device id, as returned by list_devices."}),
+    );
+    properties.insert(
+        "cursor".to_string(),
+        json!({"type": "integer", "minimum": 0, "description": "Resume point, from a previous tail/read_since call's `cursor`."}),
+    );
+    properties.insert(
+        "max_bytes".to_string(),
+        json!({"type": "integer", "minimum": 1, "description": "Roughly bound the *daemon-side* reply before context-protection runs. Omit for no limit."}),
+    );
+    properties.insert("filter".to_string(), filter_schema());
+    properties.extend(context_protection_schema_properties());
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["device", "cursor"],
         "additionalProperties": false,
     })
 }
@@ -179,35 +264,8 @@ impl ToolRegistry {
                     "additionalProperties": false,
                 }),
             ),
-            tool_spec(
-                "tail",
-                tail_description(),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "device": {"type": "string", "description": "Device id, as returned by list_devices."},
-                        "n": {"type": "integer", "minimum": 0, "description": "Number of most recent lines to return."},
-                        "filter": filter_schema(),
-                    },
-                    "required": ["device", "n"],
-                    "additionalProperties": false,
-                }),
-            ),
-            tool_spec(
-                "read_since",
-                read_since_description(),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "device": {"type": "string", "description": "Device id, as returned by list_devices."},
-                        "cursor": {"type": "integer", "minimum": 0, "description": "Resume point, from a previous tail/read_since call's `cursor`."},
-                        "max_bytes": {"type": "integer", "minimum": 1, "description": "Roughly bound the reply size. Omit for no limit."},
-                        "filter": filter_schema(),
-                    },
-                    "required": ["device", "cursor"],
-                    "additionalProperties": false,
-                }),
-            ),
+            tool_spec("tail", tail_description(), tail_schema()),
+            tool_spec("read_since", read_since_description(), read_since_schema()),
             tool_spec(
                 "wait_for",
                 wait_for_description(),
@@ -240,7 +298,8 @@ impl ToolRegistry {
                 let device = require_str(&arguments, "device")?;
                 let n = require_u64(&arguments, "n")? as usize;
                 let filter = parse_filter(&arguments)?;
-                self.tail(&device, n, filter).await
+                let limits = parse_presentation_limits(&arguments)?;
+                self.tail(&device, n, filter, &limits).await
             }
             "read_since" => {
                 let device = require_str(&arguments, "device")?;
@@ -250,7 +309,9 @@ impl ToolRegistry {
                     .and_then(Value::as_u64)
                     .map(|v| v as usize);
                 let filter = parse_filter(&arguments)?;
-                self.read_since(&device, cursor, max_bytes, filter).await
+                let limits = parse_presentation_limits(&arguments)?;
+                self.read_since(&device, cursor, max_bytes, filter, &limits)
+                    .await
             }
             "wait_for" => {
                 let device = require_str(&arguments, "device")?;
@@ -307,7 +368,13 @@ impl ToolRegistry {
         }))
     }
 
-    async fn tail(&self, device: &str, n: usize, filter: Option<Filter>) -> Result<Value, String> {
+    async fn tail(
+        &self,
+        device: &str,
+        n: usize,
+        filter: Option<Filter>,
+        limits: &PresentationLimits,
+    ) -> Result<Value, String> {
         let reply = self
             .request(Request::Tail {
                 device: device.to_string(),
@@ -316,7 +383,7 @@ impl ToolRegistry {
             })
             .await?;
         check_ok(&reply)?;
-        let lines = map_lines(reply["lines"].as_array().map(Vec::as_slice).unwrap_or(&[]));
+        let presented = present_reply(&reply, limits);
         // `tail`'s own daemon reply always carries the device's *entire*
         // out-of-band event history (see `query::DeviceQueryState::tail`'s
         // docs — filters narrow lines, never events, and `tail` itself has
@@ -324,13 +391,23 @@ impl ToolRegistry {
         // this bridge last looked. `take_new` is what turns that into "only
         // since your last call on it", matching `tail_description()`'s
         // contract and avoiding handing back (and re-growing) the same
-        // event list on every single call over a long session.
-        let all_events = reply["events"].as_array().cloned().unwrap_or_default();
-        let events = self.watermarks.take_new(device, &all_events);
+        // event list on every single call over a long session. It operates
+        // on `presented.events` (already possibly narrowed by the
+        // context-protection size cap — see `present_reply`), which is
+        // still correct: an event this page's size cap deferred simply
+        // isn't "new" yet from the watermark's point of view either, and
+        // will be picked up once a later page includes it.
+        let events_json: Vec<Value> = presented
+            .events
+            .iter()
+            .map(presentation::event_to_json)
+            .collect();
+        let events = self.watermarks.take_new(device, &events_json);
         Ok(json!({
-            "lines": lines,
+            "lines": presented.lines.iter().map(presentation::line_to_json).collect::<Vec<_>>(),
             "events": events,
-            "cursor": reply["cursor"],
+            "cursor": presented.cursor,
+            "truncated": presented.truncated,
         }))
     }
 
@@ -340,6 +417,7 @@ impl ToolRegistry {
         cursor: u64,
         max_bytes: Option<usize>,
         filter: Option<Filter>,
+        limits: &PresentationLimits,
     ) -> Result<Value, String> {
         let reply = self
             .request(Request::ReadSince {
@@ -350,23 +428,29 @@ impl ToolRegistry {
             })
             .await?;
         check_ok(&reply)?;
-        let lines = map_lines(reply["lines"].as_array().map(Vec::as_slice).unwrap_or(&[]));
+        let presented = present_reply(&reply, limits);
         // Unlike `tail`, `read_since`'s events are already correctly
         // bounded to `[cursor, next_cursor)` by the caller's own explicit
         // `cursor` argument (see `query::DeviceQueryState::read_since`'s
-        // docs) — passed through as-is here, *not* re-filtered by
-        // `take_new`, since the watermark is a separate, coarser
-        // "does any tool still owe this device an event" tracker and must
-        // never suppress data the caller explicitly asked for by cursor.
-        // Still folded into the watermark so `get_config`/`wait_for`/
-        // `list_devices` don't redundantly redeliver what this call's
-        // caller already just received.
-        let events = reply["events"].as_array().cloned().unwrap_or_default();
-        self.watermarks.advance(device, &events);
+        // docs, and `presentation::present`'s own cursor-correctness docs
+        // for how that property survives folding/truncation) — passed
+        // through as-is here, *not* re-filtered by `take_new`, since the
+        // watermark is a separate, coarser "does any tool still owe this
+        // device an event" tracker and must never suppress data the caller
+        // explicitly asked for by cursor. Still folded into the watermark
+        // so `get_config`/`wait_for`/`list_devices` don't redundantly
+        // redeliver what this call's caller already just received.
+        let events_json: Vec<Value> = presented
+            .events
+            .iter()
+            .map(presentation::event_to_json)
+            .collect();
+        self.watermarks.advance(device, &events_json);
         Ok(json!({
-            "lines": lines,
-            "events": events,
-            "cursor": reply["cursor"],
+            "lines": presented.lines.iter().map(presentation::line_to_json).collect::<Vec<_>>(),
+            "events": events_json,
+            "cursor": presented.cursor,
+            "truncated": presented.truncated,
         }))
     }
 
@@ -387,23 +471,31 @@ impl ToolRegistry {
         let events = self.fetch_new_events(device).await?;
 
         let mut result = match reply["result"].as_str() {
-            // Known limitation: a matched line only ever carries `text`
-            // here, never a `raw_b64`/binary distinction, because the
-            // daemon's own `query::WaitForOutcome::Matched` type (which
-            // this bridge must not modify — `serialwrapd` is out of scope
-            // for T3.1) only stores the line's lossy `text`, discarding
-            // `AssembledLine::raw` before it ever reaches the wire. If the
-            // one line that satisfies `pattern` happens to contain invalid
-            // UTF-8, its exact bytes are unrecoverable at this layer; only
-            // `tail`/`read_since` (which round-trip `raw_b64`) carry true
-            // byte fidelity. Revisit if `wait_for`'s wire reply ever grows
-            // a `raw_b64` field alongside `line`.
-            Some("matched") => json!({
-                "result": "matched",
-                "line": reply["line"],
-                "seq": reply["seq"],
-                "elapsed_ms": reply["elapsed_ms"],
-            }),
+            Some("matched") => {
+                // Issue #13: the daemon's `query::WaitForOutcome::Matched`
+                // now carries the matched line's exact bytes too (the same
+                // `raw_b64`-when-not-valid-UTF-8 rule `tail`/`read_since`
+                // already use — see `serialwrapd::protocol::session::line_json`'s
+                // docs) — reuse `line.rs`'s
+                // `hex_encode` so a binary match renders the same way a
+                // `tail`/`read_since` binary line does.
+                let raw_b64 = reply.get("raw_b64").and_then(Value::as_str);
+                let binary = raw_b64.is_some();
+                let mut matched = json!({
+                    "result": "matched",
+                    "line": reply["line"],
+                    "seq": reply["seq"],
+                    "elapsed_ms": reply["elapsed_ms"],
+                    "binary": binary,
+                });
+                if let Some(b64) = raw_b64 {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .unwrap_or_default();
+                    matched["raw_hex"] = json!(hex_encode(&bytes));
+                }
+                matched
+            }
             Some("timeout") => json!({
                 "result": "timeout",
                 "elapsed_ms": reply["elapsed_ms"],
@@ -484,6 +576,68 @@ impl ToolRegistry {
             }
         }
     }
+}
+
+/// Reconstruct the full `AssembledLine`/`OobRecord` set from one daemon
+/// `tail`/`read_since` wire reply, then run it through the context-
+/// protection presentation layer (`TASKS.md` T3.2, issue #13). See
+/// `serialwrapd::presentation`'s module docs for why this bridge — a
+/// process entirely separate from the daemon — can still call that crate's
+/// pure presentation logic directly (it's an ordinary library dependency of
+/// this crate) rather than reimplementing folding/summarizing/truncation
+/// here: the wire reply already carries every field losslessly (the
+/// raw_b64 rule — see `line.rs`), so reconstructing is never a lossy
+/// approximation.
+fn present_reply(reply: &Value, limits: &PresentationLimits) -> presentation::PresentedPage {
+    let lines: Vec<_> = reply["lines"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .map(assembled_line_from_wire)
+        .collect();
+    let events: Vec<_> = reply["events"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .map(oob_from_wire)
+        .collect();
+    let full_cursor = reply["cursor"].as_u64().unwrap_or(0);
+    presentation::present(&lines, &events, full_cursor, limits)
+}
+
+/// Parse `tail`/`read_since`'s optional context-protection overrides (see
+/// [`context_protection_schema_properties`]) into a
+/// [`PresentationLimits`], starting from the wiki's defaults and only
+/// overriding fields the caller actually supplied.
+fn parse_presentation_limits(args: &Value) -> Result<PresentationLimits, String> {
+    let mut limits = PresentationLimits::default();
+    if let Some(v) = args.get("max_result_bytes") {
+        limits.max_result_bytes = v
+            .as_u64()
+            .ok_or_else(|| "`max_result_bytes` must be a non-negative integer".to_string())?
+            as usize;
+    }
+    if let Some(v) = args.get("binary_ratio_threshold") {
+        let ratio = v
+            .as_f64()
+            .ok_or_else(|| "`binary_ratio_threshold` must be a number".to_string())?;
+        if !(0.0..=1.0).contains(&ratio) {
+            return Err("`binary_ratio_threshold` must be between 0.0 and 1.0".to_string());
+        }
+        limits.binary_ratio_threshold = ratio;
+    }
+    if let Some(v) = args.get("fold_min_run") {
+        let run = v
+            .as_u64()
+            .ok_or_else(|| "`fold_min_run` must be an integer".to_string())?;
+        if run < 2 {
+            return Err("`fold_min_run` must be at least 2".to_string());
+        }
+        limits.fold_min_run = run as usize;
+    }
+    Ok(limits)
 }
 
 fn describe_connect_error(err: &std::io::Error, path: &std::path::Path) -> String {
@@ -593,6 +747,38 @@ mod tests {
                 "description: {desc}"
             );
         }
+    }
+
+    #[test]
+    fn parse_presentation_limits_defaults_to_the_wiki_defaults_when_absent() {
+        let limits = parse_presentation_limits(&json!({})).unwrap();
+        assert_eq!(limits, PresentationLimits::default());
+    }
+
+    #[test]
+    fn parse_presentation_limits_applies_only_the_overrides_given() {
+        let limits =
+            parse_presentation_limits(&json!({"max_result_bytes": 4096, "fold_min_run": 5}))
+                .unwrap();
+        assert_eq!(limits.max_result_bytes, 4096);
+        assert_eq!(limits.fold_min_run, 5);
+        // Untouched fields keep the default.
+        assert_eq!(
+            limits.binary_ratio_threshold,
+            PresentationLimits::default().binary_ratio_threshold
+        );
+    }
+
+    #[test]
+    fn parse_presentation_limits_rejects_an_out_of_range_binary_ratio_threshold() {
+        let err = parse_presentation_limits(&json!({"binary_ratio_threshold": 1.5})).unwrap_err();
+        assert!(err.contains("binary_ratio_threshold"), "error: {err}");
+    }
+
+    #[test]
+    fn parse_presentation_limits_rejects_a_fold_min_run_below_two() {
+        let err = parse_presentation_limits(&json!({"fold_min_run": 1})).unwrap_err();
+        assert!(err.contains("fold_min_run"), "error: {err}");
     }
 
     #[test]

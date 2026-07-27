@@ -174,7 +174,19 @@ pub enum QueryError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WaitForOutcome {
     Matched {
+        /// `String::from_utf8_lossy` of the matched line's bytes — kept for
+        /// convenience/back-compat, but see [`Self::Matched::raw`] for the
+        /// byte-exact source of truth.
         line: String,
+        /// The matched line's exact original bytes ([`AssembledLine::raw`]).
+        ///
+        /// Added alongside the T3.1 MCP bridge work (issue #13): `tail`/
+        /// `read_since` already carry a line's real bytes via
+        /// `AssembledLine::raw` (fixed for issue #32), but `wait_for` only
+        /// ever matched against — and returned — the lossy `text`,
+        /// discarding byte-exactness for the one line that satisfied the
+        /// caller's pattern. Same bug, same fix, one milestone later.
+        raw: Vec<u8>,
         seq: u64,
         elapsed_ms: f64,
     },
@@ -563,6 +575,48 @@ impl DeviceQueryState {
         })
     }
 
+    /// [`Self::tail`], with the context-protection presentation layer
+    /// (`TASKS.md` T3.2, issue #13) applied on top: duplicate-line folding,
+    /// binary-ratio summarization, and an overall size cap with a
+    /// correctness-preserving continuation cursor. See
+    /// [`crate::presentation`]'s module docs for why this composition is
+    /// safe and how a GUI backend embedded in this daemon (T5.2) is meant
+    /// to call this directly, the same way the MCP bridge calls
+    /// [`crate::presentation::present`] itself after reconstructing lines/
+    /// events from the wire.
+    pub fn tail_presented(
+        &self,
+        n: usize,
+        filter: Option<&Filter>,
+        limits: &crate::presentation::PresentationLimits,
+    ) -> Result<crate::presentation::PresentedPage, QueryError> {
+        let page = self.tail(n, filter)?;
+        Ok(crate::presentation::present(
+            &page.lines,
+            &page.events,
+            page.cursor,
+            limits,
+        ))
+    }
+
+    /// [`Self::read_since`], with the context-protection presentation layer
+    /// applied on top — see [`Self::tail_presented`]'s docs.
+    pub fn read_since_presented(
+        &self,
+        cursor: u64,
+        max_bytes: Option<usize>,
+        filter: Option<&Filter>,
+        limits: &crate::presentation::PresentationLimits,
+    ) -> Result<crate::presentation::PresentedPage, QueryError> {
+        let page = self.read_since(cursor, max_bytes, filter)?;
+        Ok(crate::presentation::present(
+            &page.lines,
+            &page.events,
+            page.cursor,
+            limits,
+        ))
+    }
+
     /// `event`/`gate` records in `[since_seq, until_seq]`, optionally
     /// narrowed to `kinds` (matched against the `Kind` discriminant —
     /// `"event"`/`"gate"` — or, for `Kind::Event`, the specific event name
@@ -595,14 +649,14 @@ impl DeviceQueryState {
     /// for the first one matching `re`. Returns the match plus the index
     /// just past it, so a caller can resume scanning without re-checking
     /// already-seen lines.
-    fn find_match_from(&self, re: &Regex, from: usize) -> (Option<(String, u64)>, usize) {
+    fn find_match_from(&self, re: &Regex, from: usize) -> (Option<(String, Vec<u8>, u64)>, usize) {
         let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
         let mut idx = from;
         while idx < lines.len() {
             let line = &lines[idx];
             idx += 1;
             if re.is_match(&line.text) {
-                return (Some((line.text.clone(), line.seq)), idx);
+                return (Some((line.text.clone(), line.raw.clone(), line.seq)), idx);
             }
         }
         (None, idx)
@@ -632,9 +686,10 @@ impl DeviceQueryState {
         loop {
             let (found, next_checked) = self.find_match_from(&re, checked);
             checked = next_checked;
-            if let Some((line, seq)) = found {
+            if let Some((line, raw, seq)) = found {
                 return Ok(WaitForOutcome::Matched {
                     line,
+                    raw,
                     seq,
                     elapsed_ms: elapsed_ms(start),
                 });
@@ -1049,6 +1104,61 @@ mod tests {
             WaitForOutcome::Matched { line, seq, .. } => {
                 assert_eq!(line, "boot ok");
                 assert_eq!(seq, 0);
+            }
+            other => panic!("expected Matched, got {other:?}"),
+        }
+    }
+
+    // ---- Issue #13 (T3.2): wait_for carries the matched line's exact raw
+    // bytes, not just the lossy text ----
+
+    #[tokio::test]
+    async fn wait_for_matched_line_carries_exact_raw_bytes_for_invalid_utf8() {
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = std::sync::Arc::new(recorder(tmp.path()));
+        let state = std::sync::Arc::new(DeviceQueryState::new());
+
+        // Same fixture shape as `invalid_utf8_line_keeps_its_exact_original_bytes_in_raw`
+        // above (issue #32's own scenario), but through `wait_for` instead
+        // of `read_since`.
+        let mut original = b"status:".to_vec();
+        original.extend_from_slice(&[0xFF, 0xFE, 0x80]);
+        let mut with_newline = original.clone();
+        with_newline.push(b'\n');
+
+        let waiter = {
+            let state = std::sync::Arc::clone(&state);
+            tokio::spawn(async move { state.wait_for("^status:", Duration::from_secs(2)).await })
+        };
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        recorder.append_rx(&with_newline).unwrap();
+        state.ingest(&recorder);
+
+        let outcome = waiter.await.unwrap().unwrap();
+        match outcome {
+            WaitForOutcome::Matched { raw, seq, .. } => {
+                assert_eq!(seq, 0);
+                assert!(
+                    std::str::from_utf8(&raw).is_err(),
+                    "test fixture must actually be invalid UTF-8, or this test proves nothing"
+                );
+                assert_eq!(
+                    raw, original,
+                    "raw must be byte-for-byte identical to what was written, newline stripped"
+                );
+
+                let mut original_hasher = Sha256::new();
+                original_hasher.update(&original);
+                let mut raw_hasher = Sha256::new();
+                raw_hasher.update(&raw);
+                assert_eq!(
+                    format!("{:x}", original_hasher.finalize()),
+                    format!("{:x}", raw_hasher.finalize()),
+                    "sha256(original) must match sha256(raw)"
+                );
             }
             other => panic!("expected Matched, got {other:?}"),
         }

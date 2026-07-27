@@ -19,6 +19,7 @@ pub mod gate;
 pub mod port;
 pub mod port_config;
 pub mod port_io;
+pub mod presentation;
 pub mod protocol;
 pub mod query;
 pub mod recorder;
