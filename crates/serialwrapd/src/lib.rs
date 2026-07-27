@@ -24,13 +24,20 @@ pub mod presentation;
 pub mod protocol;
 pub mod query;
 pub mod recorder;
+pub mod web;
 
 use std::sync::Arc;
 
 /// Entry point the `serialwrap daemon` subcommand calls: brings up hotplug
-/// detection (T1.1) against the real system enumerator and the UDS
-/// protocol server (T1.4) on the production socket path, and serves
-/// forever.
+/// detection (T1.1) against the real system enumerator, the UDS protocol
+/// server (T1.4) on the production socket path, and the embedded web GUI
+/// (T5.1, issue #18) on `127.0.0.1` — and serves forever.
+///
+/// The web listener's bind failure is propagated (`?`), not
+/// logged-and-skipped: per this project's stance against silently
+/// half-working state (see `web::serve_on`'s doc comment), a daemon that
+/// claims to have started but has no working browser endpoint is worse
+/// than one that fails loudly at startup.
 ///
 /// CLI-level concerns (daemonizing, PID files, log destinations) are
 /// T1.5's territory — this is the in-process daemon core only.
@@ -53,12 +60,23 @@ pub async fn run() -> std::io::Result<()> {
         protocol::Shared::new(backend, env!("CARGO_PKG_VERSION")).with_gate(production_gate()),
     );
 
-    protocol::server::serve(listener, shared).await;
+    let web_listener = tokio::net::TcpListener::bind(web::web_addr()).await?;
+    let web_shared = Arc::clone(&shared);
 
-    // Unreachable in practice (`serve` loops forever absent a fatal accept
-    // error, which it logs and continues past) — kept so `handle` has a
-    // clear owner and an explicit, orderly shutdown path exists if `serve`
-    // is ever changed to return.
+    // Both futures loop forever absent a fatal error of their own kind
+    // (an accept-loop failure for the UDS side, a bind/serve failure for
+    // the web side) — `select!` means either one returning at all ends
+    // `run`, which is intentional: neither half of "daemon" is optional.
+    tokio::select! {
+        () = protocol::server::serve(listener, shared) => {}
+        result = web::serve_on(web_listener, web_shared) => {
+            result?;
+        }
+    }
+
+    // Reached only if one of the two servers above returns — kept so
+    // `handle` has a clear owner and an explicit, orderly shutdown path
+    // exists rather than an implicit process-exit teardown.
     handle.stop();
     Ok(())
 }

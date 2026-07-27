@@ -41,8 +41,26 @@ nix = { workspace = true, features = ["socket"] }
 tokio = { workspace = true }
 # `wait_for` regex matching against fully-assembled lines only (T1.4).
 regex = { workspace = true }
+# Embedded web GUI (T5.1, issue #18): HTTP/WS server serving `GET /api/*`
+# and `WS /api/stream`, bound to 127.0.0.1 only — see `web`'s module docs.
+# `ws` adds `WebSocketUpgrade`/`Message`, not on by default.
+axum = { workspace = true, features = ["ws"] }
+# Embeds `webui/dist` (the built frontend) into the binary at compile time
+# in release builds — see `web::assets` and this crate's `build.rs`.
+rust-embed = { workspace = true }
+# Content-Type for embedded static assets (`web::assets`) — inferred from
+# the file extension, since `rust-embed` itself only hands back bytes.
+mime_guess = "2"
 
 [dev-dependencies]
+# `tower::ServiceExt::oneshot` drives the axum `Router` directly in tests
+# (`web` module tests) without binding a real socket — full-stack WS
+# reconnect behavior is covered by Playwright E2E instead (`webui/e2e/`),
+# so these stay fast unit/router-level checks.
+tower = { version = "0.5", features = ["util"] }
+# Reading response bodies out of the `tower::oneshot` responses above in
+# those same tests.
+http-body-util = "0.1"
 # Test-only PTY fixture (see TASKS.md T0.2). Pulled in as a dev-dependency
 # only, so it never links into the `serialwrap` release binary.
 mock-device = { path = "../mock-device" }

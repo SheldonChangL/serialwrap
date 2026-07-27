@@ -1,0 +1,39 @@
+:root {
+  color-scheme: light dark;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+
+  --bg: #0e1116;
+  --surface: #161b22;
+  --surface-raised: #1f2530;
+  --border: #2a313c;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+
+  --dot-connecting: #d4a72c;
+  --dot-open: #3fb950;
+  --dot-stale: #d4a72c;
+  --dot-closed: #f85149;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f8fa;
+    --surface: #ffffff;
+    --surface-raised: #eef1f4;
+    --border: #d0d7de;
+    --text: #1f2328;
+    --text-dim: #57606a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+}
