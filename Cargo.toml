@@ -19,8 +19,15 @@ repository = "https://github.com/SheldonChangL/serialwrap"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `net`/`io-util`/`sync`/`time` added for T1.4's UDS protocol server
+# (`UnixListener`/`UnixStream`, framed line reads, per-device notify/mutex,
+# `wait_for`'s timeout) on top of the T0.1 baseline's `rt-multi-thread` +
+# `macros`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 clap = { version = "4", features = ["derive"] }
+# `wait_for`'s line-pattern matching (T1.4) — applied only to fully
+# assembled lines, never partial ones (see `serialwrapd::query`).
+regex = "1"
 
 # Reserved for later milestones (T5.1 web GUI, T6.1 packaging). Listed here
 # now so the version is pinned workspace-wide, but no crate depends on them

@@ -13,8 +13,14 @@
 
 mod client;
 mod error;
+mod hello;
 mod record;
+mod request;
+mod wire_error;
 
 pub use client::ClientType;
 pub use error::ErrorCode;
+pub use hello::{HelloAck, HelloRequest, Permission};
 pub use record::{Kind, Record};
+pub use request::{Filter, LineEnding, Request};
+pub use wire_error::WireError;

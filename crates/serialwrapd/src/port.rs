@@ -620,6 +620,12 @@ struct LiveDeviceConfig {
     /// on-disk [`ProfileStore`]; it just has no live fd to re-apply to
     /// until the device reconnects (see `HotplugDetector::attempt_open`).
     fd: Option<Arc<File>>,
+    /// The path last seen for this device (T1.4's `list_devices`): set on
+    /// first sight and updated on every successful (re)connect, left
+    /// untouched across a disconnect so a currently-unplugged device still
+    /// reports where it was last seen. Not authoritative for identity —
+    /// see the module docs on why `DeviceId` never keys off this.
+    path: Option<PathBuf>,
 }
 
 /// Thread-safe, shared view of every known device's live configuration
@@ -847,7 +853,14 @@ impl HotplugDetector {
                         DeviceProfile::default()
                     }
                 };
-                configs.insert(id.clone(), LiveDeviceConfig { profile, fd: None });
+                configs.insert(
+                    id.clone(),
+                    LiveDeviceConfig {
+                        profile,
+                        fd: None,
+                        path: Some(dev.path.clone()),
+                    },
+                );
             }
         }
 
@@ -935,6 +948,7 @@ impl HotplugDetector {
                     .get_mut(&id)
                 {
                     entry.fd = Some(Arc::clone(&file));
+                    entry.path = Some(dev.path.clone());
                 }
 
                 let stop = Arc::new(AtomicBool::new(false));
@@ -1288,7 +1302,56 @@ pub struct PortConfigApi {
     profiles: Arc<ProfileStore>,
 }
 
+/// One device's summary for `list_devices` (`TASKS.md` T1.4): identity,
+/// last-known path, whether it's currently connected, and its current
+/// configuration. See [`PortConfigApi::list_devices`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceSummary {
+    pub id: DeviceId,
+    /// `None` only if the device has never been tracked long enough to
+    /// reach `handle_new_device`'s config insert — should not happen in
+    /// practice, since both are part of the same reconciliation step.
+    pub path: Option<PathBuf>,
+    pub connected: bool,
+    pub config: PortConfig,
+}
+
 impl PortConfigApi {
+    /// Every device the detector has ever seen, with its last-known path,
+    /// live connection state, and current configuration — the data
+    /// `list_devices` (T1.4) needs. `connected` is derived from whether a
+    /// live fd is currently held, the same signal [`Self::live_fd`] and
+    /// [`Self::error_counts`] already key off of.
+    pub fn list_devices(&self) -> Vec<DeviceSummary> {
+        self.configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, entry)| DeviceSummary {
+                id: id.clone(),
+                path: entry.path.clone(),
+                connected: entry.fd.is_some(),
+                config: entry.profile.config.clone(),
+            })
+            .collect()
+    }
+
+    /// Read `id`'s current configuration. Unlike [`Self::error_counts`],
+    /// this works whether or not the device is currently connected — config
+    /// is persisted, shared state (see the wiki: "previously recorded data
+    /// is not reinterpreted"), not a property of the live fd. Errors with
+    /// [`io::ErrorKind::NotFound`] if `id` has never been seen.
+    pub fn get_config(&self, id: &DeviceId) -> io::Result<PortConfig> {
+        self.configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|entry| entry.profile.config.clone())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("unknown device {}", id.0))
+            })
+    }
+
     /// Change `id`'s port configuration (baud/data bits/parity/stop
     /// bits/flow control/open-time DTR-RTS policy): persist it (so a
     /// future reconnect — or daemon restart — re-applies it, see
