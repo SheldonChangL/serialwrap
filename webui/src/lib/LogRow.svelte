@@ -56,6 +56,8 @@
     data-folded={item.folded}
     data-highlighted={highlighted}
     data-binary={item.render.kind === "binary_summary" || (item.render.kind === "text" && item.render.rawHex !== null)}
+    data-seq={item.seq}
+    data-last-seq={item.lastSeq}
   >
     <span class="ts">{timestamp}</span>
     {#if item.folded}
@@ -97,7 +99,7 @@
     {/if}
   </div>
 {:else if item.kind === "tx"}
-  <div class="row event tx" class:highlighted data-testid="log-row" data-row-kind="tx" data-highlighted={highlighted}>
+  <div class="row event tx" class:highlighted data-testid="log-row" data-row-kind="tx" data-highlighted={highlighted} data-seq={item.seq}>
     <span class="ts">{timestamp}</span>
     <span class="bar" aria-hidden="true"></span>
     <span class="label">TX &middot; {item.client} ({item.clientType})</span>
@@ -112,6 +114,7 @@
     data-row-kind="event"
     data-event-name={item.name}
     data-highlighted={highlighted}
+    data-seq={item.seq}
   >
     <span class="ts">{timestamp}</span>
     <span class="bar" aria-hidden="true"></span>
@@ -140,6 +143,7 @@
     data-row-kind="gate"
     data-gate-action={item.action}
     data-highlighted={highlighted}
+    data-seq={item.seq}
   >
     <span class="ts">{timestamp}</span>
     <span class="bar" aria-hidden="true"></span>

@@ -86,13 +86,15 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::export::{ExportError, ExportRange};
 use crate::gate::approval::{DecideError, Decision};
 use crate::gate::{GateDecision, RequesterCtx, DEFAULT_LOG_CONTEXT_LINES};
 use crate::port::DeviceId;
-use crate::presentation::{page_to_json, PresentationLimits};
+use crate::presentation::{event_to_json, page_to_json, PresentationLimits};
+use crate::protocol::registry::Activity;
 use crate::protocol::Shared;
-use crate::query::{AssembledLine, QueryError};
-use wrap_proto::ClientType;
+use crate::query::{AssembledLine, OobRecord, QueryError};
+use wrap_proto::{ClientType, ExportBound, ExportFormat, Filter, Permission};
 
 /// Identity string the GUI's ungated config/control-line/approval endpoints
 /// record as `changed_by`/`approved_by` in place of a kernel-verified UDS
@@ -121,6 +123,11 @@ pub fn routes() -> Router<Arc<Shared>> {
         .route("/api/approvals", get(list_approvals))
         .route("/api/approvals/{id}/approve", post(approve_approval))
         .route("/api/approvals/{id}/deny", post(deny_approval))
+        .route("/api/clients", get(list_clients))
+        .route("/api/clients/{id}/kick", post(kick_client))
+        .route("/api/clients/{id}/demote", post(demote_client))
+        .route("/api/devices/{id}/audit", get(audit))
+        .route("/api/devices/{id}/export", get(export_device))
 }
 
 /// Liveness/readiness probe — used by the E2E harness (`webui/e2e/`) to
@@ -829,6 +836,469 @@ fn spawn_test_write_completion(
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------
+// T5.5 (issue #22): clients panel, audit panel, export dialog.
+// ---------------------------------------------------------------------
+
+/// Shape one live [`crate::protocol::registry::ClientSnapshot`] as JSON —
+/// field-for-field identical to `Request::ListClients`'s UDS reply shape
+/// (`protocol::session`, out of this task's scope to touch), built
+/// independently here from the same public [`crate::protocol::registry::ClientRegistry::list`]
+/// call, per this module's doc comment on why the web layer shapes JSON
+/// itself rather than calling into `protocol::session::dispatch`. `status:
+/// "active"` distinguishes this row from [`lease_end_to_json`]'s
+/// reconstructed `"offline"` rows once both are merged in [`list_clients`].
+fn client_snapshot_to_json(c: &crate::protocol::registry::ClientSnapshot) -> Value {
+    let activity = match &c.activity {
+        Activity::Idle => json!({ "state": "idle" }),
+        Activity::WaitingFor {
+            device,
+            pattern,
+            deadline,
+        } => {
+            // Same `deadline.saturating_duration_since(Instant::now())`
+            // computation `Request::ListClients`'s handler already does
+            // (session.rs) — reproduced here rather than shared, same
+            // reasoning as every other duplicated-JSON-shaping handler in
+            // this file.
+            let remaining_s = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs_f64();
+            json!({
+                "state": "waiting_for",
+                "device": device,
+                "pattern": pattern,
+                "remaining_s": remaining_s,
+            })
+        }
+    };
+    json!({
+        "status": "active",
+        "client_id": c.client_id,
+        "name": c.name,
+        "pid": c.pid,
+        "type": c.client_type,
+        "permission": c.permission,
+        "bytes_in": c.bytes_in,
+        "bytes_out": c.bytes_out,
+        "activity": activity,
+    })
+}
+
+/// Derive a short display name from a finished lease's `command` field
+/// (e.g. `esptool.py write_flash 0x0 firmware.bin` -> `esptool`) — the
+/// identity triple's "self-reported name" for [`lease_end_to_json`]'s rows,
+/// matching the UX-design wiki's clients-panel mockup (`🔧 esptool · lease
+/// · ended ...`). The daemon never records a separate friendly label for a
+/// leased tool — only the literal `command` it was invoked with (see
+/// `port::append_lease_start_event`) — so this is a display-only heuristic:
+/// the basename of the first whitespace-separated token, with a common
+/// script extension stripped. Falls back to `"tool"` when the command is
+/// empty, rather than fabricating a name from nothing.
+fn friendly_name_from_command(command: &str) -> String {
+    let first_token = command.split_whitespace().next().unwrap_or("");
+    if first_token.is_empty() {
+        return "tool".to_string();
+    }
+    let base = first_token.rsplit('/').next().unwrap_or(first_token);
+    match base
+        .strip_suffix(".py")
+        .or_else(|| base.strip_suffix(".sh"))
+    {
+        Some(stripped) if !stripped.is_empty() => stripped.to_string(),
+        _ => base.to_string(),
+    }
+}
+
+/// Reconstruct a finished-lease row from a `lease_end` [`OobRecord`] for
+/// [`list_clients`] — see that function's doc comment for why this is read
+/// straight from the event stream rather than kept in
+/// [`crate::protocol::registry::ClientRegistry`] (which unregisters a
+/// client's row the instant its connection tears down, and `protocol/` is
+/// out of this task's scope to touch). Every field here already exists on
+/// the `lease_end` event `port::append_lease_end_event` appends regardless
+/// of this task — nothing new is recorded, this only reads.
+fn lease_end_to_json(device_id: &str, event: &OobRecord) -> Value {
+    let command = event
+        .extra
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    json!({
+        "status": "offline",
+        "device": device_id,
+        "name": friendly_name_from_command(command),
+        "pid": event.extra.get("pid").cloned().unwrap_or(Value::Null),
+        "type": "tool",
+        "command": command,
+        "exit_code": event.extra.get("exit_code").cloned().unwrap_or(Value::Null),
+        "duration_ms": event.extra.get("duration_ms").cloned().unwrap_or(Value::Null),
+        "reason": event.extra.get("reason").cloned().unwrap_or(Value::Null),
+        "ended_at": event.t_wall,
+        "ended_seq": event.seq,
+    })
+}
+
+/// `GET /api/clients` (T5.5, issue #22): the clients panel's list. Merges
+/// two sources that deliberately stay two sources rather than one shared
+/// store:
+///
+/// - every *live* client, from [`crate::protocol::registry::ClientRegistry::list`]
+///   (the exact same public method `Request::ListClients`'s UDS handler
+///   calls — see [`client_snapshot_to_json`]);
+/// - every *finished lease* still visible in any device's event stream — a
+///   `lease_end` event, scanned via [`crate::query::DeviceQueryState::query_events`]
+///   (see [`lease_end_to_json`]).
+///
+/// The UX-design wiki is explicit that a finished lease must stay listed
+/// ("who touched the board just now" must always be answerable), but
+/// `ClientRegistry::unregister` removes a client's row the moment its
+/// connection tears down, and `protocol/` (where that registry lives) is
+/// out of this task's scope to touch. Reconstructing finished leases from
+/// the event stream instead — rather than teaching the registry to retain
+/// rows — needs no daemon-side change at all: `lease_end`'s `command`/
+/// `pid`/`duration_ms`/`exit_code`/`reason` fields are already recorded by
+/// `port::append_lease_end_event` for every lease, GUI or not. This is the
+/// same "audit is a query view, not a second store" principle the audit
+/// panel ([`audit`]) applies, extended to one more panel.
+async fn list_clients(State(shared): State<Arc<Shared>>) -> Json<Value> {
+    let live: Vec<Value> = shared
+        .clients
+        .list()
+        .iter()
+        .map(client_snapshot_to_json)
+        .collect();
+
+    let mut finished_leases = Vec::new();
+    for summary in shared.backend.list_devices() {
+        let Some(recorder) = shared.backend.recorder(&summary.id) else {
+            continue;
+        };
+        let state = shared
+            .queries
+            .get_or_spawn(&summary.id, Arc::clone(&recorder));
+        state.ingest(&recorder);
+        for event in state.query_events(&["lease_end".to_string()], None, None) {
+            finished_leases.push(lease_end_to_json(&summary.id.0, &event));
+        }
+    }
+
+    Json(json!({ "clients": live, "finished_leases": finished_leases }))
+}
+
+fn client_not_found_response(client_id: u64) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "code": "client_not_found",
+                "message": format!("no such client_id {client_id}"),
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/clients/:id/kick` (T5.5, issue #22): the clients panel's
+/// "Kick" button. Calls [`crate::protocol::registry::ClientRegistry::kick`]
+/// directly — the exact same public method `Request::Kick`'s UDS handler
+/// calls (`protocol::session`, out of this task's scope to touch). `kick`
+/// notifies the target connection's `kill` signal, which its reader/writer
+/// loops race against and return from immediately — closing the socket out
+/// from under any in-flight request that connection is blocked on (a long
+/// `wait_for`, for instance), which is what a kicked MCP/CLI client
+/// observes as a connection error rather than a silent hang (T5.5
+/// acceptance criterion 3).
+///
+/// Also appends the same `client_kicked` audit event
+/// `Request::Kick`'s handler appends to every device's stream, for parity:
+/// an operator kicking someone from the GUI is exactly as auditable as
+/// kicking them from `serialwrap` over the CLI. Reproduced here (rather
+/// than shared) per this module's established convention for every other
+/// GUI-initiated side effect — see [`GUI_CHANGED_BY`].
+async fn kick_client(
+    State(shared): State<Arc<Shared>>,
+    Path(id): Path<u64>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let target_snapshot = shared
+        .clients
+        .list()
+        .into_iter()
+        .find(|c| c.client_id == id);
+    if !shared.clients.kick(id) {
+        return client_not_found_response(id);
+    }
+    if let Some(snap) = target_snapshot {
+        for summary in shared.backend.list_devices() {
+            let Some(recorder) = shared.backend.recorder(&summary.id) else {
+                continue;
+            };
+            let mut extra = serde_json::Map::new();
+            extra.insert("client_id".to_string(), id.into());
+            extra.insert("name".to_string(), snap.name.clone().into());
+            extra.insert("pid".to_string(), snap.pid.into());
+            extra.insert(
+                "client_type".to_string(),
+                serde_json::to_value(snap.client_type).unwrap_or(Value::Null),
+            );
+            extra.insert("kicked_by".to_string(), GUI_CHANGED_BY.into());
+            if let Err(e) = recorder.append_event("client_kicked", extra) {
+                eprintln!(
+                    "serialwrapd: web: kick_client: failed to append client_kicked event for {}: {e}",
+                    summary.id.0
+                );
+            }
+        }
+    }
+    Json(json!({ "ok": true, "client_id": id })).into_response()
+}
+
+/// Body for [`demote_client`] — a bare [`Permission`] using its own wire
+/// spelling (`"read+write"`/`"read+gated_write"`/`"lease_only"`), matching
+/// `Request::Demote`'s `permission` field shape exactly.
+#[derive(Debug, Deserialize)]
+struct DemoteBody {
+    permission: Permission,
+}
+
+/// `POST /api/clients/:id/demote` (T5.5, issue #22): the clients panel's
+/// "Demote" button. Calls
+/// [`crate::protocol::registry::ClientRegistry::demote`] directly — the
+/// exact same public method `Request::Demote`'s UDS handler calls, which
+/// (per that handler — see this module's doc comment) appends no audit
+/// event either; this endpoint stays in parity with that as-is behavior
+/// rather than making a GUI demote more auditable than a CLI one.
+async fn demote_client(
+    State(shared): State<Arc<Shared>>,
+    Path(id): Path<u64>,
+    Json(body): Json<DemoteBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if shared.clients.demote(id, body.permission) {
+        Json(json!({ "ok": true, "client_id": id, "permission": body.permission })).into_response()
+    } else {
+        client_not_found_response(id)
+    }
+}
+
+/// `Record::Event` names, plus the always-audit-relevant `tx`/`gate` kinds,
+/// this endpoint surfaces via [`crate::query::DeviceQueryState::query_events`]'s
+/// own "kind string OR event name" matching (see that function's doc
+/// comment). Mirrors `crates/serialwrap/src/cli/audit.rs`'s
+/// `AUDIT_EVENT_NAMES`/`is_audit_relevant` verbatim. Duplicated rather than
+/// imported: `serialwrapd` cannot depend on `serialwrap` (dependency
+/// direction is `serialwrap -> serialwrapd -> wrap-proto`), so this small
+/// list is the one piece of "what counts as audit-relevant" knowledge every
+/// caller of `query_events` needs to restate for itself — keep both lists
+/// in sync by inspection if either ever grows a new audit-relevant event.
+const AUDIT_QUERY_KINDS: &[&str] = &[
+    "tx",
+    "gate",
+    "write_request",
+    "lease_start",
+    "lease_end",
+    "config_change",
+    "control_line_change",
+    "dtr_pulse",
+    "client_kicked",
+];
+
+/// Query params for [`audit`]. Both optional and both plain `seq` bounds
+/// (not wall-clock — the audit panel's own time-range filtering, if any, is
+/// a display concern applied client-side over the fetched rows, the same
+/// stance T5.2's live-log regex filter already takes for its own filter).
+#[derive(Debug, Deserialize)]
+struct AuditParams {
+    since_seq: Option<u64>,
+    until_seq: Option<u64>,
+}
+
+/// `GET /api/devices/:id/audit?since_seq=&until_seq=` (T5.5, issue #22): the
+/// audit panel's list. A pure filtered read over the same stream `tail`/
+/// `export` read from — see this module's doc comment: audit is a query
+/// view, never a second store. Each returned row is exactly one
+/// [`crate::query::DeviceQueryState::query_events`] result, shaped by
+/// [`event_to_json`] — the *same* function [`tail`]'s `events` field
+/// already uses — never independently re-serialized, and never joined or
+/// correlated across rows: a denied write's bytes live on its own
+/// `write_request` event row at its own `seq`; the eventual `gate` deny/
+/// approve decision is a separate row at its own later `seq`. Two real
+/// records, never one synthesized composite. "Jump to the log at this
+/// moment" for *any* row is therefore free — the row's own `seq` is already
+/// a real position in the same stream the main log view renders, no
+/// correlation id or second lookup required (T5.5 acceptance criterion 1).
+async fn audit(
+    State(shared): State<Arc<Shared>>,
+    Path(id): Path<String>,
+    Query(params): Query<AuditParams>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let dev = DeviceId(id.clone());
+    let Some(recorder) = shared.backend.recorder(&dev) else {
+        return device_not_found_response(&id);
+    };
+    let state = shared.queries.get_or_spawn(&dev, Arc::clone(&recorder));
+    state.ingest(&recorder);
+    let kinds: Vec<String> = AUDIT_QUERY_KINDS.iter().map(|s| s.to_string()).collect();
+    let events = state.query_events(&kinds, params.since_seq, params.until_seq);
+    let rows: Vec<Value> = events.iter().map(event_to_json).collect();
+    Json(json!({ "audit": rows })).into_response()
+}
+
+/// Query params for [`export_device`]. `from`/`to` are each either a plain
+/// `u64` seq or an RFC 3339 wall-clock string — see [`parse_export_bound`].
+/// `boot` and `from` are mutually exclusive (mirrors `cli::export`'s own
+/// `validate_range_flags`); `filter`+`format: bin` is rejected by
+/// [`crate::export::export_range`] itself, not re-validated here (see that
+/// function's own doc comment: the rejection is inside the one shared
+/// renderer, not a CLI-only ad hoc check this layer would need to repeat).
+#[derive(Debug, Deserialize)]
+struct ExportParams {
+    format: ExportFormat,
+    from: Option<String>,
+    to: Option<String>,
+    #[serde(default)]
+    boot: bool,
+    filter: Option<String>,
+}
+
+/// Parse a `from`/`to` query value the same way `cli::export`'s (private)
+/// `parse_bound` does: a plain integer is a `seq`; anything else is passed
+/// through as a wall-clock string for [`crate::export::export_range`]
+/// itself to validate as RFC 3339 (an invalid one surfaces as that
+/// function's own `ExportError::InvalidTimestamp`, mapped to `400` by
+/// [`export_error_response`] — no separate client-side validation
+/// duplicated here).
+fn parse_export_bound(raw: &str) -> ExportBound {
+    let trimmed = raw.trim();
+    match trimmed.parse::<u64>() {
+        Ok(seq) => ExportBound::Seq(seq),
+        Err(_) => ExportBound::Wall(trimmed.to_string()),
+    }
+}
+
+fn export_error_response(e: &ExportError) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (status, message) = match e {
+        ExportError::FilterNotAllowedForBin => (
+            StatusCode::BAD_REQUEST,
+            "--filter is not allowed with the bin format: it would silently break \
+             byte-exactness"
+                .to_string(),
+        ),
+        ExportError::InvalidPattern(msg) => {
+            (StatusCode::BAD_REQUEST, format!("invalid pattern: {msg}"))
+        }
+        ExportError::InvalidTimestamp(msg) => {
+            (StatusCode::BAD_REQUEST, format!("invalid timestamp: {msg}"))
+        }
+        ExportError::Io(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let code = if status == StatusCode::BAD_REQUEST {
+        "invalid_request"
+    } else {
+        "internal"
+    };
+    (
+        status,
+        Json(json!({ "error": { "code": code, "message": message } })),
+    )
+        .into_response()
+}
+
+/// `GET /api/devices/:id/export?format=jsonl|txt|bin&from=&to=&boot=&filter=`
+/// (T5.5, issue #22): the export dialog's download. Calls
+/// [`crate::export::export_range`] directly — the exact same function
+/// `Request::Export`'s UDS handler calls (`protocol::session`, out of this
+/// task's scope to touch) — so a GUI export and a CLI `serialwrap export`
+/// with equivalent parameters produce byte-identical `result.bytes` by
+/// construction: there is exactly one renderer, this is its second caller,
+/// not a second implementation (see `crate::export`'s own module doc
+/// comment, written anticipating exactly this task).
+///
+/// `boot=true` resolves to this device's most recent `connect` event's
+/// `seq`, mirroring `cli::export`'s own `resolve_boot_marker` — same
+/// reasoning (a `connect` event is this project's one unambiguous "fresh
+/// session with the device" marker), same "highest seq wins", reimplemented
+/// here (rather than shared) because that function is a private,
+/// CLI-crate-only helper operating over the wire `Request::QueryEvents`,
+/// whereas this runs in-process against
+/// [`crate::query::DeviceQueryState::query_events`] directly — identical
+/// logic, not behavior drifting from it. A device with no `connect` event
+/// yet exports from seq 0 (the full retained history), same fallback
+/// `resolve_boot_marker` uses.
+async fn export_device(
+    State(shared): State<Arc<Shared>>,
+    Path(id): Path<String>,
+    Query(params): Query<ExportParams>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let dev = DeviceId(id.clone());
+    let Some(recorder) = shared.backend.recorder(&dev) else {
+        return device_not_found_response(&id);
+    };
+
+    if params.boot && params.from.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "code": "invalid_request",
+                    "message": "boot and from are mutually exclusive — pick exactly one way to \
+                                say where the exported range starts",
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    let state = shared.queries.get_or_spawn(&dev, Arc::clone(&recorder));
+    state.ingest(&recorder);
+
+    let from = if params.boot {
+        let last_connect_seq = state
+            .query_events(&["connect".to_string()], None, None)
+            .iter()
+            .map(|e| e.seq)
+            .max();
+        Some(ExportBound::Seq(last_connect_seq.unwrap_or(0)))
+    } else {
+        params.from.as_deref().map(parse_export_bound)
+    };
+    let to = params.to.as_deref().map(parse_export_bound);
+    let filter = params.filter.map(|pattern| Filter {
+        pattern,
+        exclude: false,
+    });
+
+    let range = ExportRange { from, to };
+    match crate::export::export_range(&recorder, &range, params.format, filter.as_ref()) {
+        Ok(result) => {
+            let (content_type, ext) = match result.format {
+                ExportFormat::Jsonl => ("application/x-ndjson", "jsonl"),
+                ExportFormat::Txt => ("text/plain; charset=utf-8", "txt"),
+                ExportFormat::Bin => ("application/octet-stream", "bin"),
+            };
+            let filename = format!("{id}-export.{ext}");
+            (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, content_type.to_string()),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{filename}\""),
+                    ),
+                ],
+                result.bytes,
+            )
+                .into_response()
+        }
+        Err(e) => export_error_response(&e),
+    }
 }
 
 #[cfg(test)]
@@ -1634,5 +2104,541 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    // ---- T5.5 (issue #22): clients panel ----
+
+    fn register_test_client(
+        shared: &Shared,
+        name: &str,
+        pid: u32,
+        client_type: ClientType,
+        permission: Permission,
+    ) -> u64 {
+        shared.clients.register(
+            name.to_string(),
+            pid,
+            client_type,
+            permission,
+            Arc::new(tokio::sync::Notify::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn list_clients_is_empty_with_no_clients_registered() {
+        let (shared, _tmp, _id) = shared_with_device("dev-1");
+        let (status, body) = get(crate::web::router(shared), "/api/clients").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["clients"].as_array().unwrap().len(), 0);
+        assert_eq!(body["finished_leases"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_clients_reports_the_identity_triple_permission_and_traffic() {
+        let (shared, _tmp, _id) = shared_with_device("dev-1");
+        let client_id = register_test_client(
+            &shared,
+            "claude-code",
+            5140,
+            ClientType::Agent,
+            Permission::ReadGatedWrite,
+        );
+        shared.clients.add_bytes_in(client_id, 340_000);
+        let (status, body) = get(crate::web::router(shared), "/api/clients").await;
+        assert_eq!(status, StatusCode::OK);
+        let clients = body["clients"].as_array().unwrap();
+        assert_eq!(clients.len(), 1);
+        let entry = &clients[0];
+        assert_eq!(entry["status"], "active");
+        assert_eq!(entry["client_id"], client_id);
+        assert_eq!(entry["name"], "claude-code");
+        assert_eq!(entry["pid"], 5140);
+        assert_eq!(entry["type"], "agent");
+        assert_eq!(entry["permission"], "read+gated_write");
+        assert_eq!(entry["bytes_in"], 340_000);
+        assert_eq!(entry["activity"]["state"], "idle");
+    }
+
+    /// T5.5 acceptance criterion 4: the clients panel must show what an
+    /// agent is currently blocked on in `wait_for`, and how long it has
+    /// left. This pins the wire shape end to end: `set_activity` (what
+    /// `Request::WaitFor`'s handler calls before awaiting, per
+    /// `protocol::session`) through to `GET /api/clients`'s JSON.
+    #[tokio::test]
+    async fn list_clients_reports_waiting_for_state_with_remaining_seconds() {
+        let (shared, _tmp, _id) = shared_with_device("dev-1");
+        let client_id = register_test_client(
+            &shared,
+            "claude-code",
+            5140,
+            ClientType::Agent,
+            Permission::ReadGatedWrite,
+        );
+        shared.clients.set_activity(
+            client_id,
+            Activity::WaitingFor {
+                device: "dev-1".to_string(),
+                pattern: "OTA done".to_string(),
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(74),
+            },
+        );
+        let (status, body) = get(crate::web::router(shared), "/api/clients").await;
+        assert_eq!(status, StatusCode::OK);
+        let activity = &body["clients"][0]["activity"];
+        assert_eq!(activity["state"], "waiting_for");
+        assert_eq!(activity["pattern"], "OTA done");
+        let remaining = activity["remaining_s"].as_f64().unwrap();
+        assert!(
+            remaining > 0.0 && remaining <= 74.0,
+            "expected a positive remaining time close to 74s, got {remaining}"
+        );
+    }
+
+    /// T5.5 acceptance criterion 5: a finished lease must stay listed, not
+    /// vanish — reconstructed here from a `lease_end` event already sitting
+    /// in the device's own stream (see [`super::lease_end_to_json`]'s doc
+    /// comment for why no registry change was needed).
+    #[tokio::test]
+    async fn list_clients_includes_a_finished_lease_reconstructed_from_the_event_stream() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        let mut extra = serde_json::Map::new();
+        extra.insert("device_id".to_string(), json!("dev-1"));
+        extra.insert(
+            "command".to_string(),
+            json!("esptool.py write_flash 0x0 firmware.bin"),
+        );
+        extra.insert("pid".to_string(), json!(5311));
+        extra.insert("token".to_string(), json!("tok-1"));
+        extra.insert("exit_code".to_string(), json!(0));
+        extra.insert("duration_ms".to_string(), json!(46_000));
+        extra.insert("reason".to_string(), json!("released"));
+        recorder.append_event("lease_end", extra).unwrap();
+
+        let (status, body) = get(crate::web::router(shared), "/api/clients").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["clients"].as_array().unwrap().len(), 0);
+        let leases = body["finished_leases"].as_array().unwrap();
+        assert_eq!(leases.len(), 1, "{leases:?}");
+        let lease = &leases[0];
+        assert_eq!(lease["status"], "offline");
+        assert_eq!(
+            lease["name"], "esptool",
+            "derived from the command's basename"
+        );
+        assert_eq!(lease["pid"], 5311);
+        assert_eq!(lease["type"], "tool");
+        assert_eq!(lease["exit_code"], 0);
+        assert_eq!(lease["duration_ms"], 46_000);
+    }
+
+    #[test]
+    fn friendly_name_from_command_strips_a_py_extension_and_arguments() {
+        assert_eq!(
+            friendly_name_from_command("esptool.py write_flash 0x0 firmware.bin"),
+            "esptool"
+        );
+        assert_eq!(
+            friendly_name_from_command("/usr/bin/screen /dev/tty.usb"),
+            "screen"
+        );
+        assert_eq!(friendly_name_from_command(""), "tool");
+        assert_eq!(friendly_name_from_command("openocd"), "openocd");
+    }
+
+    #[tokio::test]
+    async fn kick_client_closes_the_client_and_appends_a_client_kicked_event() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let client_id = register_test_client(
+            &shared,
+            "claude-code",
+            5140,
+            ClientType::Agent,
+            Permission::ReadGatedWrite,
+        );
+        let router = crate::web::router(shared.clone());
+        let (status, body) =
+            post(router, &format!("/api/clients/{client_id}/kick"), json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["client_id"], client_id);
+
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        let records = recorder.read_since(0, usize::MAX).unwrap().records;
+        let kicked = records.iter().find_map(|r| match r {
+            wrap_proto::Record::Event { event, extra, .. } if event == "client_kicked" => {
+                Some(extra.clone())
+            }
+            _ => None,
+        });
+        let extra = kicked.expect("expected a client_kicked event");
+        assert_eq!(extra["client_id"], client_id);
+        assert_eq!(extra["name"], "claude-code");
+        assert_eq!(extra["pid"], 5140);
+        assert_eq!(extra["kicked_by"], GUI_CHANGED_BY);
+    }
+
+    #[tokio::test]
+    async fn kick_client_404s_for_an_unknown_client_id() {
+        let (shared, _tmp, _id) = shared_with_device("dev-1");
+        let (status, body) = post(
+            crate::web::router(shared),
+            "/api/clients/999999/kick",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"]["code"], "client_not_found");
+    }
+
+    #[tokio::test]
+    async fn demote_client_changes_the_registered_permission() {
+        let (shared, _tmp, _id) = shared_with_device("dev-1");
+        let client_id = register_test_client(
+            &shared,
+            "claude-code",
+            5140,
+            ClientType::Agent,
+            Permission::ReadGatedWrite,
+        );
+        let router = crate::web::router(shared.clone());
+        let (status, body) = post(
+            router.clone(),
+            &format!("/api/clients/{client_id}/demote"),
+            json!({ "permission": "lease_only" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["permission"], "lease_only");
+
+        let (_status, list_body) = get(router, "/api/clients").await;
+        assert_eq!(list_body["clients"][0]["permission"], "lease_only");
+    }
+
+    #[tokio::test]
+    async fn demote_client_404s_for_an_unknown_client_id() {
+        let (shared, _tmp, _id) = shared_with_device("dev-1");
+        let (status, body) = post(
+            crate::web::router(shared),
+            "/api/clients/999999/demote",
+            json!({ "permission": "read+write" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"]["code"], "client_not_found");
+    }
+
+    // ---- T5.5 (issue #22): audit panel ----
+
+    #[tokio::test]
+    async fn audit_endpoint_404s_for_an_unknown_device() {
+        let (shared, _tmp, _id) = shared_with_device("dev-1");
+        let (status, _) = get(
+            crate::web::router(shared),
+            "/api/devices/no-such-device/audit",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// T5.5 acceptance criterion 1 (seed): pins that `rx` never appears and
+    /// only audit-relevant `tx`/`gate`/named-`event` records survive — and
+    /// that a denied write's full payload (its `write_request` event, with
+    /// `bytes_b64`) is one of the rows returned, unmodified, un-joined with
+    /// its later `gate` decision (see [`super::audit`]'s doc comment on why
+    /// there's deliberately no correlation logic here).
+    #[tokio::test]
+    async fn audit_endpoint_filters_to_audit_relevant_records_only() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        recorder.append_rx(b"boot ok\n").unwrap(); // never audit-relevant
+        recorder
+            .append_tx(b"status\n", "claude-code", ClientType::Agent, "whitelist")
+            .unwrap();
+        let mut request_extra = serde_json::Map::new();
+        request_extra.insert("request_id".to_string(), json!(1));
+        request_extra.insert("bytes_b64".to_string(), json!("Zmxhc2hfZXJhc2U="));
+        request_extra.insert("matched_rule".to_string(), json!("danger:erase"));
+        let write_request_record = recorder
+            .append_event("write_request", request_extra)
+            .unwrap();
+        recorder
+            .append_gate("deny", "timeout_60s", write_request_record.seq())
+            .unwrap();
+        recorder
+            .append_event("recovery", serde_json::Map::new())
+            .unwrap(); // not audit-relevant
+
+        let (status, body) = get(crate::web::router(shared), "/api/devices/dev-1/audit").await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["audit"].as_array().unwrap();
+        let kinds: Vec<&str> = rows.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["tx", "event", "gate"], "{rows:?}");
+
+        let write_request = &rows[1];
+        assert_eq!(write_request["event"], "write_request");
+        assert_eq!(write_request["bytes_b64"], "Zmxhc2hfZXJhc2U=");
+        assert_eq!(write_request["matched_rule"], "danger:erase");
+
+        let gate_row = &rows[2];
+        assert_eq!(gate_row["action"], "deny");
+        assert_eq!(gate_row["reason"], "timeout_60s");
+        assert_eq!(gate_row["request_seq"], write_request["seq"]);
+    }
+
+    #[tokio::test]
+    async fn audit_endpoint_respects_since_and_until_seq_params() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        for i in 0..5u64 {
+            recorder
+                .append_tx(
+                    format!("cmd{i}\n").as_bytes(),
+                    "claude-code",
+                    ClientType::Agent,
+                    "whitelist",
+                )
+                .unwrap();
+        }
+        let (status, body) = get(
+            crate::web::router(shared),
+            "/api/devices/dev-1/audit?since_seq=1&until_seq=3",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["audit"].as_array().unwrap();
+        let seqs: Vec<u64> = rows.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, vec![1, 2, 3], "{rows:?}");
+    }
+
+    // ---- T5.5 (issue #22): export dialog ----
+
+    #[tokio::test]
+    async fn export_device_404s_for_an_unknown_device() {
+        let (shared, _tmp, _id) = shared_with_device("dev-1");
+        let response = crate::web::router(shared)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices/no-such-device/export?format=jsonl")
+                    .extension(axum::extract::ConnectInfo(
+                        "127.0.0.1:9".parse::<std::net::SocketAddr>().unwrap(),
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn export_bytes(
+        router: axum::Router,
+        uri: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .extension(axum::extract::ConnectInfo(
+                        "127.0.0.1:9".parse::<std::net::SocketAddr>().unwrap(),
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, headers, bytes)
+    }
+
+    /// T5.5 acceptance criterion 2 (the byte-identity requirement) at the
+    /// unit level: this HTTP handler's bytes must be *exactly*
+    /// `crate::export::export_range`'s own output for equivalent
+    /// parameters, since it calls that function directly rather than
+    /// reimplementing any rendering. The full CLI-vs-GUI byte comparison
+    /// (spawning the real `serialwrap export` binary) lives in
+    /// `webui/e2e/`, where both real binaries exist; this pins the
+    /// in-process half of that guarantee.
+    #[tokio::test]
+    async fn export_device_jsonl_bytes_match_export_range_directly() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        recorder.append_rx(b"boot ok\n").unwrap();
+        recorder
+            .append_tx(b"status\n", "claude-code", ClientType::Agent, "whitelist")
+            .unwrap();
+        recorder.append_rx(&[0xFF, 0xFE, b'\n']).unwrap();
+
+        let (status, headers, bytes) = export_bytes(
+            crate::web::router(shared.clone()),
+            "/api/devices/dev-1/export?format=jsonl",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "application/x-ndjson"
+        );
+        assert!(headers
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("dev-1-export.jsonl"));
+
+        let direct = crate::export::export_range(
+            &recorder,
+            &crate::export::ExportRange::default(),
+            wrap_proto::ExportFormat::Jsonl,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes, direct.bytes,
+            "GUI export must be byte-identical to a direct export_range call"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_device_bin_bytes_match_export_range_directly_and_are_byte_exact() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        recorder.append_rx(b"boot ok\n").unwrap();
+        recorder.append_rx(&[0x00, 0x01, 0xFF, 0xFE]).unwrap();
+        recorder
+            .append_tx(b"status\n", "claude-code", ClientType::Agent, "whitelist")
+            .unwrap(); // tx bytes must never appear in a bin export
+
+        let (status, _headers, bytes) = export_bytes(
+            crate::web::router(shared.clone()),
+            "/api/devices/dev-1/export?format=bin",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let direct = crate::export::export_range(
+            &recorder,
+            &crate::export::ExportRange::default(),
+            wrap_proto::ExportFormat::Bin,
+            None,
+        )
+        .unwrap();
+        assert_eq!(bytes, direct.bytes);
+        assert_eq!(bytes, b"boot ok\n\x00\x01\xFF\xFE".to_vec());
+    }
+
+    #[tokio::test]
+    async fn export_device_rejects_bin_with_a_filter() {
+        let (shared, _tmp, _id) = shared_with_device("dev-1");
+        let (status, body) = get(
+            crate::web::router(shared),
+            "/api/devices/dev-1/export?format=bin&filter=boot",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn export_device_rejects_boot_and_from_together() {
+        let (shared, _tmp, _id) = shared_with_device("dev-1");
+        let (status, body) = get(
+            crate::web::router(shared),
+            "/api/devices/dev-1/export?format=jsonl&boot=true&from=0",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    /// `--boot`/`boot=true` resolves to the *latest* `connect` event's
+    /// `seq`, mirroring `cli::export::resolve_boot_marker` — pinned here by
+    /// seeding two `connect` events and asserting the export only contains
+    /// records from the second boot onward.
+    #[tokio::test]
+    async fn export_device_boot_resolves_to_the_latest_connect_event() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        recorder.append_rx(b"first boot line\n").unwrap();
+        recorder
+            .append_event("connect", serde_json::Map::new())
+            .unwrap();
+        recorder.append_rx(b"pre-second-boot line\n").unwrap();
+        let second_connect = recorder
+            .append_event("connect", serde_json::Map::new())
+            .unwrap();
+        recorder.append_rx(b"second boot line\n").unwrap();
+
+        let (status, _headers, bytes) = export_bytes(
+            crate::web::router(shared.clone()),
+            "/api/devices/dev-1/export?format=txt&boot=true",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Independently pin the exact resolved starting bound (the second
+        // `connect`'s own seq, known here from its returned `Record` —
+        // not re-derived via this handler's own boot-resolution logic) by
+        // comparing byte-for-byte against a direct `export_range` call with
+        // that explicit bound.
+        let expected_range = crate::export::ExportRange {
+            from: Some(wrap_proto::ExportBound::Seq(second_connect.seq())),
+            to: None,
+        };
+        let direct = crate::export::export_range(
+            &recorder,
+            &expected_range,
+            wrap_proto::ExportFormat::Txt,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes, direct.bytes,
+            "boot=true must resolve to exactly the latest connect event's own seq"
+        );
+
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("second boot line"), "{text}");
+        assert!(
+            !text.contains("first boot line") && !text.contains("pre-second-boot"),
+            "boot export must not include data from before the latest boot: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_device_txt_bytes_match_export_range_directly() {
+        let (shared, _tmp, id) = shared_with_device("dev-1");
+        let recorder = shared.backend.recorder(&id).expect("recorder registered");
+        recorder.append_rx(b"boot ok\n").unwrap();
+        recorder
+            .append_event("config_change", serde_json::Map::new())
+            .unwrap();
+
+        let (status, headers, bytes) = export_bytes(
+            crate::web::router(shared.clone()),
+            "/api/devices/dev-1/export?format=txt",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+
+        let direct = crate::export::export_range(
+            &recorder,
+            &crate::export::ExportRange::default(),
+            wrap_proto::ExportFormat::Txt,
+            None,
+        )
+        .unwrap();
+        assert_eq!(bytes, direct.bytes);
     }
 }

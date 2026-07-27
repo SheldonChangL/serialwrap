@@ -5,7 +5,11 @@
   import DeviceList from "./lib/DeviceList.svelte";
   import LiveLog from "./lib/LiveLog.svelte";
   import ApprovalCardHost from "./lib/ApprovalCardHost.svelte";
+  import ClientsPanel from "./lib/ClientsPanel.svelte";
+  import AuditPanel from "./lib/AuditPanel.svelte";
+  import ExportDialog from "./lib/ExportDialog.svelte";
   import { fetchDevices } from "./lib/api";
+  import type { TimelineSelection } from "./lib/timeline";
 
   const connection = new Connection();
   let info = $state<ConnectionInfo>({
@@ -24,6 +28,18 @@
   // omissions" section — no multi-device tabs in v1): the live log view
   // below simply follows whichever device `GET /api/devices` lists first.
   let primaryDeviceId = $state<string | null>(null);
+
+  // ---- T5.5 (issue #22): clients / audit / export plumbing ----
+  // `timelineSelection` is a second copy of `LiveLog.svelte`'s own
+  // internal state, kept in sync via its `onTimelineSelect` callback prop
+  // (see that component's doc comment) so `ExportDialog` — a sibling, not
+  // a child, of `LiveLog` — can offer the current drag-selection as an
+  // export source without `LiveLog` needing to know `ExportDialog` exists.
+  let timelineSelection = $state<TimelineSelection | null>(null);
+  // An imperative handle into `LiveLog`'s own `jumpToSeq`, captured once
+  // via `registerJumpToSeq` — see that prop's doc comment on why this is a
+  // captured function reference rather than a reactive prop.
+  let jumpToSeq: ((seq: number) => void) | null = null;
 
   async function loadPrimaryDevice(): Promise<void> {
     try {
@@ -52,13 +68,20 @@
 
   <p class="tagline">
     Web GUI foundation (T5.1), the live log view (T5.2), the timeline and
-    port settings popover (T5.3), and the approval card (T5.4). Clients,
-    audit, and export panels land in T5.5.
+    port settings popover (T5.3), the approval card (T5.4), and the
+    clients/audit/export panels (T5.5).
   </p>
 
   {#if primaryDeviceId}
     <ApprovalCardHost deviceId={primaryDeviceId} />
-    <LiveLog deviceId={primaryDeviceId} />
+    <LiveLog
+      deviceId={primaryDeviceId}
+      onTimelineSelect={(selection) => (timelineSelection = selection)}
+      registerJumpToSeq={(fn) => (jumpToSeq = fn)}
+    />
+    <ClientsPanel />
+    <AuditPanel deviceId={primaryDeviceId} onJumpToSeq={(seq) => jumpToSeq?.(seq)} />
+    <ExportDialog deviceId={primaryDeviceId} {timelineSelection} />
   {/if}
 
   <DeviceList />
