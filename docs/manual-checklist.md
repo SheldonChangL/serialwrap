@@ -19,7 +19,7 @@
 
 ## 1. 自訂 Baud Rate（74880）
 
-對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwrap/wiki/Architecture)（`needs:hardware`）
+對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwrap/issues/5)（`needs:hardware`）
 
 74880 是 ESP8266 開機 log 的預設 baud，是最常見、也最容易在跨平台 API 上出錯的
 非標準值（`serialport` crate 在 macOS 走 `IOSSIOSPEED`、Linux 走
@@ -37,7 +37,7 @@
 
 ## 2. 「不觸碰 DTR/RTS」開啟不觸發 Arduino Uno 自動 reset
 
-對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwrap/wiki/Architecture)（`needs:hardware`）
+對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwrap/issues/5)（`needs:hardware`）
 
 Arduino Uno（及多數用 DTR 觸發 reset 進 bootloader 的板子）在 serial port 被
 `open()` 時，若 DTR 被驅動預設拉低再拉高，會觸發 MCU reset。「不觸碰
@@ -55,7 +55,7 @@ DTR/RTS」模式必須讓 daemon 開啟 port 時完全不改變這兩條控制�
 
 ## 3. `serialwrap run -- esptool` 實機燒錄
 
-對應：T2.2 Lease 模式 `serialwrap run --` — [issue #9](https://github.com/SheldonChangL/serialwrap/wiki/Architecture)（`needs:hardware`）
+對應：T2.2 Lease 模式 `serialwrap run --` — [issue #9](https://github.com/SheldonChangL/serialwrap/issues/9)（`needs:hardware`）
 
 Lease 機制（daemon 讓出 port fd 給子行程獨佔）只有跑一次真正的燒錄流程才能
 證明「daemon 收回 port、恢復錄製、期間其他 client 沒有斷線」全部成立；mock
@@ -73,7 +73,7 @@ device 治具能測狀態機（fd 讓出/收回的時序），但測不出 espto
 
 ## 4. 桌面通知
 
-對應：T4.2 審批流程與通知 — [issue #15](https://github.com/SheldonChangL/serialwrap/wiki/Architecture)（`needs:hardware`，嚴格說是「需要桌面環境」而非硬體，但同樣無法在無頭 CI 上驗）
+對應：T4.2 審批流程與通知 — [issue #15](https://github.com/SheldonChangL/serialwrap/issues/15)（`needs:hardware`，嚴格說是「需要桌面環境」而非硬體，但同樣無法在無頭 CI 上驗）
 
 - [ ] macOS：審批請求觸發 `osascript`（或 terminal-notifier）桌面通知，實際看到彈出
   - 所需硬體/環境：有登入 GUI session 的 macOS 桌面
@@ -89,7 +89,7 @@ device 治具能測狀態機（fd 讓出/收回的時序），但測不出 espto
 
 ## 5. Linux `TIOCGICOUNT` 錯誤計數；macOS 顯示 unavailable
 
-對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwrap/wiki/Architecture)（`needs:hardware`）
+對應：T1.3 Port I/O 與設定核心 — [issue #5](https://github.com/SheldonChangL/serialwrap/issues/5)（`needs:hardware`）
 
 Linux 的 framing/overrun/parity error 計數走 `TIOCGICOUNT` ioctl；macOS 沒有對應
 機制。這裡要驗證兩件事：Linux 上計數真的隨錯誤增加、macOS 上介面誠實回報
@@ -110,13 +110,13 @@ Linux 的 framing/overrun/parity error 計數走 `TIOCGICOUNT` ioctl；macOS 沒
 
 以下項目在對應任務開工時應併入該任務自己的驗收流程，這裡先登記避免遺漏。
 
-### T1.1 裝置識別與熱插拔 — [issue #3]
+### T1.1 裝置識別與熱插拔 — [issue #3](https://github.com/SheldonChangL/serialwrap/issues/3)
 
 - [ ] macOS 實機驗證一律使用 `/dev/cu.*` 節點且開啟不阻塞（不是 `/dev/tty.*`）
   - 所需硬體：任意 USB-serial 轉接器
   - 判定通過：`serialwrapd` 開啟裝置時使用的路徑經確認是 `cu.*`；反覆插拔不出現因等待 DCD 而卡住的開啟
 
-### T6.1 打包與服務安裝 — [issue #23]
+### T6.1 打包與服務安裝 — [issue #23](https://github.com/SheldonChangL/serialwrap/issues/23)
 
 - [ ] 乾淨 macOS VM：照 README 從安裝到 GUI 看到 log ≤15 分鐘（實測計時）
 - [ ] 乾淨 Ubuntu VM：同上
