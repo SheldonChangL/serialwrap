@@ -54,6 +54,14 @@ pub const DEFAULT_PORT: u16 = 5590;
 /// this task's "localhost only" requirement exists to prevent. Only the
 /// port varies, and only via env var; there's no CLI flag for it.
 pub fn web_addr() -> SocketAddr {
+    // Known limitation (deferred, not fixed here): a malformed
+    // `SERIALWRAP_WEB_PORT` (non-numeric, out of `u16` range) silently
+    // falls back to `DEFAULT_PORT` rather than failing loudly — someone
+    // debugging "why is it on 5590 when I set the env var" gets no signal
+    // at all. Low risk today (this var is set by this crate's own test
+    // harness and `webui/e2e/daemon.ts`, never by an end user), but if a
+    // CLI flag for this is ever added, it should reject a bad value
+    // instead of inheriting this fallback.
     let port = std::env::var("SERIALWRAP_WEB_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -97,4 +105,53 @@ pub async fn serve_on(listener: TcpListener, shared: Arc<Shared>) -> std::io::Re
         router(shared).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    use crate::protocol::backend::testing::TestBackend;
+    use crate::protocol::backend::DeviceBackend;
+    use crate::protocol::Shared;
+
+    /// End-to-end over a *real* TCP socket — every other `web` test drives
+    /// the router with `tower::ServiceExt::oneshot` and hand-injects a
+    /// `ConnectInfo` extension, so none of them would notice a bug in the
+    /// actual `into_make_service_with_connect_info::<SocketAddr>()` wiring
+    /// this function does (review finding #11 on PR #43: `web::serve` had
+    /// zero callers and zero coverage). A real loopback connection's own
+    /// peer address should, unsurprisingly, pass the loopback guard.
+    #[tokio::test]
+    async fn serve_wires_up_a_real_socket_end_to_end() {
+        let shared = Arc::new(Shared::new(
+            Arc::new(TestBackend::new()) as Arc<dyn DeviceBackend>,
+            "test-version",
+        ));
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let server = tokio::spawn(super::serve_on(listener, shared));
+
+        let mut stream = TcpStream::connect(bound).await.unwrap();
+        stream
+            .write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "expected 200 OK, got: {response}"
+        );
+        assert!(response.contains("\"ok\":true"));
+
+        server.abort();
+    }
 }

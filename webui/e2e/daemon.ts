@@ -24,6 +24,15 @@ export interface DaemonHandle {
   stop(): Promise<void>;
 }
 
+// Known limitation (deferred, not fixed here): auto-allocated ports are a
+// fixed, incrementing sequence rather than OS-assigned ephemeral ports. If
+// a previous run's daemon were ever orphaned (e.g. the process survived a
+// hard test-runner kill) it could still be holding one of these ports,
+// causing the next run's `startDaemon()` to fail its health check against
+// the wrong (stale) daemon. `workers: 1` plus each daemon's own throwaway
+// HOME dir makes this unlikely in practice; escalate to real OS-assigned
+// ports (bind `0`, read back the actual port) if this is ever observed
+// flaking in CI — same category of fix as issue #39.
 let nextPort = 15590;
 
 async function waitForHealthy(url: string, timeoutMs: number): Promise<void> {
@@ -83,8 +92,21 @@ export async function startDaemon(port?: number): Promise<DaemonHandle> {
         port: usePort,
         url: `http://127.0.0.1:${usePort}`,
         async stop() {
-          stopper.kill("SIGKILL");
-          await new Promise<void>((resolve) => stopper.once("exit", () => resolve()));
+          // `exit` is not a sticky/replayable event: if `stopper` already
+          // exited on its own (crashed, or an earlier `stop()` call raced
+          // with this one) before this listener attaches, awaiting a new
+          // `once("exit", ...)` would hang forever — Node never re-fires
+          // an event nothing was listening for the first time. Checking
+          // `exitCode`/`signalCode` (both non-null once a child has
+          // actually exited) lets an already-dead process skip straight
+          // to cleanup instead of hanging the test's `afterEach` until
+          // Playwright's own timeout, which would report an opaque hook
+          // timeout instead of the real failure.
+          if (stopper.exitCode === null && stopper.signalCode === null) {
+            const exited = new Promise<void>((resolve) => stopper.once("exit", () => resolve()));
+            stopper.kill("SIGKILL");
+            await exited;
+          }
           rmSync(home, { recursive: true, force: true });
         },
       };

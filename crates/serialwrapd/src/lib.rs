@@ -82,9 +82,14 @@ pub async fn run() -> std::io::Result<()> {
         }
     }
 
-    // Reached only if one of the two servers above returns — kept so
-    // `handle` has a clear owner and an explicit, orderly shutdown path
-    // exists rather than an implicit process-exit teardown.
+    // Unreachable in practice, same as the pre-T5.1 version of this
+    // function: both futures above loop forever absent a fatal error,
+    // which `?` already propagates before this line. Kept anyway (review
+    // finding #10 on PR #43 flagged the previous wording here as
+    // overclaiming — "an explicit, orderly shutdown path" reads as if this
+    // runs on normal shutdown, which it never does) purely so `handle` has
+    // a clear owner and there's *something* to run if `serve`/`serve_on`
+    // are ever changed to return `Ok` instead of only erroring.
     handle.stop();
     Ok(())
 }

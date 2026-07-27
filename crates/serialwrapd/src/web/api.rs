@@ -108,4 +108,57 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["devices"].as_array().unwrap().len(), 0);
     }
+
+    /// Regression test for a review finding on PR #43 (#6): the only
+    /// previous `/api/devices` test asserted an *empty* array, so the
+    /// `id`/`path`/`connected`/`config` field mapping itself had zero
+    /// coverage — renaming a field would still pass every Rust test, and
+    /// CI has no real serial device for the Playwright E2E to catch it
+    /// either. This pins the exact shape against a real registered device.
+    #[tokio::test]
+    async fn devices_endpoint_maps_a_registered_device_field_for_field() {
+        use crate::port::DeviceId;
+        use crate::recorder::{Recorder, RecorderConfig};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(
+            Recorder::open(tmp.path(), "dev-1", RecorderConfig::default()).expect("open recorder"),
+        );
+        let backend = Arc::new(TestBackend::new());
+        backend.register(DeviceId("dev-1".to_string()), recorder);
+        let shared = Arc::new(Shared::new(
+            backend as Arc<dyn DeviceBackend>,
+            "test-version",
+        ));
+
+        let router = crate::web::router(shared);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .extension(axum::extract::ConnectInfo(
+                        "127.0.0.1:9".parse::<std::net::SocketAddr>().unwrap(),
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let devices = value["devices"].as_array().expect("devices array");
+        assert_eq!(devices.len(), 1);
+        let device = &devices[0];
+        assert_eq!(device["id"], "dev-1");
+        assert_eq!(device["connected"], true);
+        assert!(
+            device["path"].is_null(),
+            "TestBackend::register doesn't set a path"
+        );
+        assert_eq!(
+            device["config"]["baud"], 9600,
+            "PortConfig::default()'s baud, round-tripped through the config field"
+        );
+    }
 }

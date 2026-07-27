@@ -25,6 +25,15 @@ fn looks_like_a_static_file(path: &str) -> bool {
         .is_some_and(|last| last.contains('.'))
 }
 
+/// Whether `raw_path` (the untrimmed `uri.path()`, always leading-slash) is
+/// `/api` itself or anything under it. `starts_with("/api/")` alone misses
+/// the bare `/api` (no trailing slash) — a request for exactly that path
+/// would otherwise fall through to the SPA fallback and get a `200`
+/// `index.html` instead of the `404` every other unmatched API path gets.
+fn is_api_path(raw_path: &str) -> bool {
+    raw_path == "/api" || raw_path.starts_with("/api/")
+}
+
 /// Fallback handler for any request no other route matched: serves the
 /// embedded asset at the request path, or `index.html` for anything that
 /// looks like an SPA client-side route (no file extension in the last path
@@ -45,7 +54,7 @@ pub async fn serve_asset(uri: Uri) -> Response {
             .into_response();
     }
 
-    if uri.path().starts_with("/api/") || looks_like_a_static_file(path) {
+    if is_api_path(uri.path()) || looks_like_a_static_file(path) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 
@@ -96,6 +105,18 @@ mod tests {
         use axum::http::StatusCode;
 
         let response = serve_asset("/assets/does-not-exist-1234.js".parse().unwrap()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Regression test for a review finding on PR #43: `starts_with("/api/")`
+    /// alone doesn't match the bare `/api` (no trailing slash), so a request
+    /// for exactly that path used to fall through to the SPA branch and get
+    /// a `200` `index.html` instead of a `404`.
+    #[tokio::test]
+    async fn bare_api_path_with_no_trailing_slash_still_404s() {
+        use axum::http::StatusCode;
+
+        let response = serve_asset("/api".parse().unwrap()).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
