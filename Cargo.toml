@@ -4,6 +4,7 @@ members = [
     "crates/wrap-proto",
     "crates/serialwrapd",
     "crates/serialwrap",
+    "crates/mock-device",
 ]
 
 [workspace.package]
