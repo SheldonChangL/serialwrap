@@ -8,8 +8,25 @@ repository.workspace = true
 
 [dependencies]
 wrap-proto = { path = "../wrap-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Base64 for `data_b64` payload encoding (T1.2 recorder).
+base64 = "0.22"
+# `clock_gettime(CLOCK_MONOTONIC)` for `t_mono` — `std::time::Instant` is
+# opaque and can't be serialized to an absolute seconds value (T1.2).
+libc = "0.2"
+# RFC 3339 wall-clock timestamps with a numeric UTC offset (T1.2 `t_wall`).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Platform data-dir resolution (`~/.local/share/serialwrap`, `~/Library/
+# Application Support/serialwrap`) — recorder callers use this by default;
+# tests always inject an explicit tempdir instead (T1.2).
+directories = "5"
 
 [dev-dependencies]
 # Test-only PTY fixture (see TASKS.md T0.2). Pulled in as a dev-dependency
 # only, so it never links into the `serialwrap` release binary.
 mock-device = { path = "../mock-device" }
+# Test-only tempdirs (recorder tests must never touch the user's real data
+# dir) and a hash for the byte-exact acceptance test (T1.2).
+tempfile = "3"
+sha2 = "0.10"
