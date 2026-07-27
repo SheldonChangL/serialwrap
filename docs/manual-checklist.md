@@ -52,6 +52,10 @@ DTR/RTS」模式必須讓 daemon 開啟 port 時完全不改變這兩條控制�
   - 所需硬體：同上
   - 判定通過：同上
   - 驗證紀錄：
+- [ ] 兩平台：`dtr_pulse`（獨立顯名操作，見 issue #5）確實觸發板子 reset，且方向（先拉低再拉高）與該板子的實際 auto-reset 電路相符
+  - 所需硬體：Arduino Uno（或任何以 DTR 觸發 auto-reset 的板子）
+  - 判定通過：呼叫 `dtr_pulse` 後板子重新開機（boot banner 重新出現）；若特定板子的極性相反，記錄下來供之後調整預設方向
+  - 驗證紀錄：
 
 ## 3. `serialwrap run -- esptool` 實機燒錄
 
