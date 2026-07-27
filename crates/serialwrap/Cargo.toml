@@ -33,6 +33,9 @@ base64 = "0.22"
 # tests use it — dev-dependency only, never linked into the release binary.
 mock-device = { path = "../mock-device" }
 tempfile = "3"
+# Byte-exactness assertions for `export`'s `bin` format acceptance tests
+# (`TASKS.md` T2.4) — same version `serialwrapd` itself uses.
+sha2 = "0.10"
 # Send a real SIGINT to a spawned `serialwrap tail -f` child process, to
 # test the Ctrl-C acceptance criterion (T1.5) against the actual compiled
 # binary rather than an in-process approximation. `term` adds
