@@ -8,19 +8,29 @@ use std::sync::Arc;
 
 use tokio::net::UnixListener;
 
+use crate::gate::Gate;
+
 use super::backend::DeviceBackend;
 use super::registry::{ClientRegistry, QueryRegistry};
 use super::session;
 
 /// State shared by every connection: the device backend, the per-device
-/// query-state registry, and the client registry. One instance per running
-/// daemon, held behind an `Arc` and cloned (cheaply — it's just the `Arc`)
-/// into every spawned connection task.
+/// query-state registry, the client registry, and the write gate. One
+/// instance per running daemon, held behind an `Arc` and cloned (cheaply —
+/// it's just the `Arc`) into every spawned connection task.
 pub struct Shared {
     pub backend: Arc<dyn DeviceBackend>,
     pub queries: QueryRegistry,
     pub clients: ClientRegistry,
     pub server_version: String,
+    /// The write gate (`TASKS.md` T4.1/T4.2, issues #14/#15). Defaults to
+    /// [`Gate::builtin`] (built-in danger patterns, no whitelist, 60s
+    /// timeout, real desktop notifications) — call [`Self::with_gate`] to
+    /// override, e.g. with a loaded `rules.toml` (production, see
+    /// `serialwrapd::run`) or a short-timeout/custom-notifier `Gate` for
+    /// tests. Kept a plain field (not `pub` behind a getter) matching this
+    /// struct's existing convention for `backend`/`clients`/`queries`.
+    pub gate: Gate,
 }
 
 impl Shared {
@@ -30,7 +40,17 @@ impl Shared {
             queries: QueryRegistry::default(),
             clients: ClientRegistry::new(),
             server_version: server_version.into(),
+            gate: Gate::default(),
         }
+    }
+
+    /// Replace the default [`Gate`] — see [`Self::gate`]'s doc comment.
+    /// Consuming/builder-style so production startup (`serialwrapd::run`)
+    /// and tests can both write `Shared::new(...).with_gate(...)` inline
+    /// rather than needing a separate constructor overload.
+    pub fn with_gate(mut self, gate: Gate) -> Self {
+        self.gate = gate;
+        self
     }
 }
 

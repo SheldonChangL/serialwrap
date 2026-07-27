@@ -13,6 +13,7 @@
 //! `wrap-proto` define — everything here talks to the daemon only over the
 //! UDS socket, the same way any future MCP bridge or GUI client will.
 
+pub mod approvals;
 pub mod client;
 pub mod clients;
 pub mod config;

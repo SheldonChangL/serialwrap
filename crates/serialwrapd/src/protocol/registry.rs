@@ -107,6 +107,11 @@ struct ClientEntry {
     permission: Mutex<Permission>,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    /// How many `Request::Write`s this client has sent to the gate this
+    /// session, whitelisted-and-immediately-allowed writes included
+    /// (`TASKS.md` T4.2, issue #15: an approval payload's "本 session 第幾
+    /// 次請求" field) — see [`ClientRegistry::next_write_attempt`].
+    write_attempts: AtomicU64,
     activity: Mutex<Activity>,
     /// Notified (once, via `notify_waiters`) when this client is kicked or
     /// disconnects on its own — both the reader and writer loops for this
@@ -166,6 +171,7 @@ impl ClientRegistry {
                     permission: Mutex::new(permission),
                     bytes_in: AtomicU64::new(0),
                     bytes_out: AtomicU64::new(0),
+                    write_attempts: AtomicU64::new(0),
                     activity: Mutex::new(Activity::Idle),
                     kill,
                 },
@@ -232,6 +238,41 @@ impl ClientRegistry {
                     *e.permission.lock().unwrap_or_else(|e| e.into_inner()),
                 )
             })
+    }
+
+    /// This connection's self-reported `name`, kernel-verified `pid`, and
+    /// [`ClientType`] — looked up fresh, same "never cached from the
+    /// handshake" convention [`Self::type_and_permission`] documents.
+    /// [`crate::gate::RequesterCtx`] is built from this (plus
+    /// [`Self::next_write_attempt`]) by `protocol::session`'s
+    /// `Request::Write` handler for a gated (`agent`) write (`TASKS.md`
+    /// T4.2, issue #15's approval payload: "requester 身分（name + verified
+    /// pid + type）").
+    pub fn identity(&self, client_id: u64) -> Option<(String, u32, ClientType)> {
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&client_id)
+            .map(|e| (e.name.clone(), e.pid, e.client_type))
+    }
+
+    /// Increment and return this client's write-attempt counter (1-based —
+    /// the first call returns `1`), for the approval payload's "本 session
+    /// 第幾次請求" field (`TASKS.md` T4.2, issue #15). Counts every write
+    /// that reaches the gate, allowed-by-whitelist ones included: an
+    /// operator deciding whether to approve a pending write benefits from
+    /// knowing "this is this agent's 13th write this session, the first 12
+    /// went fine" just as much for a whitelisted history as a gated one.
+    /// Returns `1` for an unknown `client_id` (same defensive fallback
+    /// `type_and_permission`'s unreachable-in-practice branch documents)
+    /// rather than panicking.
+    pub fn next_write_attempt(&self, client_id: u64) -> u64 {
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&client_id)
+            .map(|e| e.write_attempts.fetch_add(1, Ordering::Relaxed) + 1)
+            .unwrap_or(1)
     }
 
     pub fn list(&self) -> Vec<ClientSnapshot> {

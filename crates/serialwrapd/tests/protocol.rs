@@ -26,6 +26,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
+use serialwrapd::gate::Gate;
 use serialwrapd::port::DeviceId;
 use serialwrapd::protocol::backend::{testing::TestBackend, DeviceBackend};
 use serialwrapd::protocol::{server, Shared};
@@ -40,6 +41,22 @@ async fn start_test_daemon(backend: Arc<dyn DeviceBackend>) -> (PathBuf, tempfil
     let path = dir.path().join("test.sock");
     let listener = server::bind(&path).expect("bind test socket");
     let shared = Arc::new(Shared::new(backend, "test"));
+    tokio::spawn(server::serve(listener, shared));
+    (path, dir)
+}
+
+/// Same as [`start_test_daemon`], but with a caller-supplied [`Gate`]
+/// instead of the default 60s-timeout builtin one — for a test that needs
+/// a gated write to actually resolve (by timeout) without waiting out the
+/// real production default (`TASKS.md` T4.1/T4.2, issues #14/#15).
+async fn start_test_daemon_with_gate(
+    backend: Arc<dyn DeviceBackend>,
+    gate: Gate,
+) -> (PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("test.sock");
+    let listener = server::bind(&path).expect("bind test socket");
+    let shared = Arc::new(Shared::new(backend, "test").with_gate(gate));
     tokio::spawn(server::serve(listener, shared));
     (path, dir)
 }
@@ -1156,10 +1173,21 @@ async fn write_appends_a_tx_event_visible_to_another_subscriber_with_correct_ide
     );
 }
 
-// ---- T2.1 acceptance criterion 5: agent (and tool) writes stay denied ----
-
+// ---- T2.3 client-type policy: `tool` has no byte-level write path at all ----
+//
+// This test used to also assert an `agent` write was flatly
+// `permission_denied` here, "pending the T4.1 rule engine" — that stub is
+// exactly what T4.1/T4.2 (issues #14/#15) replace: an `agent` write now
+// goes through the real gate (whitelist/danger/default-pending) instead of
+// a blanket denial. That behavior has its own dedicated, fast-running
+// coverage in `tests/write_gate.rs` — asserting a *pending* or *denied*
+// gate outcome here would mean waiting out a real approval timeout, which
+// belongs to the gate's own test suite, not this general protocol-dispatch
+// one. `tool`'s denial, by contrast, is unconditional (no byte-level write
+// path exists for `tool` at all — see the Security-model wiki's policy
+// table: "tool 只能走 lease") and still belongs here.
 #[tokio::test]
-async fn agent_and_tool_writes_are_denied_pending_the_t4_1_rule_engine() {
+async fn tool_writes_have_no_byte_level_write_path() {
     let tmp_data = tempfile::tempdir().unwrap();
     let recorder =
         Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
@@ -1167,33 +1195,41 @@ async fn agent_and_tool_writes_are_denied_pending_the_t4_1_rule_engine() {
     backend.register(DeviceId("dev".to_string()), recorder);
     let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
 
-    for client_type in ["agent", "tool"] {
-        let (mut c, _ack) = Client::connect(&sock_path, "claude-code", client_type).await;
-        c.send(json!({
-            "id": 1, "op": "write", "device": "dev",
-            "text": "status", "line_ending": "lf",
-        }))
-        .await;
-        let reply = c.recv().await;
-        assert_eq!(
-            reply["ok"], false,
-            "{client_type} write must be denied: {reply}"
-        );
-        assert_eq!(
-            reply["error"]["code"], "permission_denied",
-            "{client_type} write: {reply}"
-        );
-    }
-    println!(
-        "acceptance (T2.1) #5 — agent and tool writes both denied (T4.1 gate not implemented)"
-    );
+    let (mut c, _ack) = Client::connect(&sock_path, "flasher", "tool").await;
+    c.send(json!({
+        "id": 1, "op": "write", "device": "dev",
+        "text": "status", "line_ending": "lf",
+    }))
+    .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], false, "tool write must be denied: {reply}");
+    assert_eq!(reply["error"]["code"], "permission_denied", "{reply}");
+    println!("acceptance (T2.3) — tool client has no byte-level write path, only a lease");
 }
 
 // ---- T2.3 acceptance criterion (demote): a demoted client's next write is denied ----
 
 #[tokio::test]
 async fn demote_denies_a_subsequent_write_from_a_previously_allowed_human_client() {
-    let (sock_path, _sockdir, _datadir, master) = start_daemon_with_writable_device("dev").await;
+    // A short gate timeout, not the 60s production default: after demote,
+    // the write below is no longer a bypassed `human` write but a gated
+    // one (`read+gated_write`) that matches neither whitelist nor danger,
+    // so it default-pends — this test only cares that it's denied, not how
+    // long that takes, and shouldn't have to wait 60 real seconds to see
+    // it (`TASKS.md` T4.1/T4.2, issues #14/#15).
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    let backend = Arc::new(TestBackend::new());
+    let id = DeviceId("dev".to_string());
+    backend.register(id.clone(), recorder);
+    let (master, slave) = open_raw_pty_pair();
+    backend.register_writer(&id, slave);
+    let mut rules = serialwrapd::gate::rules::RuleSet::builtin();
+    rules.timeout = Duration::from_millis(300);
+    let gate = Gate::new(rules, Arc::new(serialwrapd::gate::notify::DesktopNotifier));
+    let (sock_path, _sockdir) =
+        start_test_daemon_with_gate(backend as Arc<dyn DeviceBackend>, gate).await;
 
     let (mut writer, _ack) = Client::connect(&sock_path, "human-1", "human").await;
     writer
@@ -1241,7 +1277,22 @@ async fn demote_denies_a_subsequent_write_from_a_previously_allowed_human_client
         second["ok"], false,
         "write after demote must be denied: {second}"
     );
-    assert_eq!(second["error"]["code"], "permission_denied", "{second}");
+    // Demoted to `read+gated_write` (agent-equivalent): the write now goes
+    // through the real gate instead of a blanket `permission_denied`.
+    // `"no"` matches neither this test's (empty) whitelist nor any
+    // built-in danger pattern, so it default-pends and is then auto-denied
+    // once the short timeout above elapses. What this test actually
+    // protects — demote takes effect on the very next write from the same
+    // connection — holds regardless of exactly which gate outcome that
+    // write meets: what must never happen is it succeeding as if the
+    // connection were still `human`.
+    assert_eq!(second["error"]["code"], "write_denied", "{second}");
+    assert!(
+        second["error"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("timeout_")),
+        "{second}"
+    );
     println!(
         "acceptance (T2.3) — demote takes effect on the very next write from the same connection"
     );
