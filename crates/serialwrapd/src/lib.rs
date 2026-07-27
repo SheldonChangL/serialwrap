@@ -13,8 +13,12 @@
 //! device I/O, no recording, no protocol handling. See the module docs for
 //! which later task fills each one in.
 
+pub mod device_profile;
+pub mod error_counts;
 pub mod gate;
 pub mod port;
+pub mod port_config;
+pub mod port_io;
 pub mod query;
 pub mod recorder;
 

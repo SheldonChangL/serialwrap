@@ -13,14 +13,16 @@
 //!
 //! In scope: device identity ([`DeviceId`]), enumeration ([`DeviceEnumerator`],
 //! [`SystemEnumerator`]), polling-based hotplug detection
-//! ([`HotplugDetector`]), and the `connect`/`disconnect`/`open_failed`
-//! events that go with it.
+//! ([`HotplugDetector`]), the `connect`/`disconnect`/`open_failed` events
+//! that go with it, and — as of T1.3, issue #5 — port configuration
+//! (baud/data bits/parity/stop bits/flow control, DTR/RTS, error counts)
+//! layered on top of the same open fd. See [`crate::port_config`] for the
+//! pure configuration types/encoding and [`crate::port_io`] for the actual
+//! syscalls; this module wires both into the connect/reconnect/disconnect
+//! state machine below and exposes [`PortConfigApi`] as the seam later
+//! tasks (T1.4's UDS query layer) call into.
 //!
-//! Explicitly out of scope (later tasks): port configuration — baud,
-//! parity, DTR/RTS, error counters (T1.3); the UDS client protocol (T1.4).
-//! `HotplugDetector` opens the device with `O_NOCTTY` and nothing else —
-//! whatever termios state the device node already has is left alone, on
-//! purpose, until T1.3 owns that.
+//! Explicitly out of scope (later task): the UDS client protocol (T1.4).
 //!
 //! # Device identity
 //!
@@ -70,10 +72,9 @@
 //! is never throttled.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::AsFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -83,6 +84,10 @@ use std::time::{Duration, Instant};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use serde_json::{Map, Value};
 
+use crate::device_profile::{self, DeviceProfile, ProfileStore};
+use crate::error_counts::{self, ErrorCounts};
+use crate::port_config::PortConfig;
+use crate::port_io::{self, ControlLine};
 use crate::recorder::{Recorder, RecorderConfig};
 
 /// Stable identifier for a serial device.
@@ -384,10 +389,13 @@ const READER_POLL_TIMEOUT_MS: u16 = 100;
 /// Minimum time to wait before retrying an open at the *same* path right
 /// after a disconnect. Without this, a device that opens successfully but
 /// then immediately hits EOF on every read — e.g. a real tty left with
-/// `VMIN=0`-style termios by a crashed previous process, which this task
-/// deliberately does not configure (see the module docs; that's T1.3's
-/// job) — would spin connect/disconnect events and reader threads forever.
-/// A path change (genuine drift) is never subject to this cooldown; only a
+/// `VMIN=0`-style termios by a crashed previous process — would spin
+/// connect/disconnect events and reader threads forever (this module's own
+/// `port_io::apply_termios` sets `VMIN=1`/`VTIME=0` on every successful
+/// connect, but a device whose config application failed, or one this
+/// process has never successfully opened before, may still be left in
+/// whatever state a previous process — or nothing at all — configured). A
+/// path change (genuine drift) is never subject to this cooldown; only a
 /// retry at the exact same path is throttled.
 const RECONNECT_COOLDOWN: Duration = Duration::from_millis(500);
 
@@ -405,19 +413,6 @@ impl Default for HotplugConfig {
             recorder_config: RecorderConfig::default(),
         }
     }
-}
-
-/// Open a device path the way the daemon must: read/write, and `O_NOCTTY`
-/// so the daemon process never accidentally adopts the device as its
-/// controlling terminal (the same reasoning as `mock-device`'s own
-/// `open_slave`). Deliberately nothing else — no termios configuration, no
-/// baud, no raw-mode setup; that's T1.3's job to layer on top.
-fn open_device_path(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOCTTY)
-        .open(path)
 }
 
 /// Human-actionable description of a failure to `open()` a device's path:
@@ -611,6 +606,27 @@ fn stop_and_join_reader(state: ConnectionState) {
 /// the detector.
 pub type SharedRecorders = Arc<Mutex<HashMap<DeviceId, Arc<Recorder>>>>;
 
+/// One device's live configuration state: its persisted [`DeviceProfile`]
+/// plus, only while actually `Connected`, the shared fd config operations
+/// apply to. Kept in its own map (rather than folded into `TrackedDevice`,
+/// which stays private to the poll thread) specifically so it can be
+/// wrapped in an `Arc<Mutex<_>>` and handed out via [`PortConfigApi`] to
+/// callers outside the poll loop — e.g. a future T1.4 UDS client-handler
+/// thread — the same way [`SharedRecorders`] already is.
+struct LiveDeviceConfig {
+    profile: DeviceProfile,
+    /// `None` whenever the device isn't currently `Connected`. A config
+    /// change made while disconnected still updates `profile` and the
+    /// on-disk [`ProfileStore`]; it just has no live fd to re-apply to
+    /// until the device reconnects (see `HotplugDetector::attempt_open`).
+    fd: Option<Arc<File>>,
+}
+
+/// Thread-safe, shared view of every known device's live configuration
+/// state, keyed by [`DeviceId`]. See [`LiveDeviceConfig`] and
+/// [`PortConfigApi`].
+type SharedDeviceConfigs = Arc<Mutex<HashMap<DeviceId, LiveDeviceConfig>>>;
+
 /// Polls a [`DeviceEnumerator`] and drives the connect/disconnect/
 /// open-failed state machine described in the module docs.
 ///
@@ -628,6 +644,8 @@ pub struct HotplugDetector {
     disconnect_tx: mpsc::Sender<DisconnectNotice>,
     disconnect_rx: mpsc::Receiver<DisconnectNotice>,
     recorders: SharedRecorders,
+    configs: SharedDeviceConfigs,
+    profiles: Arc<ProfileStore>,
 }
 
 impl HotplugDetector {
@@ -637,15 +655,19 @@ impl HotplugDetector {
         config: HotplugConfig,
     ) -> Self {
         let (disconnect_tx, disconnect_rx) = mpsc::channel();
+        let data_dir = data_dir.into();
+        let profiles = Arc::new(ProfileStore::new(data_dir.clone()));
         Self {
             enumerator,
-            data_dir: data_dir.into(),
+            data_dir,
             platform: current_platform(),
             config,
             tracked: HashMap::new(),
             disconnect_tx,
             disconnect_rx,
             recorders: Arc::new(Mutex::new(HashMap::new())),
+            configs: Arc::new(Mutex::new(HashMap::new())),
+            profiles,
         }
     }
 
@@ -653,6 +675,17 @@ impl HotplugDetector {
     /// detector has ever opened. See [`SharedRecorders`].
     pub fn recorders(&self) -> SharedRecorders {
         Arc::clone(&self.recorders)
+    }
+
+    /// The seam T1.3's config API is exposed through — see
+    /// [`PortConfigApi`]. Safe to call and clone freely, before or after
+    /// [`Self::spawn`]; every clone shares the same underlying state.
+    pub fn port_config_api(&self) -> PortConfigApi {
+        PortConfigApi {
+            configs: Arc::clone(&self.configs),
+            recorders: Arc::clone(&self.recorders),
+            profiles: Arc::clone(&self.profiles),
+        }
     }
 
     /// Run exactly one enumerate-and-reconcile cycle: drain pending
@@ -681,6 +714,8 @@ impl HotplugDetector {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let recorders = Arc::clone(&self.recorders);
+        let configs = Arc::clone(&self.configs);
+        let profiles = Arc::clone(&self.profiles);
         let poll_interval = self.config.poll_interval;
 
         let join = thread::spawn(move || {
@@ -716,6 +751,8 @@ impl HotplugDetector {
             stop,
             join: Some(join),
             recorders,
+            configs,
+            profiles,
         }
     }
 
@@ -766,6 +803,7 @@ impl HotplugDetector {
                     );
                     stop_and_join_reader(old);
                 }
+                self.clear_live_fd(&id);
                 self.attempt_open(id, dev);
             }
             PresentAction::AlreadyConnected | PresentAction::CooldownSkip => {}
@@ -788,6 +826,31 @@ impl HotplugDetector {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.clone(), Arc::clone(&recorder));
+
+        // Load this device's persisted profile (if any) the first time
+        // it's ever seen — falls back to `DeviceProfile::default()` for a
+        // brand-new device, or if the saved profile fails to load (logged,
+        // never fatal to detection: see the module docs' general
+        // best-effort stance on config application).
+        {
+            let mut configs = self.configs.lock().unwrap_or_else(|e| e.into_inner());
+            if !configs.contains_key(&id) {
+                let profile = match self.profiles.load(&id.0) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => DeviceProfile::default(),
+                    Err(e) => {
+                        eprintln!(
+                            "serialwrapd: port: failed to load saved profile for {} (using \
+                             default): {e}",
+                            id.0
+                        );
+                        DeviceProfile::default()
+                    }
+                };
+                configs.insert(id.clone(), LiveDeviceConfig { profile, fd: None });
+            }
+        }
+
         self.tracked.insert(
             id.clone(),
             TrackedDevice {
@@ -813,21 +876,81 @@ impl HotplugDetector {
                 .recorder,
         );
 
-        match open_device_path(&dev.path) {
-            Ok(file) => {
+        // The config to apply is always this device's *current* live
+        // profile — freshly loaded in `handle_new_device` for a brand-new
+        // device, or whatever a `PortConfigApi::set_port_config` call
+        // updated it to since (persisted, so it survives a full daemon
+        // restart too). This is what makes "reconnect re-applies the saved
+        // profile" true: the same `DeviceId` always maps to the same
+        // config entry, regardless of how many times it disconnects and
+        // reconnects (possibly at a different path — see the module docs
+        // on device identity).
+        let config = {
+            let configs = self.configs.lock().unwrap_or_else(|e| e.into_inner());
+            configs
+                .get(&id)
+                .map(|c| c.profile.config.clone())
+                .unwrap_or_default()
+        };
+
+        match port_io::open_and_configure(&dev.path, &config) {
+            Ok((file, config_err)) => {
+                if let Some(e) = config_err {
+                    // Best-effort: see `port_io`'s module docs for why a
+                    // config-application failure (e.g. IOSSIOSPEED's
+                    // documented, empirically-confirmed ENOTTY against a
+                    // PTY, or a fake test device that isn't a tty at all)
+                    // must not be treated the same as a failure to open
+                    // the device at all — the device is still connected
+                    // and still recording raw bytes either way.
+                    eprintln!(
+                        "serialwrapd: port: config application for {} did not fully apply (device \
+                         is still connected and recording): {e}",
+                        id.0
+                    );
+                }
                 if let Err(e) = append_connect_event(&recorder, &id, &dev.path, dev.usb.as_ref()) {
                     eprintln!(
                         "serialwrapd: port: failed to append connect event for {}: {e}",
                         id.0
                     );
                 }
+                if let Err(e) = device_profile::append_config_change_event(
+                    &recorder,
+                    None,
+                    &config,
+                    "system:connect",
+                ) {
+                    eprintln!(
+                        "serialwrapd: port: failed to append config_change event for {}: {e}",
+                        id.0
+                    );
+                }
+
+                let file = Arc::new(file);
+                if let Some(entry) = self
+                    .configs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&id)
+                {
+                    entry.fd = Some(Arc::clone(&file));
+                }
+
                 let stop = Arc::new(AtomicBool::new(false));
                 let reader_stop = Arc::clone(&stop);
                 let reader_tx = self.disconnect_tx.clone();
                 let reader_id = id.clone();
                 let reader_recorder = Arc::clone(&recorder);
+                let reader_file = Arc::clone(&file);
                 let reader = thread::spawn(move || {
-                    run_reader(file, reader_id, reader_recorder, reader_tx, reader_stop);
+                    run_reader(
+                        reader_file,
+                        reader_id,
+                        reader_recorder,
+                        reader_tx,
+                        reader_stop,
+                    );
                 });
 
                 if let Some(tracked) = self.tracked.get_mut(&id) {
@@ -906,6 +1029,23 @@ impl HotplugDetector {
                 // because a long wait is expected here.
                 stop_and_join_reader(old);
             }
+            self.clear_live_fd(&notice.device_id);
+        }
+    }
+
+    /// Clear a device's live fd from the shared config map (see
+    /// [`LiveDeviceConfig`]) — called from every place a device transitions
+    /// away from `Connected`, so [`PortConfigApi`] never operates on a
+    /// stale fd for a device that's actually disconnected. The persisted
+    /// profile itself is untouched; only the live-fd handle goes away.
+    fn clear_live_fd(&self, id: &DeviceId) {
+        if let Some(entry) = self
+            .configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(id)
+        {
+            entry.fd = None;
         }
     }
 
@@ -928,6 +1068,12 @@ impl HotplugDetector {
             })
             .map(|(id, _)| id.clone())
             .collect();
+
+        // Collected rather than cleared inline: `clear_live_fd` takes
+        // `&self` (it only touches `self.configs`), which would otherwise
+        // conflict with the `&mut self.tracked` borrow `tracked` holds for
+        // the rest of this loop body.
+        let mut newly_disconnected = Vec::new();
 
         for id in missing_ids {
             let Some(tracked) = self.tracked.get_mut(&id) else {
@@ -956,6 +1102,7 @@ impl HotplugDetector {
                         );
                     }
                     stop_and_join_reader(old);
+                    newly_disconnected.push(id);
                 }
                 ConnectionState::OpenFailed { .. } => {
                     // No event: nothing was ever actually connected to
@@ -973,12 +1120,28 @@ impl HotplugDetector {
                 _ => {}
             }
         }
+
+        for id in &newly_disconnected {
+            self.clear_live_fd(id);
+        }
     }
 }
 
 /// Read loop for one connected device: copies whatever bytes arrive
-/// straight into the recorder as `rx` records (no line assembly, no
-/// termios configuration — see the module docs).
+/// straight into the recorder as `rx` records (no line assembly — see
+/// the module docs).
+///
+/// Takes `Arc<File>` (shared with `LiveDeviceConfig::fd`, see that type's
+/// docs) rather than owning the `File` outright: `PortConfigApi` needs to
+/// issue termios/`TIOCM*` ioctls against the exact same fd this thread
+/// reads from, and POSIX termios/control-line state belongs to the
+/// underlying tty, not to any one fd/thread — sharing the same `Arc<File>`
+/// (rather than a second independent `open()` of the same path) is what
+/// guarantees both sides are always looking at the same open file
+/// description with no risk of racing a second exclusive-mode open.
+/// Reading through `&File` (via `impl Read for &File`) rather than
+/// `&mut File` is what makes this safe to share: nothing here ever needs
+/// exclusive access to `file` itself, only to `buf`.
 ///
 /// Polls with a short timeout ([`READER_POLL_TIMEOUT_MS`]) rather than
 /// calling a plain blocking `read()`, so `stop` (set by
@@ -994,7 +1157,7 @@ impl HotplugDetector {
 /// because `read` returned EOF/an error (a real disconnect — reported via
 /// `tx`).
 fn run_reader(
-    mut file: File,
+    file: Arc<File>,
     device_id: DeviceId,
     recorder: Arc<Recorder>,
     tx: mpsc::Sender<DisconnectNotice>,
@@ -1005,6 +1168,7 @@ fn run_reader(
     // sustained failure (e.g. a full disk) produces one diagnostic line
     // instead of one per incoming chunk at line rate.
     let mut logged_append_failure = false;
+    let mut file_ref: &File = file.as_ref();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -1027,7 +1191,7 @@ fn run_reader(
             }
         }
 
-        match file.read(&mut buf) {
+        match file_ref.read(&mut buf) {
             Ok(0) => {
                 let _ = tx.send(DisconnectNotice {
                     device_id,
@@ -1064,6 +1228,8 @@ pub struct DetectorHandle {
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     recorders: SharedRecorders,
+    configs: SharedDeviceConfigs,
+    profiles: Arc<ProfileStore>,
 }
 
 impl DetectorHandle {
@@ -1071,6 +1237,15 @@ impl DetectorHandle {
     /// detector has opened. See [`SharedRecorders`].
     pub fn recorders(&self) -> SharedRecorders {
         Arc::clone(&self.recorders)
+    }
+
+    /// See [`HotplugDetector::port_config_api`].
+    pub fn port_config_api(&self) -> PortConfigApi {
+        PortConfigApi {
+            configs: Arc::clone(&self.configs),
+            recorders: Arc::clone(&self.recorders),
+            profiles: Arc::clone(&self.profiles),
+        }
     }
 
     /// Signal the poll loop to stop and wait for it to actually exit.
@@ -1091,6 +1266,169 @@ impl Drop for DetectorHandle {
         // caller drops the handle without calling `stop()` explicitly.
         // Doesn't join (avoids blocking an unrelated unwind/drop).
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The seam through which anything outside the poll loop — currently only
+/// this crate's own tests, but the intended caller is T1.4's future UDS
+/// client-handler threads — reads and changes a device's shared port
+/// configuration. Cheap to clone (every field is an `Arc`); every clone
+/// operates on the exact same underlying state as the [`HotplugDetector`]
+/// (or [`DetectorHandle`]) it came from.
+///
+/// This is where this task's "config is shared state" requirement actually
+/// lives: there is one [`PortConfig`] per [`DeviceId`], not one per caller,
+/// so a change made through any clone of this API is immediately visible
+/// (and, if the device is connected, immediately re-applied to the one fd)
+/// to every other holder — including the poll thread's own next reconnect.
+#[derive(Clone)]
+pub struct PortConfigApi {
+    configs: SharedDeviceConfigs,
+    recorders: SharedRecorders,
+    profiles: Arc<ProfileStore>,
+}
+
+impl PortConfigApi {
+    /// Change `id`'s port configuration (baud/data bits/parity/stop
+    /// bits/flow control/open-time DTR-RTS policy): persist it (so a
+    /// future reconnect — or daemon restart — re-applies it, see
+    /// `port.rs`'s `attempt_open`), re-apply it live if the device is
+    /// currently connected, and append a `config_change` event carrying
+    /// the full old/new values and `changed_by`.
+    ///
+    /// Errors with [`io::ErrorKind::NotFound`] if `id` has never been seen
+    /// by the detector at all. A live re-application failure (e.g. a real
+    /// ioctl error) is logged, not returned — matching `attempt_open`'s
+    /// own "config problems don't fail the operation" stance (see
+    /// `port_io`'s module docs) — because the new config *has* been
+    /// durably persisted and will be attempted again on the next
+    /// reconnect regardless.
+    pub fn set_port_config(
+        &self,
+        id: &DeviceId,
+        new_config: PortConfig,
+        changed_by: &str,
+    ) -> io::Result<()> {
+        let (old_config, fd) = {
+            let mut configs = self.configs.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = configs.get_mut(id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("unknown device {}", id.0))
+            })?;
+            let old_config = entry.profile.config.clone();
+            entry.profile.config = new_config.clone();
+            self.profiles.save(&id.0, &entry.profile)?;
+            (old_config, entry.fd.clone())
+        };
+
+        if let Some(fd) = fd {
+            if let Err(e) = port_io::apply_termios(fd.as_raw_fd(), &new_config) {
+                eprintln!(
+                    "serialwrapd: port: failed to live-apply new config for {} (persisted; will \
+                     be retried on next reconnect): {e}",
+                    id.0
+                );
+            }
+        }
+
+        if let Some(recorder) = self
+            .recorders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+        {
+            device_profile::append_config_change_event(
+                recorder,
+                Some(&old_config),
+                &new_config,
+                changed_by,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Manually assert/deassert DTR. Errors with
+    /// [`io::ErrorKind::NotConnected`] if the device isn't currently
+    /// connected (there is no live fd to touch). Appends a
+    /// `control_line_change` event — distinct from `config_change` and
+    /// from `dtr_pulse` (see `device_profile.rs`'s event-naming docs).
+    pub fn set_dtr(&self, id: &DeviceId, level: bool, changed_by: &str) -> io::Result<()> {
+        self.set_control_line(id, ControlLine::Dtr, level, changed_by)
+    }
+
+    /// Manually assert/deassert RTS. See [`Self::set_dtr`].
+    pub fn set_rts(&self, id: &DeviceId, level: bool, changed_by: &str) -> io::Result<()> {
+        self.set_control_line(id, ControlLine::Rts, level, changed_by)
+    }
+
+    fn set_control_line(
+        &self,
+        id: &DeviceId,
+        line: ControlLine,
+        level: bool,
+        changed_by: &str,
+    ) -> io::Result<()> {
+        let fd = self.live_fd(id)?;
+        port_io::set_control_line(fd.as_raw_fd(), line, level)?;
+        if let Some(recorder) = self
+            .recorders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+        {
+            device_profile::append_control_line_change_event(
+                recorder,
+                line.as_str(),
+                level,
+                changed_by,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Pulse DTR (deassert, hold, reassert) — the independently-named
+    /// reset-shaped operation this task's issue specifically calls for
+    /// (see `port_io::dtr_pulse`'s and `device_profile.rs`'s docs). Errors
+    /// with [`io::ErrorKind::NotConnected`] if the device isn't currently
+    /// connected.
+    pub fn dtr_pulse(&self, id: &DeviceId, duration: Duration, changed_by: &str) -> io::Result<()> {
+        let fd = self.live_fd(id)?;
+        port_io::dtr_pulse(fd.as_raw_fd(), duration)?;
+        if let Some(recorder) = self
+            .recorders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+        {
+            device_profile::append_dtr_pulse_event(
+                recorder,
+                duration.as_millis() as u64,
+                changed_by,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Read `id`'s framing/overrun/parity error counters for the host
+    /// platform — [`ErrorCounts::Unavailable`] on macOS, never a
+    /// misleading `0` (see `error_counts.rs`'s module docs). Errors with
+    /// [`io::ErrorKind::NotConnected`] if the device isn't currently
+    /// connected.
+    pub fn error_counts(&self, id: &DeviceId) -> io::Result<ErrorCounts> {
+        let fd = self.live_fd(id)?;
+        error_counts::read_error_counts(current_platform(), fd.as_raw_fd())
+    }
+
+    fn live_fd(&self, id: &DeviceId) -> io::Result<Arc<File>> {
+        let configs = self.configs.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = configs.get(id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("unknown device {}", id.0))
+        })?;
+        entry.fd.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("device {} is not connected", id.0),
+            )
+        })
     }
 }
 
