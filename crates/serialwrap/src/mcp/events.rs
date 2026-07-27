@@ -31,6 +31,51 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
+/// Reconstruct a [`serialwrapd::query::OobRecord`] from one daemon wire
+/// event object (`TASKS.md` T3.2, issue #13) — the mirror image of
+/// `crate::mcp::line::assembled_line_from_wire`, needed for the same
+/// reason: this bridge calls `serialwrapd::presentation::present` directly
+/// (reusing the daemon crate's own logic rather than reimplementing it),
+/// which takes real `OobRecord`s, not wire JSON. Every field this produces
+/// round-trips back through `serialwrapd::presentation::event_to_json` to
+/// the identical wire shape the daemon itself sent (same field names as
+/// `serialwrapd::protocol::session`'s private `oob_json`).
+pub fn oob_from_wire(v: &Value) -> serialwrapd::query::OobRecord {
+    use serialwrapd::query::OobRecord;
+    use wrap_proto::Kind;
+
+    let kind = match v.get("kind").and_then(Value::as_str) {
+        Some("rx") => Kind::Rx,
+        Some("tx") => Kind::Tx,
+        Some("gate") => Kind::Gate,
+        _ => Kind::Event,
+    };
+    let name = v
+        .get("event")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+    let mut extra = serde_json::Map::new();
+    if let Some(obj) = v.as_object() {
+        for (k, val) in obj {
+            if !matches!(k.as_str(), "seq" | "t_mono" | "t_wall" | "kind" | "event") {
+                extra.insert(k.clone(), val.clone());
+            }
+        }
+    }
+    OobRecord {
+        seq: v.get("seq").and_then(Value::as_u64).unwrap_or(0),
+        t_mono: v.get("t_mono").and_then(Value::as_f64).unwrap_or(0.0),
+        t_wall: v
+            .get("t_wall")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        kind,
+        name,
+        extra,
+    }
+}
+
 #[derive(Default)]
 pub struct EventWatermarks {
     /// device id -> lowest event `seq` not yet delivered.
@@ -115,6 +160,39 @@ impl EventWatermarks {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn oob_from_wire_round_trips_an_event_record() {
+        let wire = json!({
+            "seq": 3, "t_mono": 1.5, "t_wall": "t3", "kind": "event",
+            "event": "disconnect", "device_id": "usb-1",
+        });
+        let record = oob_from_wire(&wire);
+        assert_eq!(record.seq, 3);
+        assert_eq!(record.kind, wrap_proto::Kind::Event);
+        assert_eq!(record.name.as_deref(), Some("disconnect"));
+        assert_eq!(
+            record.extra.get("device_id").and_then(Value::as_str),
+            Some("usb-1")
+        );
+        // Round-trips back to the identical wire shape.
+        assert_eq!(serialwrapd::presentation::event_to_json(&record), wire);
+    }
+
+    #[test]
+    fn oob_from_wire_round_trips_a_gate_record() {
+        let wire = json!({
+            "seq": 9, "t_mono": 2.0, "t_wall": "t9", "kind": "gate",
+            "action": "deny", "reason": "timeout_60s", "request_seq": 1,
+        });
+        let record = oob_from_wire(&wire);
+        assert_eq!(record.kind, wrap_proto::Kind::Gate);
+        assert!(record.name.is_none());
+        assert_eq!(
+            record.extra.get("action").and_then(Value::as_str),
+            Some("deny")
+        );
+    }
 
     #[test]
     fn fresh_device_starts_at_watermark_zero() {

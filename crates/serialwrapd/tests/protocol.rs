@@ -635,6 +635,97 @@ async fn a_valid_utf8_line_never_carries_a_redundant_raw_b64() {
     );
 }
 
+// ---- Issue #13 (T3.2): wait_for's matched line carries raw_b64 too ----
+//
+// T3.1 found (and documented as a known limitation) that
+// `query::WaitForOutcome::Matched` only ever carried the matched line's
+// lossy `text`, discarding `AssembledLine::raw` before it reached the wire
+// — the same byte-fidelity gap issue #32 had already fixed for
+// `tail`/`read_since`. These two tests are the wire-level proof of the fix:
+// same `raw_b64`-present-only-when-not-valid-UTF-8 rule `line_json` already
+// uses, now applied to `wait_for`'s own reply too.
+
+#[tokio::test]
+async fn wait_for_matched_invalid_utf8_line_carries_raw_b64() {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "waiter", "agent").await;
+
+    // Ordinary text with a deliberately invalid UTF-8 run spliced in --
+    // exactly the same fixture shape the `tail`/`read_since` byte-fidelity
+    // tests above use.
+    let mut original = b"status:".to_vec();
+    original.extend_from_slice(&[0xFF, 0xFE, 0x80]);
+    let mut with_newline = original.clone();
+    with_newline.push(b'\n');
+
+    c.send(
+        json!({"id": 1, "op": "wait_for", "device": "dev", "pattern": "^status:", "timeout_s": 3.0}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    recorder.append_rx(&with_newline).unwrap();
+
+    let reply = tokio::time::timeout(Duration::from_secs(2), c.recv())
+        .await
+        .expect("a match within 2s");
+    assert_eq!(reply["ok"], true, "wait_for failed: {reply}");
+    assert_eq!(reply["result"], "matched", "reply: {reply}");
+
+    let raw_b64 = reply["raw_b64"]
+        .as_str()
+        .unwrap_or_else(|| panic!("invalid-UTF-8 matched line must carry raw_b64: {reply}"));
+    let decoded = BASE64
+        .decode(raw_b64)
+        .expect("raw_b64 must be valid base64");
+    assert_eq!(
+        decoded, original,
+        "raw_b64 must decode to the exact matched bytes, not a lossy reconstruction"
+    );
+
+    let mut original_hasher = Sha256::new();
+    original_hasher.update(&original);
+    let mut decoded_hasher = Sha256::new();
+    decoded_hasher.update(&decoded);
+    assert_eq!(
+        format!("{:x}", original_hasher.finalize()),
+        format!("{:x}", decoded_hasher.finalize()),
+        "sha256(original) must match sha256(decoded raw_b64)"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_matched_valid_utf8_line_never_carries_a_redundant_raw_b64() {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "waiter", "agent").await;
+
+    c.send(
+        json!({"id": 1, "op": "wait_for", "device": "dev", "pattern": "boot ok", "timeout_s": 3.0}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    recorder.append_rx(b"boot ok\n").unwrap();
+
+    let reply = tokio::time::timeout(Duration::from_secs(2), c.recv())
+        .await
+        .expect("a match within 2s");
+    assert_eq!(reply["ok"], true, "wait_for failed: {reply}");
+    assert_eq!(reply["result"], "matched", "reply: {reply}");
+    assert!(
+        reply.get("raw_b64").is_none(),
+        "a matched line that's already valid UTF-8 must not pay the raw_b64 bandwidth cost: {reply}"
+    );
+}
+
 // ---- Issue #32 acceptance criterion 2: subscribe(since_cursor) has no gap ----
 
 #[tokio::test]

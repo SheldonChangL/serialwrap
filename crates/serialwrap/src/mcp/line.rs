@@ -47,49 +47,34 @@ pub fn hex_encode(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-/// Reshape one daemon `tail`/`read_since` line object into this bridge's
-/// tool-result shape: always `seq`/`t_mono`/`t_wall`/`text`/`binary`, plus
-/// `raw_hex` — computed via [`exact_bytes`], **never** from the lossy
-/// `text` field — only when `binary` is true (i.e. only when the daemon
-/// sent a `raw_b64`, meaning this line's bytes are not valid UTF-8).
+/// Reconstruct a [`serialwrapd::query::AssembledLine`] from one daemon
+/// `tail`/`read_since` wire line object (`TASKS.md` T3.2, issue #13).
 ///
-/// `binary`/`raw_hex` rather than passing `raw_b64` straight through: an
-/// agent consuming this tool's JSON output reads hex far more reliably than
-/// base64 (no risk of it being mistaken for arbitrary embeddable text), and
-/// the acceptance criterion this exists for is specifically that a binary
-/// line's summary is demonstrably derived from the real bytes, not the
-/// lossy display string.
-pub fn map_line(line: &Value) -> Value {
-    let binary = line.get("raw_b64").is_some();
-    let mut obj = serde_json::Map::new();
-    obj.insert(
-        "seq".to_string(),
-        line.get("seq").cloned().unwrap_or(Value::Null),
-    );
-    obj.insert(
-        "t_mono".to_string(),
-        line.get("t_mono").cloned().unwrap_or(Value::Null),
-    );
-    obj.insert(
-        "t_wall".to_string(),
-        line.get("t_wall").cloned().unwrap_or(Value::Null),
-    );
-    obj.insert(
-        "text".to_string(),
-        line.get("text").cloned().unwrap_or(Value::Null),
-    );
-    obj.insert("binary".to_string(), Value::Bool(binary));
-    if binary {
-        obj.insert(
-            "raw_hex".to_string(),
-            Value::String(hex_encode(&exact_bytes(line))),
-        );
+/// This bridge is a *separate process* from the daemon, so it can never
+/// reach into a live [`serialwrapd::query::DeviceQueryState`] directly —
+/// but it can, and does, link `serialwrapd` as an ordinary library
+/// dependency (see that crate's `presentation` module docs on why this is
+/// the intended reuse story for both this bridge and the future GUI). The
+/// wire line JSON already carries every field losslessly (see the
+/// raw_b64 rule above), so reconstructing the exact same struct
+/// [`serialwrapd::presentation::present`] operates on is just a matter of
+/// reading them back out — never a lossy approximation.
+pub fn assembled_line_from_wire(line: &Value) -> serialwrapd::query::AssembledLine {
+    serialwrapd::query::AssembledLine {
+        raw: exact_bytes(line),
+        text: line
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        seq: line.get("seq").and_then(Value::as_u64).unwrap_or(0),
+        t_mono: line.get("t_mono").and_then(Value::as_f64).unwrap_or(0.0),
+        t_wall: line
+            .get("t_wall")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
     }
-    Value::Object(obj)
-}
-
-pub fn map_lines(lines: &[Value]) -> Vec<Value> {
-    lines.iter().map(map_line).collect()
 }
 
 #[cfg(test)]
@@ -98,42 +83,57 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn valid_utf8_line_has_no_raw_hex_and_is_not_marked_binary() {
-        let line = json!({"text": "hello", "seq": 1, "t_mono": 1.0, "t_wall": "t"});
-        let mapped = map_line(&line);
-        assert_eq!(mapped["binary"], false);
-        assert!(mapped.get("raw_hex").is_none());
-        assert_eq!(mapped["text"], "hello");
-    }
-
-    #[test]
     fn exact_bytes_falls_back_to_texts_own_bytes_when_raw_b64_absent() {
         let line = json!({"text": "hello", "seq": 1, "t_mono": 1.0, "t_wall": "t"});
         assert_eq!(exact_bytes(&line), b"hello".to_vec());
     }
 
     #[test]
-    fn binary_line_derives_raw_hex_from_raw_b64_not_from_lossy_text() {
+    fn assembled_line_from_wire_round_trips_every_field() {
+        let original: Vec<u8> = vec![0xFF, 0xFE, b'z'];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&original);
+        let wire = json!({
+            "text": String::from_utf8_lossy(&original),
+            "raw_b64": b64,
+            "seq": 42,
+            "t_mono": 3.5,
+            "t_wall": "2026-07-27T00:00:00Z",
+        });
+        let reconstructed = assembled_line_from_wire(&wire);
+        assert_eq!(reconstructed.raw, original);
+        assert_eq!(reconstructed.seq, 42);
+        assert_eq!(reconstructed.t_mono, 3.5);
+        assert_eq!(reconstructed.t_wall, "2026-07-27T00:00:00Z");
+    }
+
+    #[test]
+    fn assembled_line_from_wire_recovers_raw_from_text_when_raw_b64_absent() {
+        let wire = json!({"text": "plain", "seq": 1, "t_mono": 0.0, "t_wall": "t"});
+        let reconstructed = assembled_line_from_wire(&wire);
+        assert_eq!(reconstructed.raw, b"plain".to_vec());
+        assert_eq!(reconstructed.text, "plain");
+    }
+
+    #[test]
+    fn assembled_line_from_wire_derives_raw_from_raw_b64_not_from_lossy_text() {
         // Deliberately invalid UTF-8 bytes the daemon would have sent as
         // raw_b64, with `text` holding the lossy U+FFFD replacement form —
         // exactly issue #32's scenario.
         let original: Vec<u8> = vec![0xFF, 0xFE, b'x'];
         let b64 = base64::engine::general_purpose::STANDARD.encode(&original);
-        let line = json!({
+        let wire = json!({
             "text": String::from_utf8_lossy(&original),
             "raw_b64": b64,
             "seq": 5,
             "t_mono": 2.0,
             "t_wall": "t",
         });
-        let mapped = map_line(&line);
-        assert_eq!(mapped["binary"], true);
-        let raw_hex = mapped["raw_hex"].as_str().unwrap();
-        assert_eq!(raw_hex, hex_encode(&original));
+        let reconstructed = assembled_line_from_wire(&wire);
+        assert_eq!(reconstructed.raw, original);
         // The replacement character's own UTF-8 bytes (ef bf bd) must never
-        // appear in the hex derived from raw_b64 — proving it wasn't
-        // computed from the lossy `text` field.
-        assert!(!raw_hex.contains("ef bf bd"));
+        // appear in the reconstructed raw bytes — proving they weren't
+        // derived from the lossy `text` field.
+        assert_ne!(reconstructed.raw, "\u{FFFD}\u{FFFD}x".as_bytes());
     }
 
     #[test]

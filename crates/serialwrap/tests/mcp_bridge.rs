@@ -640,3 +640,269 @@ async fn read_since_cursor_from_tail_continues_without_gap_or_duplicate() {
 
     mcp.shutdown().await;
 }
+
+// ---- T3.2 (issue #13): context-protection presentation layer ----
+//
+// The tests below exercise the presentation layer end to end: real daemon,
+// real `serialwrap mcp` subprocess, wire round trip and all — not just
+// `serialwrapd::presentation`'s own (much more exhaustive) unit tests. Those
+// unit tests are the authoritative proof of the folding/binary/cursor
+// invariants across many small and adversarial cases; these confirm the
+// wiring (wire reconstruction -> `present` -> tool JSON) is correct for the
+// literal acceptance-criterion scenarios.
+
+/// Pull a `binary_summary` (if present) or the line's own `text` out of a
+/// `tail`/`read_since` line-or-fold JSON entry, plus the raw seq range it
+/// covers -- used by the cursor-equivalence test below to compare a
+/// paginated read against a whole one regardless of exactly where fold
+/// boundaries happened to fall.
+fn expand_presented_lines(lines: &[Value]) -> Vec<(u64, String)> {
+    let mut out = Vec::new();
+    for l in lines {
+        let content_key = if let Some(summary) = l.get("binary_summary") {
+            format!("bin:{}:{}", summary["length"], summary["hex_preview"])
+        } else {
+            format!("text:{}", l["text"])
+        };
+        if l.get("folded") == Some(&Value::Bool(true)) {
+            let first = l["first_seq"].as_u64().expect("first_seq");
+            let last = l["last_seq"].as_u64().expect("last_seq");
+            for seq in first..=last {
+                out.push((seq, content_key.clone()));
+            }
+        } else {
+            out.push((l["seq"].as_u64().expect("seq"), content_key));
+        }
+    }
+    out
+}
+
+// ---- Acceptance criterion 1: 1MB binary -> tail response <=8KB, with a
+// length + hex-preview summary ----
+
+#[tokio::test]
+async fn binary_stream_over_1mb_is_summarized_into_a_capped_tail_response() {
+    let (daemon, recorder) = start_daemon_with_empty_device("dev").await;
+    // Deterministic 1MB "binary" stream: cycle every byte value 0..=255.
+    // Byte value 0x0A (10) recurs roughly every 256 bytes and acts as this
+    // stream's own line terminator -- exactly like a real mixed-encoding
+    // device dump that happens to contain 0x0A among the noise.
+    let payload: Vec<u8> = (0..1_000_000usize).map(|i| (i % 256) as u8).collect();
+    recorder
+        .append_rx(&payload)
+        .expect("append 1MB binary payload");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut mcp = McpProcess::spawn(&daemon.socket_path);
+    mcp.initialize().await;
+
+    let tail_result = mcp
+        .call_tool("tail", json!({"device": "dev", "n": 100_000}))
+        .await;
+    let response_bytes = serde_json::to_string(&tail_result).unwrap().len();
+    let lines = tail_result["lines"].as_array().expect("lines array");
+    assert!(
+        !lines.is_empty(),
+        "expected at least one assembled line from the 1MB payload"
+    );
+    let summary = lines
+        .iter()
+        .find_map(|l| l.get("binary_summary"))
+        .unwrap_or_else(|| panic!("expected at least one binary_summary entry: {tail_result}"));
+    let length = summary["length"].as_u64().expect("length field");
+    let hex_preview = summary["hex_preview"].as_str().expect("hex_preview field");
+    assert!(length > 0, "summary: {summary}");
+    assert!(!hex_preview.is_empty(), "summary: {summary}");
+    assert!(
+        response_bytes <= 8192,
+        "tail response was {response_bytes} bytes, expected <= 8192 (truncated={}, {} presented \
+         line entries)",
+        tail_result["truncated"],
+        lines.len()
+    );
+    println!(
+        "acceptance (T3.2 #1) — 1MB binary -> tail response {response_bytes} bytes (<=8192); \
+         {} presented line entries; sample binary_summary length={length}",
+        lines.len()
+    );
+
+    mcp.shutdown().await;
+}
+
+// ---- Acceptance criterion 2: 100k duplicate lines fold with the exact
+// count ----
+
+#[tokio::test]
+#[ignore = "100k-line acceptance-criterion reproduction; run via `cargo test -- --ignored` \
+            (also wired into CI). Small/fast folding coverage (including the fold-vs-event \
+            boundary invariant) lives in serialwrapd::presentation's own unit tests."]
+async fn one_hundred_thousand_duplicate_lines_fold_with_the_exact_count_via_tail() {
+    let (daemon, recorder) = start_daemon_with_empty_device("dev").await;
+    for _ in 0..100_000 {
+        recorder.append_rx(b"read timeout\n").expect("append rx");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut mcp = McpProcess::spawn(&daemon.socket_path);
+    mcp.initialize().await;
+
+    let tail_result = mcp
+        .call_tool("tail", json!({"device": "dev", "n": 200_000}))
+        .await;
+    let lines = tail_result["lines"].as_array().expect("lines array");
+    let fold = lines
+        .iter()
+        .find(|l| l.get("folded") == Some(&Value::Bool(true)))
+        .unwrap_or_else(|| panic!("expected a folded entry: {tail_result}"));
+    let count = fold["count"].as_u64().expect("count field");
+    assert_eq!(
+        count, 100_000,
+        "fold count must exactly equal the number of injected duplicate lines"
+    );
+    let response_bytes = serde_json::to_string(&tail_result).unwrap().len();
+    println!(
+        "acceptance (T3.2 #2) — 100000 duplicate lines -> tail response {response_bytes} bytes, \
+         folded count={count}, truncated={}",
+        tail_result["truncated"]
+    );
+
+    mcp.shutdown().await;
+}
+
+// ---- Acceptance criterion 3: cursor pagination with folding+truncation
+// both enabled matches a whole read exactly ----
+
+#[tokio::test]
+async fn cursor_pagination_with_folding_and_truncation_matches_a_whole_read() {
+    let (daemon, recorder) = start_daemon_with_empty_device("dev").await;
+    for i in 0..5 {
+        recorder
+            .append_rx(format!("alpha-{i}\n").as_bytes())
+            .expect("append rx");
+    }
+    for _ in 0..6 {
+        recorder.append_rx(b"dup-a\n").expect("append rx");
+    }
+    recorder
+        .append_event("disconnect", serde_json::Map::new())
+        .expect("append event");
+    for _ in 0..4 {
+        recorder.append_rx(b"dup-b\n").expect("append rx");
+    }
+    for i in 0..5 {
+        recorder
+            .append_rx(format!("beta-{i}\n").as_bytes())
+            .expect("append rx");
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut mcp = McpProcess::spawn(&daemon.socket_path);
+    mcp.initialize().await;
+
+    // "Whole read": one `tail` call, generous enough that nothing needs
+    // truncating (the wiki's own default 8KB cap is already far more than
+    // this small dataset needs).
+    let whole = mcp
+        .call_tool("tail", json!({"device": "dev", "n": 1000}))
+        .await;
+    assert_eq!(whole["truncated"], false, "whole read: {whole}");
+    let whole_trace = expand_presented_lines(whole["lines"].as_array().unwrap());
+    let whole_event_count = whole["events"].as_array().unwrap().len();
+    assert_eq!(whole_event_count, 1, "whole read events: {whole}");
+
+    // Paginated: a tiny `max_result_bytes` forces many `read_since` round
+    // trips, with folding still enabled throughout.
+    let mut cursor = 0u64;
+    let mut paginated_trace = Vec::new();
+    let mut paginated_event_count = 0usize;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages < 500, "must terminate; possible infinite loop");
+        let page = mcp
+            .call_tool(
+                "read_since",
+                json!({"device": "dev", "cursor": cursor, "max_result_bytes": 40}),
+            )
+            .await;
+        let lines = page["lines"].as_array().expect("lines array");
+        let events = page["events"].as_array().expect("events array");
+        if lines.is_empty() && events.is_empty() {
+            break;
+        }
+        paginated_trace.extend(expand_presented_lines(lines));
+        paginated_event_count += events.len();
+        let next_cursor = page["cursor"].as_u64().expect("cursor");
+        assert!(
+            next_cursor > cursor,
+            "cursor must always advance to make progress: page {page}"
+        );
+        cursor = next_cursor;
+    }
+
+    assert_eq!(
+        paginated_trace, whole_trace,
+        "paginated per-seq content trace must exactly match the whole read — no gap, no \
+         duplicate, regardless of where the tiny cap forced fold boundaries to fall"
+    );
+    assert_eq!(
+        paginated_event_count, whole_event_count,
+        "paginated events must exactly match the whole read"
+    );
+    println!(
+        "acceptance (T3.2 #3, MCP level) — {pages} read_since pages reconstruct exactly the \
+         whole tail read: {} line-seqs, {paginated_event_count} events",
+        paginated_trace.len()
+    );
+
+    mcp.shutdown().await;
+}
+
+// ---- wait_for byte fidelity (T3.2's "順帶" fix, issue #13) ----
+
+#[tokio::test]
+async fn wait_for_matched_binary_line_carries_the_real_raw_hex_via_the_bridge() {
+    let (daemon, recorder) = start_daemon_with_empty_device("dev").await;
+    let mut mcp = McpProcess::spawn(&daemon.socket_path);
+    mcp.initialize().await;
+
+    let mut payload = b"status:".to_vec();
+    payload.extend_from_slice(&[0xFF, 0xFE, 0x80]);
+    let mut with_newline = payload.clone();
+    with_newline.push(b'\n');
+
+    let writer_recorder = Arc::clone(&recorder);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        writer_recorder
+            .append_rx(&with_newline)
+            .expect("append binary line");
+    });
+
+    let result = mcp
+        .call_tool(
+            "wait_for",
+            json!({"device": "dev", "pattern": "^status:", "timeout_s": 3.0}),
+        )
+        .await;
+    assert_eq!(result["result"], "matched", "result: {result}");
+    assert_eq!(result["binary"], true, "result: {result}");
+    let raw_hex = result["raw_hex"]
+        .as_str()
+        .expect("raw_hex present for a binary matched line");
+    let decoded: Vec<u8> = raw_hex
+        .split(' ')
+        .map(|byte| u8::from_str_radix(byte, 16).expect("valid hex byte"))
+        .collect();
+    assert_eq!(
+        decoded, payload,
+        "raw_hex must decode to the exact original bytes, not a lossy reconstruction"
+    );
+    assert!(
+        !raw_hex.contains("ef bf bd"),
+        "raw_hex looks derived from the lossy text field, not raw_b64: {raw_hex}"
+    );
+    println!("acceptance (T3.2 wait_for fix) — matched binary line raw_hex: {raw_hex}");
+
+    mcp.shutdown().await;
+}
