@@ -1,0 +1,10 @@
+[package]
+name = "serialwrapd"
+description = "Daemon core: port I/O, recorder, query layer, and write gate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wrap-proto = { path = "../wrap-proto" }

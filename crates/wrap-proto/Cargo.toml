@@ -1,0 +1,11 @@
+[package]
+name = "wrap-proto"
+description = "Wire and on-disk record types shared by serialwrapd, the CLI, and the MCP bridge."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
