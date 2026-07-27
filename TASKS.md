@@ -12,12 +12,16 @@
 - 儲存格式：JSONL 事件流（bytes 以 base64），分段檔＋依總量 ring 淘汰。理由：可 grep、crash 容忍（截斷尾行可丟棄）、匯出幾乎免費。serial 流量（≤ 數 MB/s）下效能綽綽有餘。
 - 事件 record schema（所有功能共用這一條流）：
 
+每一筆都帶 `seq` + 兩個時鐘，無例外——TX 缺時戳則時間軸插不進去，gate 缺時戳則稽核答不出「何時拒絕」：
+
 ```json
 {"seq":812044,"t_mono":123456.789012,"t_wall":"2026-07-27T10:34:12.443+08:00","kind":"rx","data_b64":"..."}
-{"seq":812045,"kind":"event","event":"lease_start","client":"esptool","pid":5311}
-{"seq":812046,"kind":"tx","client":"claude-code","client_type":"agent","gate":"whitelist","data_b64":"c3RhdHVzCg=="}
-{"seq":812047,"kind":"gate","action":"deny","reason":"timeout_60s","request_seq":812040}
+{"seq":812045,"t_mono":123457.104,"t_wall":"...","kind":"event","event":"lease_start","client":"esptool","pid":5311}
+{"seq":812046,"t_mono":123458.001,"t_wall":"...","kind":"tx","client":"claude-code","client_type":"agent","gate":"whitelist","data_b64":"c3RhdHVzCg=="}
+{"seq":812047,"t_mono":123458.512,"t_wall":"...","kind":"gate","action":"deny","reason":"timeout_60s","request_seq":812040}
 ```
+
+完整 schema 以 wiki [Event stream and storage](https://github.com/SheldonChangL/serialwrap/wiki/Event-stream-and-storage) 為準。
 
 - 二進位發佈：單一 binary（`serialwrap`，daemon 以 `serialwrap daemon` 啟動；MCP 以 `serialwrap mcp`）。
 
