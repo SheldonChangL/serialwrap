@@ -1157,7 +1157,15 @@ mod tests {
             tokio::spawn(async move { state.wait_for("boot ok", Duration::from_secs(2)).await })
         };
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Unlike the protocol-/MCP-level tests of this same "append after
+        // wait_for starts" shape (which cross a socket or subprocess
+        // boundary and so need to confirm the real event — see issue #39),
+        // this unit test only needs `waiter` to have reached its own
+        // "checked" snapshot, which is a plain in-process tokio task with
+        // no I/O in front of it. `yield_now` deterministically gives the
+        // (default current-thread) runtime a chance to run it to its first
+        // suspension point before we append — no guessed duration needed.
+        tokio::task::yield_now().await;
         recorder.append_rx(b"boot ok\n").unwrap();
         state.ingest(&recorder);
 
@@ -1195,7 +1203,11 @@ mod tests {
             tokio::spawn(async move { state.wait_for("^status:", Duration::from_secs(2)).await })
         };
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // See the identical comment in
+        // `wait_for_matches_a_line_that_completes_after_the_call_starts`
+        // above: `yield_now` deterministically lets `waiter` reach its
+        // "checked" snapshot instead of guessing a duration.
+        tokio::task::yield_now().await;
         recorder.append_rx(&with_newline).unwrap();
         state.ingest(&recorder);
 
