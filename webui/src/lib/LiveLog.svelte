@@ -3,6 +3,9 @@
   import { LiveLogBuffer, type LogItem, type TimestampMode } from "./liveLog";
   import { LogStream, fetchDeviceConfig, type DeviceConfig, type LogStreamState } from "./logStream";
   import LogRow from "./LogRow.svelte";
+  import Timeline from "./Timeline.svelte";
+  import PortSettingsPopover from "./PortSettingsPopover.svelte";
+  import type { TimelineSelection } from "./timeline";
 
   interface Props {
     deviceId: string;
@@ -38,6 +41,73 @@
   let streamErrorDetail = $state<string | null>(null);
   let deviceConfig = $state<DeviceConfig | null>(null);
   let recordingSinceLabel = $state<string | null>(null);
+
+  // ---- T5.3 (issue #20): timeline jump/highlight + settings popover ----
+  let popoverOpen = $state(false);
+  let configChipEl: HTMLButtonElement | undefined = $state();
+  let highlightedItemId = $state<number | null>(null);
+  let highlightTimer: ReturnType<typeof setTimeout> | undefined;
+  let timelineSelection = $state<TimelineSelection | null>(null);
+
+  function refreshConfig(): void {
+    fetchDeviceConfig(deviceId)
+      .then((c) => {
+        deviceConfig = c;
+      })
+      .catch(() => {
+        deviceConfig = null;
+      });
+  }
+
+  /** Item range (inclusive) a `LogItem` covers, in the underlying record
+   * `seq` space — a `line` may be a fold spanning several records
+   * (`seq`..`lastSeq`); everything else is a single record. `gap` has no
+   * real seq of its own (`afterSeq` is a display anchor, not a record). */
+  function itemSeqRange(item: LogItem): [number, number] | null {
+    if (item.kind === "gap") return null;
+    if (item.kind === "line") return [item.seq, item.lastSeq];
+    return [item.seq, item.seq];
+  }
+
+  /** Jump the log view to whichever buffered item covers `seq`, pausing
+   * follow mode, centering it in the viewport, and flashing a highlight —
+   * the timeline's click-to-jump contract (T5.3 acceptance criterion 1).
+   * Clears an active filter first: a filtered-out target would otherwise
+   * silently fail to be found in `buffer.filtered` (the only array actually
+   * rendered), and jumping to hidden content is a worse outcome than
+   * dropping the filter. */
+  function jumpToSeq(seq: number): void {
+    const target = buffer.items.find((it) => {
+      const range = itemSeqRange(it);
+      return range !== null && seq >= range[0] && seq <= range[1];
+    });
+    if (!target) return;
+
+    if (filterText.length > 0) {
+      filterText = "";
+      applyFilter();
+    }
+
+    following = false;
+    void tick().then(() => {
+      const idx = buffer.filtered.findIndex((it) => it.id === target.id);
+      if (idx === -1 || !containerEl) return;
+      const targetTop = idx * ROW_HEIGHT;
+      containerEl.scrollTop = Math.max(0, targetTop - viewportHeight / 2 + ROW_HEIGHT / 2);
+      scrollTop = containerEl.scrollTop;
+      version++;
+    });
+
+    highlightedItemId = target.id;
+    if (highlightTimer) clearTimeout(highlightTimer);
+    highlightTimer = setTimeout(() => {
+      highlightedItemId = null;
+    }, 3_000);
+  }
+
+  function togglePopover(): void {
+    popoverOpen = !popoverOpen;
+  }
 
   let pendingPages: Parameters<typeof buffer.ingest>[0][] = [];
   let rafScheduled = false;
@@ -121,6 +191,15 @@
   }
 
   function onPage(page: Parameters<typeof buffer.ingest>[0]): void {
+    // T5.3 (issue #20) broadcast acceptance criterion: a `config_change`
+    // event (from *any* client — this tab's own popover, another open tab,
+    // or an agent) must refresh this tab's status-bar config chip too, not
+    // just the tab that made the change. `config_change` already flows
+    // through this same per-device push stream (see `device_profile.rs`'s
+    // event-naming docs) — no new subscription needed, just react to it.
+    if (page.events.some((e) => e.event === "config_change")) {
+      refreshConfig();
+    }
     pendingPages.push(page);
     if (!rafScheduled) {
       rafScheduled = true;
@@ -202,17 +281,12 @@
       },
     });
     void stream.start();
-    fetchDeviceConfig(deviceId)
-      .then((c) => {
-        deviceConfig = c;
-      })
-      .catch(() => {
-        deviceConfig = null;
-      });
+    refreshConfig();
   });
 
   onDestroy(() => {
     stream?.stop();
+    if (highlightTimer) clearTimeout(highlightTimer);
   });
 
   function cycleTimestampMode(): void {
@@ -257,11 +331,40 @@
       data-state={streamState}
     ></span>
     <span class="device-id">{deviceId}</span>
-    <span class="config-chip" data-testid="config-chip">{configLabel}</span>
+    <span class="config-chip-wrap">
+      <button
+        type="button"
+        class="config-chip"
+        data-testid="config-chip"
+        bind:this={configChipEl}
+        onclick={togglePopover}
+      >
+        {configLabel}
+      </button>
+      <PortSettingsPopover
+        {deviceId}
+        open={popoverOpen}
+        onClose={() => (popoverOpen = false)}
+        onApplied={refreshConfig}
+        anchorEl={configChipEl}
+      />
+    </span>
     {#if streamState === "error" && streamErrorDetail}
       <span class="stream-error" data-testid="stream-error">{streamErrorDetail}</span>
     {/if}
   </div>
+
+  <Timeline
+    items={buffer.items}
+    {version}
+    onJump={jumpToSeq}
+    onRangeSelect={(selection) => (timelineSelection = selection)}
+  />
+  {#if timelineSelection}
+    <div class="timeline-selection-info" data-testid="timeline-selection">
+      selected seq {timelineSelection.fromSeq}–{timelineSelection.toSeq}
+    </div>
+  {/if}
 
   <div class="controls">
     <input
@@ -297,7 +400,15 @@
     <div class="spacer" style="height: {totalHeight}px;">
       {#each rows as row (row.item.id)}
         <div class="positioned" style="transform: translateY({row.top}px);">
-          <LogRow item={row.item} timestamp={row.timestamp} expanded={isExpanded(row.item.id)} onToggleExpand={toggleExpand} />
+          <LogRow
+            item={row.item}
+            timestamp={row.timestamp}
+            expanded={isExpanded(row.item.id)}
+            onToggleExpand={toggleExpand}
+            {deviceId}
+            highlighted={row.item.id === highlightedItemId}
+            onReverted={refreshConfig}
+          />
         </div>
       {/each}
     </div>
@@ -361,11 +472,26 @@
     background: var(--dot-open);
   }
 
+  .config-chip-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+
   .config-chip {
+    font: inherit;
     border: 1px solid var(--border);
     border-radius: 0.35rem;
     padding: 0.05rem 0.4rem;
     color: var(--text-dim);
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .timeline-selection-info {
+    padding: 0.15rem 0.75rem;
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
   }
 
   .stream-error {

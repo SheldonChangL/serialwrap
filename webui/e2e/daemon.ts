@@ -5,7 +5,7 @@
 // acceptance criterion end to end, including a real daemon restart for the
 // WS reconnect criterion.
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,11 @@ function resolveBinary(): string {
 export interface DaemonHandle {
   port: number;
   url: string;
+  /** This instance's throwaway `HOME`/XDG dirs — exposed so `runCli` (T5.4,
+   * issue #21's "GUI and CLI decide the same request" test) can spawn the
+   * `serialwrap` CLI against the *same* daemon, pointed at the same UDS
+   * socket and `rules.toml`, rather than a second, unrelated instance. */
+  home: string;
   stop(): Promise<void>;
 }
 
@@ -74,12 +79,45 @@ export interface StartDaemonOptions {
    * exercising the zero-devices case exactly as before.
    */
   testDeviceId?: string;
+  /**
+   * `rules.toml` contents to write into this instance's throwaway config
+   * dir *before* spawning — lets a test configure e.g. a short
+   * `[approval] timeout_s` (T5.4, issue #21's countdown-timeout acceptance
+   * criterion needs seconds, not the production 60s default) without
+   * touching `crates/serialwrapd/src/gate/rules.rs`'s own defaults. See
+   * `rulesTomlPath` for why the destination differs by platform.
+   */
+  rulesToml?: string;
+}
+
+/**
+ * Where `serialwrapd::gate::rules::default_rules_path` resolves to for a
+ * daemon started with `HOME`/`XDG_CONFIG_HOME` both set to `home` (see
+ * `startDaemon`'s env block below) — mirrors the `directories` crate's own
+ * platform split that function's doc comment describes: XDG-based on
+ * Linux (respects `XDG_CONFIG_HOME`), `~/Library/Application Support` on
+ * macOS (which `directories` resolves from `HOME` directly, ignoring any
+ * XDG var — verified against that crate's source before writing this,
+ * same "don't assume, check" standard the daemon's own code documents for
+ * this same function).
+ */
+function rulesTomlPath(home: string): string {
+  if (process.platform === "darwin") {
+    return path.join(home, "Library", "Application Support", "serialwrap", "rules.toml");
+  }
+  return path.join(home, "serialwrap", "rules.toml");
 }
 
 export async function startDaemon(options?: number | StartDaemonOptions): Promise<DaemonHandle> {
   const opts: StartDaemonOptions = typeof options === "number" ? { port: options } : (options ?? {});
   const usePort = opts.port ?? nextPort++;
   const home = mkdtempSync(path.join(tmpdir(), "serialwrap-e2e-"));
+
+  if (opts.rulesToml) {
+    const rulesPath = rulesTomlPath(home);
+    mkdirSync(path.dirname(rulesPath), { recursive: true });
+    writeFileSync(rulesPath, opts.rulesToml);
+  }
 
   let child: ChildProcess | undefined;
   let lastError: unknown;
@@ -108,6 +146,7 @@ export async function startDaemon(options?: number | StartDaemonOptions): Promis
       return {
         port: usePort,
         url: `http://127.0.0.1:${usePort}`,
+        home,
         async stop() {
           // `exit` is not a sticky/replayable event: if `stopper` already
           // exited on its own (crashed, or an earlier `stop()` call raced
@@ -162,4 +201,46 @@ export async function injectLog(daemon: DaemonHandle, deviceId: string, ops: Inj
   if (!res.ok) {
     throw new Error(`test/inject failed: ${res.status} ${await res.text()}`);
   }
+}
+
+export interface CliResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Run the real `serialwrap` CLI binary against `daemon`'s own socket
+ * (T5.4, issue #21's "GUI and CLI decide the same request" acceptance
+ * criterion) — same binary `resolveBinary()` picks for the daemon itself,
+ * invoked with the identical `HOME`/`XDG_RUNTIME_DIR` env so
+ * `resolve_socket_path` (the CLI's own connection setup) finds the same
+ * UDS socket this specific daemon instance is listening on, not some other
+ * (or no) daemon.
+ */
+export async function runCli(daemon: DaemonHandle, args: string[]): Promise<CliResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(resolveBinary(), args, {
+      env: {
+        ...process.env,
+        HOME: daemon.home,
+        XDG_RUNTIME_DIR: daemon.home,
+        XDG_DATA_HOME: daemon.home,
+        XDG_CONFIG_HOME: daemon.home,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      resolve({
+        code,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      });
+    });
+  });
 }

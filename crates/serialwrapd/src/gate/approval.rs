@@ -98,6 +98,17 @@ pub struct ApprovalSnapshot {
     /// without that context an operator is just guessing."
     pub log_context: Vec<String>,
     pub age_s: f64,
+    /// This request's configured approval timeout, in seconds (`RuleSet::timeout`
+    /// at the moment [`super::Gate::submit_write`] enqueued it) — added for
+    /// T5.4 (issue #21): the approval card's countdown bar needs the *total*
+    /// duration alongside `age_s` to render "how much is left", and a fixed
+    /// client-side assumption (e.g. always 60s) would silently be wrong the
+    /// moment an operator's `rules.toml` sets a different `timeout_s`. Purely
+    /// observational — carrying this value changes no gate decision or
+    /// timeout behavior; the real fail-safe timeout race is still exactly
+    /// [`super::Gate::submit_write`]'s own spawned task, unaffected by this
+    /// field's existence.
+    pub timeout_s: f64,
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -127,6 +138,8 @@ struct PendingMeta {
     /// handler that may not even know which device an opaque approval `id`
     /// belongs to) having to look it up separately.
     recorder: Arc<Recorder>,
+    /// See [`ApprovalSnapshot::timeout_s`]'s doc comment.
+    timeout_s: f64,
 }
 
 impl PendingMeta {
@@ -145,6 +158,7 @@ impl PendingMeta {
             danger_reason: self.danger_reason.clone(),
             log_context: self.log_context.clone(),
             age_s: self.created_at.elapsed().as_secs_f64(),
+            timeout_s: self.timeout_s,
         }
     }
 }
@@ -163,6 +177,8 @@ pub(crate) struct NewPending {
     pub danger_reason: Option<String>,
     pub log_context: Vec<String>,
     pub recorder: Arc<Recorder>,
+    /// See [`ApprovalSnapshot::timeout_s`]'s doc comment.
+    pub timeout_s: f64,
 }
 
 struct PendingEntry {
@@ -206,6 +222,7 @@ impl PendingQueue {
             log_context: new.log_context,
             created_at: Instant::now(),
             recorder: new.recorder,
+            timeout_s: new.timeout_s,
         };
         self.entries
             .lock()
@@ -290,6 +307,7 @@ mod tests {
             danger_reason: None,
             log_context: vec!["boot ok".to_string()],
             recorder: Arc::clone(recorder),
+            timeout_s: 60.0,
         }
     }
 
@@ -344,6 +362,24 @@ mod tests {
             Err(DecideError),
             "an already-resolved id must not be decidable again"
         );
+    }
+
+    // ---- T5.4 (issue #21): timeout_s survives into the snapshot for the
+    // approval card's countdown ----
+
+    #[test]
+    fn snapshot_carries_the_configured_timeout_seconds() {
+        let (recorder, _dir) = test_recorder();
+        let queue = PendingQueue::new();
+        let mut new = new_pending(&recorder, b"status");
+        new.timeout_s = 12.5;
+        let (id, _rx) = queue.submit(new);
+        let snapshot = queue
+            .list()
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("just-submitted entry must be listed");
+        assert_eq!(snapshot.timeout_s, 12.5);
     }
 
     #[test]
