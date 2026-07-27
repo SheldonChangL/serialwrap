@@ -1,0 +1,13 @@
+[package]
+name = "serialwrap"
+description = "serialwrap: the single binary providing the daemon, the MCP bridge, and the CLI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serialwrapd = { path = "../serialwrapd" }
+wrap-proto = { path = "../wrap-proto" }
+clap = { workspace = true }
+tokio = { workspace = true }

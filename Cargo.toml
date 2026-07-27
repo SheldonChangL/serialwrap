@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wrap-proto",
+    "crates/serialwrapd",
+    "crates/serialwrap",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/SheldonChangL/serialwrap"
+
+# Shared dependency versions. Every member pulls from this table so upgrades
+# happen in one place and the whole workspace stays on one version of each
+# crate.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+clap = { version = "4", features = ["derive"] }
+
+# Reserved for later milestones (T1.3 port I/O, T5.1 web GUI, T6.1 packaging).
+# Listed here now so the version is pinned workspace-wide, but no crate
+# depends on them yet at this skeleton stage.
+serialport = "4"
+axum = "0.8"
+rust-embed = "8"
