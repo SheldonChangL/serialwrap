@@ -25,5 +25,5 @@ clap = { version = "4", features = ["derive"] }
 # Listed here now so the version is pinned workspace-wide, but no crate
 # depends on them yet at this skeleton stage.
 serialport = "4"
-axum = "0.7"
+axum = "0.8"
 rust-embed = "8"
