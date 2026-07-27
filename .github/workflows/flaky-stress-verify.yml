@@ -1,0 +1,49 @@
+name: Flaky test stress verification (temporary, issue #39)
+
+# TEMPORARY workflow for verifying the timing-stability fixes in issue #39 on
+# Linux, where the original flakes reproduced (never on macOS). Manually
+# triggered only; removed again once verification is done — not part of the
+# permanent CI setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "How many times to repeat cargo test --all"
+        required: false
+        default: "200"
+
+jobs:
+  stress:
+    name: repeat cargo test --all on ubuntu-latest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build test binaries once
+        run: cargo test --all --no-run
+
+      - name: Repeat cargo test --all N times, fail fast on the first failure
+        run: |
+          set -u
+          N="${{ github.event.inputs.iterations }}"
+          N="${N:-200}"
+          echo "Running cargo test --all x ${N} on $(uname -a)"
+          for i in $(seq 1 "$N"); do
+            if ! out=$(cargo test --all 2>&1); then
+              echo "=== FAILURE on iteration ${i}/${N} ==="
+              echo "$out"
+              exit 1
+            fi
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "iteration ${i}/${N} ok"
+            fi
+          done
+          echo "ALL ${N} ITERATIONS PASSED"
