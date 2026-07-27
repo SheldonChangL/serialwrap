@@ -115,6 +115,32 @@ fn is_terminal_safe(bytes: &[u8]) -> bool {
     }
 }
 
+/// Render one `tx` out-of-band record (`TASKS.md` T2.1, issue #8): the
+/// writing client's identity (`"name:pid"` — see
+/// `serialwrapd::protocol::session`'s `changed_by` convention), the gate
+/// decision (`"human_rw"` today; T4.1 adds `"whitelist"`/`"approved"`/...),
+/// and the bytes actually written — reusing [`render_data_content`] so a
+/// tx echo renders exactly the way the same bytes would as an `rx` line
+/// (text when safe, length+hex preview otherwise — never a raw control
+/// byte reaching the terminal).
+fn tx_content(record: &Value) -> String {
+    let client = record.get("client").and_then(Value::as_str).unwrap_or("?");
+    let client_type = record
+        .get("client_type")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let gate = record.get("gate").and_then(Value::as_str).unwrap_or("?");
+    let bytes = record
+        .get("data_b64")
+        .and_then(Value::as_str)
+        .and_then(|b64| BASE64.decode(b64).ok())
+        .unwrap_or_default();
+    format!(
+        "tx client={client} client_type={client_type} gate={gate} {}",
+        render_data_content(&bytes)
+    )
+}
+
 /// Render an out-of-band record's content: its event/gate label, plus
 /// every other field flattened as `key=value` (sorted for deterministic,
 /// diffable output).
@@ -123,6 +149,9 @@ fn event_content(record: &Value) -> String {
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or("event");
+    if kind == "tx" {
+        return tx_content(record);
+    }
     let label = if kind == "event" {
         record
             .get("event")

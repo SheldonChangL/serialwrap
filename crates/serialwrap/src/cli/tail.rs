@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use wrap_proto::Request;
 
-use super::client::{resolve_socket_path, DaemonClient};
+use super::client::{resolve_device, resolve_socket_path, DaemonClient};
 use super::error::describe_connect_error;
 use super::render::{render_data_line, render_event_line};
 use super::time::{parse_since, passes_since};
@@ -69,36 +69,6 @@ pub async fn run(args: TailArgs) -> io::Result<()> {
         follow(&mut client, &device, cursor, &mut out).await?;
     }
     Ok(())
-}
-
-/// Resolve which device to tail: the explicit argument if given, otherwise
-/// the sole device the daemon currently knows about. Zero or multiple
-/// devices without an explicit choice is an actionable error, not a guess.
-async fn resolve_device(client: &mut DaemonClient, requested: Option<&str>) -> io::Result<String> {
-    if let Some(device) = requested {
-        return Ok(device.to_string());
-    }
-    let reply = client.call(Request::ListDevices).await?;
-    check_ok(&reply, None)?;
-    let devices = reply["devices"].as_array().cloned().unwrap_or_default();
-    match devices.len() {
-        0 => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no devices known yet — plug one in, then check `serialwrap devices`",
-        )),
-        1 => Ok(devices[0]["id"].as_str().unwrap_or_default().to_string()),
-        _ => {
-            let ids: Vec<&str> = devices.iter().filter_map(|d| d["id"].as_str()).collect();
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "multiple devices known ({}); specify one: `serialwrap tail <device>` (see \
-                     `serialwrap devices`)",
-                    ids.join(", ")
-                ),
-            ))
-        }
-    }
 }
 
 async fn print_tail(

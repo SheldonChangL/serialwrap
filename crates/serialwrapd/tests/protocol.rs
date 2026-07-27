@@ -10,12 +10,16 @@
 //! requests — never by calling internal daemon functions directly. See
 //! [`Client`] below.
 
+use std::fs::File;
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use nix::pty::openpty;
+use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -26,6 +30,7 @@ use serialwrapd::port::DeviceId;
 use serialwrapd::protocol::backend::{testing::TestBackend, DeviceBackend};
 use serialwrapd::protocol::{server, Shared};
 use serialwrapd::recorder::{Recorder, RecorderConfig};
+use wrap_proto::Record;
 
 /// Bind and serve a fresh daemon instance on a tempdir-scoped socket.
 /// Returns the socket path and the tempdir (kept alive for the caller's
@@ -869,4 +874,464 @@ async fn subscribe_since_cursor_below_the_retained_floor_is_a_structured_data_ag
         "reply: {reply}"
     );
     println!("acceptance (issue #32) #2 (edge case) — aged-out since_cursor: {reply}");
+}
+
+// =====================================================================
+// TASKS.md T2.1 (issue #8) / T2.3 (issue #10): `write`, `set_config`
+// (already-implemented protocol layer, exercised here through the wire for
+// the first time), `list_clients`, `kick`, `demote`.
+// =====================================================================
+
+/// Open a raw (no line-discipline surprises) PTY pair for the write-path
+/// tests below: `master` is what a test reads to see exactly what the
+/// daemon wrote via `TestBackend::write_bytes`; `slave` (registered via
+/// `TestBackend::register_writer`) plays the role of "the physical device
+/// fd" `write_bytes` opens fresh against (see `protocol::backend::LiveBackend`'s
+/// doc comment on `write_bytes` for why it's a *second* fd rather than the
+/// daemon's one shared fd).
+///
+/// This duplicates the handful of lines `mock_device::pty::open_raw_pty`
+/// already has, rather than depending on it: that module is private to the
+/// `mock-device` crate (not `pub mod pty`), and — separately — this test
+/// specifically needs to read the *master* side directly, which
+/// `mock_device::MockDevice`'s public API never exposes (its master is
+/// permanently owned by its own background `Responder` thread, and that
+/// thread's own line-based command matching strips exactly the CR/LF bytes
+/// a byte-exact assertion needs to see — see the acceptance criteria this
+/// file proves below).
+fn open_raw_pty_pair() -> (File, File) {
+    let pair = openpty(None, None).expect("openpty");
+    let mut attrs = tcgetattr(&pair.slave).expect("tcgetattr");
+    cfmakeraw(&mut attrs);
+    tcsetattr(&pair.slave, SetArg::TCSANOW, &attrs).expect("tcsetattr");
+    (File::from(pair.master), File::from(pair.slave))
+}
+
+/// Block (on a blocking-pool thread, so the daemon's own tasks on this same
+/// `#[tokio::test]` runtime keep making progress concurrently) until
+/// exactly `n` bytes have been read from `file`, or `timeout` elapses.
+/// Returns the file back alongside what was read, so a test can keep
+/// reading from the same PTY master across several sequential writes.
+async fn read_n_bytes(file: File, n: usize, timeout: Duration) -> (File, Vec<u8>) {
+    let task = tokio::task::spawn_blocking(move || {
+        let mut file = file;
+        let mut buf = vec![0u8; n];
+        file.read_exact(&mut buf)
+            .expect("read_exact from pty master");
+        (file, buf)
+    });
+    tokio::time::timeout(timeout, task)
+        .await
+        .unwrap_or_else(|_| panic!("expected {n} bytes on the pty master within {timeout:?}"))
+        .expect("blocking read task panicked")
+}
+
+/// Stand up a daemon with one `TestBackend` device, plus a fresh raw PTY
+/// pair registered as that device's writer — the fixture every write-path
+/// test below starts from. Returns the socket path plus *both* tempdirs
+/// that must outlive the test (the socket's own, and — easy to miss, and
+/// exactly the bug this comment now documents — the recorder's data
+/// directory: `Recorder::read_since` freshly `File::open`s each segment
+/// per call rather than caching a handle, so dropping this tempdir early
+/// makes every `read_since`/`tail`/`subscribe` call fail with a silent,
+/// logged-not-propagated `NotFound` — segment appends still succeed
+/// through the already-open fd, which is what made this so easy to
+/// misattribute to the tx-event code path itself while first writing this
+/// test), and the PTY master `File` a test reads from to prove
+/// byte-exactness.
+async fn start_daemon_with_writable_device(
+    device_id: &str,
+) -> (PathBuf, tempfile::TempDir, tempfile::TempDir, File) {
+    let tmp_data = tempfile::tempdir().expect("tempdir");
+    let recorder = Arc::new(
+        Recorder::open(tmp_data.path(), device_id, RecorderConfig::default())
+            .expect("open recorder"),
+    );
+    let backend = Arc::new(TestBackend::new());
+    let id = DeviceId(device_id.to_string());
+    backend.register(id.clone(), recorder);
+    let (master, slave) = open_raw_pty_pair();
+    backend.register_writer(&id, slave);
+    let (sock_path, sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+    (sock_path, sockdir, tmp_data, master)
+}
+
+// ---- T2.1 acceptance criterion 1: four line endings, byte-exact ----
+
+#[tokio::test]
+async fn write_line_endings_are_byte_exact_on_the_wire() {
+    let (sock_path, _sockdir, _datadir, mut master) =
+        start_daemon_with_writable_device("dev").await;
+    let (mut c, _ack) = Client::connect(&sock_path, "writer", "human").await;
+
+    let cases: [(&str, &str, &[u8]); 4] = [
+        ("lf", "PING", b"PING\n"),
+        ("crlf", "PONG", b"PONG\r\n"),
+        ("cr", "FOO", b"FOO\r"),
+        ("none", "BAR", b"BAR"),
+    ];
+    for (line_ending, text, expected) in cases {
+        c.send(json!({
+            "id": 1, "op": "write", "device": "dev",
+            "text": text, "line_ending": line_ending,
+        }))
+        .await;
+        let reply = c.recv().await;
+        assert_eq!(reply["ok"], true, "write({line_ending}) failed: {reply}");
+        assert_eq!(
+            reply["written"].as_u64(),
+            Some(expected.len() as u64),
+            "write({line_ending}) reported the wrong byte count: {reply}"
+        );
+
+        let (returned_master, got) =
+            read_n_bytes(master, expected.len(), Duration::from_secs(2)).await;
+        master = returned_master;
+        assert_eq!(
+            got, expected,
+            "line_ending={line_ending}: bytes on the wire did not match byte-for-byte"
+        );
+    }
+    println!("acceptance (T2.1) #1 — lf/crlf/cr/none all byte-exact on the wire");
+}
+
+// ---- T2.1 acceptance criterion 2: --hex-equivalent (`data_b64`) is exact, ignores line_ending ----
+
+#[tokio::test]
+async fn write_data_b64_sends_exact_bytes_and_ignores_line_ending() {
+    let (sock_path, _sockdir, _datadir, master) = start_daemon_with_writable_device("dev").await;
+    let (mut c, _ack) = Client::connect(&sock_path, "writer", "human").await;
+
+    let payload = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+    let b64 = BASE64.encode(&payload);
+    // `line_ending` is deliberately non-default here — it must be ignored
+    // whenever `data_b64` is present (see the wire handler's docs: a caller
+    // who spelled out exact bytes wants exactly those bytes, nothing
+    // appended).
+    c.send(json!({
+        "id": 1, "op": "write", "device": "dev",
+        "data_b64": b64, "line_ending": "crlf",
+    }))
+    .await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["written"].as_u64(), Some(4));
+
+    let (_master, got) = read_n_bytes(master, 4, Duration::from_secs(2)).await;
+    assert_eq!(
+        got, payload,
+        "hex/data_b64 bytes must be exact, nothing appended"
+    );
+    println!("acceptance (T2.1) #2 — data_b64 (the `--hex` wire equivalent) is byte-exact");
+}
+
+// ---- T2.1 acceptance criterion 3: stdin is a CLI-layer concern; see
+// crates/serialwrap/tests/write_cli.rs for that acceptance test — the
+// protocol layer itself has no notion of "stdin" at all (it only ever sees
+// `text`/`data_b64`, whichever the CLI decided to send).
+
+// ---- T2.1 acceptance criterion 4: tx event visible to another subscriber, correct identity ----
+
+#[tokio::test]
+async fn write_appends_a_tx_event_visible_to_another_subscriber_with_correct_identity() {
+    let (sock_path, _sockdir, _datadir, master) = start_daemon_with_writable_device("dev").await;
+
+    let (mut writer, writer_ack) = Client::connect(&sock_path, "agent-writer", "human").await;
+    let writer_pid = writer_ack["pid"].as_u64().expect("pid");
+
+    let (mut subscriber, _ack) = Client::connect(&sock_path, "watcher", "human").await;
+    subscriber
+        .send(json!({"id": 1, "op": "subscribe", "device": "dev"}))
+        .await;
+    // Let the subscribe task reach its snapshot-then-wait point before the
+    // write happens (same pattern the file's other subscribe tests use).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    writer
+        .send(json!({
+            "id": 1, "op": "write", "device": "dev",
+            "text": "status", "line_ending": "lf",
+        }))
+        .await;
+    let write_reply = writer.recv().await;
+    assert_eq!(write_reply["ok"], true, "{write_reply}");
+
+    let expected_bytes = b"status\n".to_vec();
+    let (_master, got) = read_n_bytes(master, expected_bytes.len(), Duration::from_secs(2)).await;
+    assert_eq!(got, expected_bytes, "bytes actually written to the device");
+
+    let push = tokio::time::timeout(Duration::from_secs(2), subscriber.recv())
+        .await
+        .expect("a subscribe push containing the tx event within 2s");
+    let events = push["events"].as_array().expect("events array");
+    let tx_event = events
+        .iter()
+        .find(|e| e["kind"] == "tx")
+        .unwrap_or_else(|| panic!("expected a tx event in the subscriber's push: {push}"));
+
+    assert_eq!(tx_event["gate"], "human_rw", "tx event: {tx_event}");
+    assert_eq!(tx_event["client_type"], "human", "tx event: {tx_event}");
+    let client_field = tx_event["client"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tx event missing `client`: {tx_event}"));
+    // `client` carries "name:pid" — the same convention `changed_by` uses
+    // for `config_change` — so both the self-reported name *and* the
+    // kernel-verified pid travel with the event.
+    assert_eq!(
+        client_field,
+        format!("agent-writer:{writer_pid}"),
+        "tx event identity must be the writer's real name and kernel-verified pid: {tx_event}"
+    );
+    let decoded = BASE64
+        .decode(tx_event["data_b64"].as_str().expect("data_b64"))
+        .expect("valid base64");
+    assert_eq!(
+        decoded, expected_bytes,
+        "tx event's recorded bytes: {tx_event}"
+    );
+    println!(
+        "acceptance (T2.1) #4 — tx event visible to another subscriber, identity={client_field:?}"
+    );
+}
+
+// ---- T2.1 acceptance criterion 5: agent (and tool) writes stay denied ----
+
+#[tokio::test]
+async fn agent_and_tool_writes_are_denied_pending_the_t4_1_rule_engine() {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), recorder);
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+
+    for client_type in ["agent", "tool"] {
+        let (mut c, _ack) = Client::connect(&sock_path, "claude-code", client_type).await;
+        c.send(json!({
+            "id": 1, "op": "write", "device": "dev",
+            "text": "status", "line_ending": "lf",
+        }))
+        .await;
+        let reply = c.recv().await;
+        assert_eq!(
+            reply["ok"], false,
+            "{client_type} write must be denied: {reply}"
+        );
+        assert_eq!(
+            reply["error"]["code"], "permission_denied",
+            "{client_type} write: {reply}"
+        );
+    }
+    println!(
+        "acceptance (T2.1) #5 — agent and tool writes both denied (T4.1 gate not implemented)"
+    );
+}
+
+// ---- T2.3 acceptance criterion (demote): a demoted client's next write is denied ----
+
+#[tokio::test]
+async fn demote_denies_a_subsequent_write_from_a_previously_allowed_human_client() {
+    let (sock_path, _sockdir, _datadir, master) = start_daemon_with_writable_device("dev").await;
+
+    let (mut writer, _ack) = Client::connect(&sock_path, "human-1", "human").await;
+    writer
+        .send(json!({
+            "id": 1, "op": "write", "device": "dev",
+            "text": "ok", "line_ending": "none",
+        }))
+        .await;
+    let first = writer.recv().await;
+    assert_eq!(
+        first["ok"], true,
+        "first write (still ReadWrite) failed: {first}"
+    );
+    let (_master, drained) = read_n_bytes(master, 2, Duration::from_secs(2)).await;
+    assert_eq!(drained, b"ok");
+
+    let (mut admin, _ack) = Client::connect(&sock_path, "admin", "human").await;
+    admin.send(json!({"id": 1, "op": "list_clients"})).await;
+    let list_reply = admin.recv().await;
+    let target_id = list_reply["clients"]
+        .as_array()
+        .expect("clients array")
+        .iter()
+        .find(|c| c["name"] == "human-1")
+        .expect("writer client must appear in list_clients")["client_id"]
+        .as_u64()
+        .expect("client_id");
+
+    admin
+        .send(json!({
+            "id": 2, "op": "demote", "client_id": target_id, "permission": "read+gated_write",
+        }))
+        .await;
+    let demote_reply = admin.recv().await;
+    assert_eq!(demote_reply["ok"], true, "demote failed: {demote_reply}");
+
+    writer
+        .send(json!({
+            "id": 2, "op": "write", "device": "dev",
+            "text": "no", "line_ending": "none",
+        }))
+        .await;
+    let second = writer.recv().await;
+    assert_eq!(
+        second["ok"], false,
+        "write after demote must be denied: {second}"
+    );
+    assert_eq!(second["error"]["code"], "permission_denied", "{second}");
+    println!(
+        "acceptance (T2.3) — demote takes effect on the very next write from the same connection"
+    );
+}
+
+// ---- T2.3 acceptance criterion (kick): target's connection closes and an event is recorded ----
+
+#[tokio::test]
+async fn kick_closes_the_targets_connection_and_records_a_client_kicked_event() {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+
+    let (mut victim, victim_ack) = Client::connect(&sock_path, "victim", "agent").await;
+    let victim_pid = victim_ack["pid"].as_u64().expect("pid");
+
+    let (mut admin, _ack) = Client::connect(&sock_path, "admin", "human").await;
+    admin.send(json!({"id": 1, "op": "list_clients"})).await;
+    let list_reply = admin.recv().await;
+    let target_id = list_reply["clients"]
+        .as_array()
+        .expect("clients array")
+        .iter()
+        .find(|c| c["name"] == "victim")
+        .expect("victim must appear in list_clients")["client_id"]
+        .as_u64()
+        .expect("client_id");
+
+    admin
+        .send(json!({"id": 2, "op": "kick", "client_id": target_id}))
+        .await;
+    let kick_reply = admin.recv().await;
+    assert_eq!(kick_reply["ok"], true, "kick failed: {kick_reply}");
+
+    let victim_outcome = tokio::time::timeout(Duration::from_secs(2), victim.try_recv())
+        .await
+        .expect("kick must take effect within 2s");
+    assert!(
+        victim_outcome.is_err(),
+        "expected the victim's connection to close, got {victim_outcome:?}"
+    );
+
+    let records = recorder.read_since(0, usize::MAX).unwrap().records;
+    let kicked_extra = records
+        .iter()
+        .find_map(|r| match r {
+            Record::Event { event, extra, .. } if event == "client_kicked" => Some(extra.clone()),
+            _ => None,
+        })
+        .expect("expected a client_kicked event to be recorded");
+    assert_eq!(
+        kicked_extra.get("client_id").and_then(|v| v.as_u64()),
+        Some(target_id)
+    );
+    assert_eq!(
+        kicked_extra.get("name").and_then(|v| v.as_str()),
+        Some("victim")
+    );
+    assert_eq!(
+        kicked_extra.get("pid").and_then(|v| v.as_u64()),
+        Some(victim_pid)
+    );
+    assert_eq!(
+        kicked_extra.get("client_type").and_then(|v| v.as_str()),
+        Some("agent")
+    );
+    println!("acceptance (T2.3) — kick closed the victim's connection and recorded client_kicked: {kicked_extra:?}");
+}
+
+// ---- T2.3 acceptance criterion (config): config_change event with old/new,
+// and prior rx records stay byte-for-byte untouched ----
+
+#[tokio::test]
+async fn set_config_over_the_wire_produces_a_config_change_event_and_never_touches_prior_rx_records(
+) {
+    let tmp_data = tempfile::tempdir().unwrap();
+    let recorder =
+        Arc::new(Recorder::open(tmp_data.path(), "dev", RecorderConfig::default()).unwrap());
+    recorder.append_rx(b"boot ok\n").unwrap();
+    let before = recorder.read_since(0, usize::MAX).unwrap().records;
+
+    let backend = Arc::new(TestBackend::new());
+    backend.register(DeviceId("dev".to_string()), Arc::clone(&recorder));
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+    let (mut c, _ack) = Client::connect(&sock_path, "operator", "human").await;
+
+    c.send(json!({"id": 1, "op": "set_config", "device": "dev", "baud": 74880}))
+        .await;
+    let set_reply = c.recv().await;
+    assert_eq!(set_reply["ok"], true, "set_config failed: {set_reply}");
+    assert_eq!(set_reply["config"]["baud"].as_u64(), Some(74880));
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    c.send(json!({"id": 2, "op": "read_since", "device": "dev", "cursor": 0}))
+        .await;
+    let read_reply = c.recv().await;
+    assert_eq!(read_reply["ok"], true, "read_since failed: {read_reply}");
+    let config_change = read_reply["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .find(|e| e["event"] == "config_change")
+        .unwrap_or_else(|| panic!("expected a config_change event in {read_reply}"));
+    assert_eq!(config_change["new"]["baud"].as_u64(), Some(74880));
+    assert!(
+        config_change["old"].is_object(),
+        "expected an `old` config snapshot: {config_change}"
+    );
+
+    // "先前錄的資料不重新解讀" — the rx record from before the config
+    // change must be byte-for-byte identical afterward.
+    let after = recorder.read_since(0, usize::MAX).unwrap().records;
+    assert_eq!(
+        before[0], after[0],
+        "changing baud must never alter a previously recorded rx record"
+    );
+    println!("acceptance (T2.3) — config_change carries old/new over the wire; prior rx record unchanged: {config_change}");
+}
+
+// ---- T2.3 acceptance criterion (clients): the triple — name, verified pid, type, permission ----
+
+#[tokio::test]
+async fn list_clients_reports_name_verified_pid_type_permission_and_traffic() {
+    let backend = Arc::new(TestBackend::new());
+    let (sock_path, _sockdir) = start_test_daemon(backend as Arc<dyn DeviceBackend>).await;
+    let (mut c, ack) = Client::connect(&sock_path, "human-op", "human").await;
+    let my_pid = ack["pid"].as_u64().expect("pid");
+
+    c.send(json!({"id": 1, "op": "list_clients"})).await;
+    let reply = c.recv().await;
+    assert_eq!(reply["ok"], true, "{reply}");
+    let me = reply["clients"]
+        .as_array()
+        .expect("clients array")
+        .iter()
+        .find(|cl| cl["name"] == "human-op")
+        .expect("self must appear in list_clients");
+
+    assert_eq!(
+        me["pid"].as_u64(),
+        Some(my_pid),
+        "pid must be the kernel-verified value, never a client claim: {me}"
+    );
+    assert_eq!(me["type"], "human", "{me}");
+    assert_eq!(me["permission"], "read+write", "{me}");
+    assert!(
+        me["bytes_in"].as_u64().unwrap_or(0) > 0,
+        "this connection's own list_clients request should already count as bytes_in: {me}"
+    );
+    assert!(me.get("bytes_out").is_some(), "{me}");
+    println!("acceptance (T2.3) — clients triple (name/verified pid/type) plus permission and traffic: {me}");
 }

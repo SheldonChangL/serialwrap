@@ -14,11 +14,14 @@
 //! UDS socket, the same way any future MCP bridge or GUI client will.
 
 pub mod client;
+pub mod clients;
+pub mod config;
 pub mod devices;
 pub mod error;
 pub mod render;
 pub mod tail;
 pub mod time;
+pub mod write;
 
 use std::io;
 

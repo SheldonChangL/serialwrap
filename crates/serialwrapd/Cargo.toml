@@ -45,3 +45,12 @@ mock-device = { path = "../mock-device" }
 # dir) and a hash for the byte-exact acceptance test (T1.2).
 tempfile = "3"
 sha2 = "0.10"
+# `term` on top of this crate's own `[dependencies]` nix (adds
+# `openpty`/`termios`, unified by cargo for test builds): T2.1's write-path
+# tests build their own raw PTY pair directly (mirroring
+# `mock_device::pty`'s private internals, which aren't reachable from
+# outside that crate) so a test can read the master side directly and
+# prove byte-exactness per line ending — something `mock-device`'s own
+# line-based command-responder API can't distinguish (it strips the exact
+# CR/LF bytes a byte-exact assertion needs to see).
+nix = { workspace = true, features = ["term"] }

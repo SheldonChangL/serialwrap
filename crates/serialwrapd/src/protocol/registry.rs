@@ -213,6 +213,27 @@ impl ClientRegistry {
         }
     }
 
+    /// This connection's [`ClientType`] and *current* [`Permission`] —
+    /// looked up fresh on every call, never cached from the handshake, so a
+    /// `demote` mid-connection is visible to the very next `write` request
+    /// on that same connection. See `protocol::session`'s `Request::Write`
+    /// handler, the only caller: it's the one place in this task's scope
+    /// that decides "is this write allowed *right now*" (human's
+    /// `ReadWrite` passes; everything else is still `permission_denied`
+    /// pending T4.1's rule engine).
+    pub fn type_and_permission(&self, client_id: u64) -> Option<(ClientType, Permission)> {
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&client_id)
+            .map(|e| {
+                (
+                    e.client_type,
+                    *e.permission.lock().unwrap_or_else(|e| e.into_inner()),
+                )
+            })
+    }
+
     pub fn list(&self) -> Vec<ClientSnapshot> {
         self.clients
             .lock()

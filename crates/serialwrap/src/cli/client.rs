@@ -134,3 +134,42 @@ impl DaemonClient {
         })
     }
 }
+
+/// Resolve which device a subcommand should act on: the explicit argument if
+/// given, otherwise the sole device the daemon currently knows about. Zero
+/// or multiple devices without an explicit choice is an actionable error,
+/// not a guess. Shared by every subcommand that takes an optional
+/// `[device]` (`tail`, `write`, `config` — `TASKS.md` T1.5/T2.1/T2.3).
+pub async fn resolve_device(
+    client: &mut DaemonClient,
+    requested: Option<&str>,
+) -> io::Result<String> {
+    if let Some(device) = requested {
+        return Ok(device.to_string());
+    }
+    let reply = client.call(Request::ListDevices).await?;
+    if reply["ok"].as_bool() != Some(true) {
+        return Err(io::Error::other(super::error::describe_wire_error(
+            &reply["error"],
+            None,
+        )));
+    }
+    let devices = reply["devices"].as_array().cloned().unwrap_or_default();
+    match devices.len() {
+        0 => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no devices known yet — plug one in, then check `serialwrap devices`",
+        )),
+        1 => Ok(devices[0]["id"].as_str().unwrap_or_default().to_string()),
+        _ => {
+            let ids: Vec<&str> = devices.iter().filter_map(|d| d["id"].as_str()).collect();
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "multiple devices known ({}); specify one explicitly (see `serialwrap devices`)",
+                    ids.join(", ")
+                ),
+            ))
+        }
+    }
+}

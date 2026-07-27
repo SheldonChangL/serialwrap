@@ -453,11 +453,45 @@ impl DeviceQueryState {
                         });
                         added = true;
                     }
-                    Record::Tx { .. } => {
-                        // Not surfaced by tail/read_since/query_events at
-                        // this stage — the write path itself is deferred
-                        // (T4.x's write gate); revisit what audit view a
-                        // `tx` record needs once `write` actually lands.
+                    Record::Tx {
+                        seq,
+                        t_mono,
+                        t_wall,
+                        client,
+                        client_type,
+                        gate,
+                        data_b64,
+                    } => {
+                        // T2.1 (issue #8): now that `write` actually lands
+                        // (see `protocol::session`'s `Request::Write`
+                        // handler), a `tx` record needs exactly the same
+                        // "never filtered, always in the tail/subscribe
+                        // stream" treatment `Gate` already gets above —
+                        // "TX 事件入流，所有 viewer 即時看到回顯" is a T2.1
+                        // acceptance criterion, and there is no other path
+                        // into `tail`/`read_since`/`subscribe` than this
+                        // `events` vec. `client` already carries
+                        // `"name:pid"` (see `protocol::session`'s
+                        // `changed_by` convention), so the kernel-verified
+                        // identity travels with every tx event without
+                        // needing a new wire field.
+                        let mut extra = serde_json::Map::new();
+                        extra.insert("client".to_string(), client.clone().into());
+                        extra.insert(
+                            "client_type".to_string(),
+                            serde_json::to_value(client_type).unwrap_or(serde_json::Value::Null),
+                        );
+                        extra.insert("gate".to_string(), gate.clone().into());
+                        extra.insert("data_b64".to_string(), data_b64.clone().into());
+                        events.push(OobRecord {
+                            seq: *seq,
+                            t_mono: *t_mono,
+                            t_wall: t_wall.clone(),
+                            kind: Kind::Tx,
+                            name: None,
+                            extra,
+                        });
+                        added = true;
                     }
                 }
             }
@@ -837,6 +871,34 @@ mod tests {
 
     fn recorder(tmp: &std::path::Path) -> Recorder {
         Recorder::open(tmp, "dev", RecorderConfig::default()).expect("open recorder")
+    }
+
+    #[test]
+    fn tx_record_is_surfaced_as_an_oob_event_with_identity_and_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+        recorder
+            .append_tx(
+                b"status\n",
+                "agent-writer:4242",
+                wrap_proto::ClientType::Human,
+                "human_rw",
+            )
+            .unwrap();
+        state.ingest(&recorder);
+        let page = state.read_since(0, None, None).unwrap();
+        assert_eq!(page.events.len(), 1, "{:?}", page.events);
+        let ev = &page.events[0];
+        assert_eq!(ev.kind, Kind::Tx);
+        assert_eq!(
+            ev.extra.get("client").and_then(|v| v.as_str()),
+            Some("agent-writer:4242")
+        );
+        assert_eq!(
+            ev.extra.get("gate").and_then(|v| v.as_str()),
+            Some("human_rw")
+        );
     }
 
     #[test]

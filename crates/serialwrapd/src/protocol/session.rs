@@ -36,7 +36,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 
-use wrap_proto::{ErrorCode, HelloAck, HelloRequest, Permission, Request, WireError};
+use wrap_proto::{ErrorCode, HelloAck, HelloRequest, LineEnding, Permission, Request, WireError};
 
 use crate::port::DeviceId;
 use crate::query::{OobRecord, QueryError, QueryPage, WaitForOutcome};
@@ -155,6 +155,23 @@ fn backend_error_to_wire(e: &io::Error, device: &str) -> WireError {
         ),
         io::ErrorKind::InvalidInput => WireError::new(ErrorCode::InvalidRequest, e.to_string()),
         _ => WireError::new(ErrorCode::Internal, e.to_string()),
+    }
+}
+
+/// Bytes to append after `text` for a given [`LineEnding`] — the write
+/// path's own encoding step (`TASKS.md` T2.1, issue #8). See the wiki:
+/// sending the wrong line ending to a firmware CLI is "a classic source of
+/// 'the board ignored my command'", which is exactly why this is a
+/// parameter on the request rather than a client-side convention. Kept
+/// local to this module (not added to `wrap_proto::LineEnding` itself)
+/// since only the write path needs the actual byte sequence; `data_b64`
+/// writes never go through this at all — see the `Request::Write` handler.
+fn line_ending_bytes(line_ending: LineEnding) -> &'static [u8] {
+    match line_ending {
+        LineEnding::Lf => b"\n",
+        LineEnding::Crlf => b"\r\n",
+        LineEnding::Cr => b"\r",
+        LineEnding::None => b"",
     }
 }
 
@@ -833,18 +850,148 @@ async fn dispatch(
             );
         }
 
-        Request::Write { .. } => send(
-            shared,
-            client_id,
-            tx,
-            err_reply(
-                Some(id),
-                WireError::new(
-                    ErrorCode::PermissionDenied,
-                    "write gate not implemented yet (see TASKS.md T4.1)",
+        Request::Write {
+            device,
+            data_b64,
+            text,
+            line_ending,
+        } => {
+            // Who's asking, and what they're currently allowed to do —
+            // looked up fresh (never cached from the handshake) so a
+            // `demote` mid-connection takes effect on the very next write
+            // (`TASKS.md` T2.3 acceptance criterion 10).
+            let Some((client_type, permission)) = shared.clients.type_and_permission(client_id)
+            else {
+                // Unreachable in practice: `client_id` is this same
+                // connection's own registry row, registered before
+                // `dispatch` is ever reached and only removed after
+                // `reader_loop` returns. Handled explicitly rather than
+                // unwrapping anyway, matching this module's no-panic-on-
+                // any-input stance.
+                send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(
+                        Some(id),
+                        WireError::new(ErrorCode::Internal, "client identity not found"),
+                    ),
+                );
+                return;
+            };
+
+            // The one write-gate rule this task implements (`TASKS.md`
+            // T2.1, issue #8): a `human` client's `ReadWrite` permission
+            // passes straight through — per the Security-model wiki's
+            // policy table, "human is the authority the gate answers to;
+            // gating them only lets a human turn the gate off". Every
+            // other permission level (`agent`'s `ReadGatedWrite`, `tool`'s
+            // `LeaseOnly`) still gets exactly the same structured
+            // `permission_denied` this endpoint has always returned — the
+            // real whitelist/danger/pending rule engine is T4.1's job, not
+            // this one's.
+            if permission != Permission::ReadWrite {
+                send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(
+                        Some(id),
+                        WireError::new(
+                            ErrorCode::PermissionDenied,
+                            "write gate not implemented yet (see TASKS.md T4.1)",
+                        ),
+                    ),
+                );
+                return;
+            }
+
+            // `data_b64` (used for `--hex` and raw/binary payloads) is sent
+            // exactly as given, no line ending appended: a caller who
+            // spelled out exact bytes wants exactly those bytes on the
+            // wire. `text` gets `line_ending`'s bytes appended server-side
+            // — the wire contract the Client-protocol wiki documents.
+            let bytes = match (data_b64, text) {
+                (Some(b64), _) => match BASE64.decode(&b64) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        send(
+                            shared,
+                            client_id,
+                            tx,
+                            err_reply(
+                                Some(id),
+                                WireError::new(
+                                    ErrorCode::InvalidRequest,
+                                    format!("invalid data_b64: {e}"),
+                                ),
+                            ),
+                        );
+                        return;
+                    }
+                },
+                (None, Some(text)) => {
+                    let mut bytes = text.into_bytes();
+                    bytes.extend_from_slice(line_ending_bytes(line_ending));
+                    bytes
+                }
+                (None, None) => {
+                    send(
+                        shared,
+                        client_id,
+                        tx,
+                        err_reply(
+                            Some(id),
+                            WireError::new(
+                                ErrorCode::InvalidRequest,
+                                "write requires `data_b64` or `text`",
+                            ),
+                        ),
+                    );
+                    return;
+                }
+            };
+
+            let dev = DeviceId(device.clone());
+            match shared.backend.write_bytes(&dev, &bytes) {
+                Ok(()) => {
+                    // Record the tx event *after* the bytes are actually
+                    // out the port, carrying this write's identity
+                    // (`changed_by` is already this connection's
+                    // `"name:pid"` string — the same kernel-verified-pid
+                    // convention `config_change`'s `changed_by` uses),
+                    // type, and the `"human_rw"` gate label the
+                    // Security-model wiki documents for a human's
+                    // always-audited-never-gated write. A failure to
+                    // append is logged, not returned as an error to the
+                    // client: the write itself already succeeded, and
+                    // reporting it as failed would invite a duplicate
+                    // retry that writes the same bytes to the device
+                    // twice.
+                    if let Some(recorder) = shared.backend.recorder(&dev) {
+                        if let Err(e) =
+                            recorder.append_tx(&bytes, changed_by, client_type, "human_rw")
+                        {
+                            eprintln!(
+                                "serialwrapd: protocol: failed to append tx record for {device}: {e}"
+                            );
+                        }
+                    }
+                    send(
+                        shared,
+                        client_id,
+                        tx,
+                        ok_reply(id, serde_json::json!({ "written": bytes.len() })),
+                    );
+                }
+                Err(e) => send(
+                    shared,
+                    client_id,
+                    tx,
+                    err_reply(Some(id), backend_error_to_wire(&e, &device)),
                 ),
-            ),
-        ),
+            }
+        }
         Request::LeaseAcquire { .. } => send(
             shared,
             client_id,
@@ -915,7 +1062,49 @@ async fn dispatch(
         }
 
         Request::Kick { client_id: target } => {
+            // Snapshot the target's identity *before* kicking — `kick`
+            // only notifies the connection's `kill` signal, it doesn't
+            // remove the registry row (that happens once the connection
+            // actually unwinds), but grabbing this first avoids any race
+            // with that teardown.
+            let target_snapshot = shared
+                .clients
+                .list()
+                .into_iter()
+                .find(|c| c.client_id == target);
             if shared.clients.kick(target) {
+                // `TASKS.md` T2.3 acceptance criterion 9: "kick 後...記事
+                // 件". A kick is about a *client*, not any one device —
+                // this daemon's only event stream is per-device (see
+                // `recorder.rs`), so the client_kicked event is broadcast
+                // to every device this backend currently knows about
+                // (harmless extra visibility on an operator-initiated,
+                // infrequent action; never a gap for whichever device an
+                // operator is actually watching).
+                if let Some(snap) = &target_snapshot {
+                    for summary in shared.backend.list_devices() {
+                        let Some(recorder) = shared.backend.recorder(&summary.id) else {
+                            continue;
+                        };
+                        let mut extra = serde_json::Map::new();
+                        extra.insert("client_id".to_string(), target.into());
+                        extra.insert("name".to_string(), snap.name.clone().into());
+                        extra.insert("pid".to_string(), snap.pid.into());
+                        extra.insert(
+                            "client_type".to_string(),
+                            serde_json::to_value(snap.client_type)
+                                .unwrap_or(serde_json::Value::Null),
+                        );
+                        extra.insert("kicked_by".to_string(), changed_by.into());
+                        if let Err(e) = recorder.append_event("client_kicked", extra) {
+                            eprintln!(
+                                "serialwrapd: protocol: failed to append client_kicked event for \
+                                 {}: {e}",
+                                summary.id.0
+                            );
+                        }
+                    }
+                }
                 send(
                     shared,
                     client_id,
