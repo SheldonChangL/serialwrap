@@ -7,6 +7,7 @@
 //! `tail`/`read_since`/`subscribe` actually returned.
 
 use std::io::{self, Write};
+use tokio::signal::unix::{signal, Signal, SignalKind};
 
 use clap::Args;
 use serde_json::Value;
@@ -46,6 +47,16 @@ pub struct TailArgs {
 }
 
 pub async fn run(args: TailArgs) -> io::Result<()> {
+    // Arm the interrupt handler before anything is printed.
+    //
+    // `tokio::signal::ctrl_c()` registers lazily — the handler is installed
+    // when the future is first polled, which under `-f` would not happen
+    // until inside `follow`'s `select!`, after the history lines have already
+    // been written. A Ctrl-C arriving in that window hit the default
+    // disposition and killed the process instead of exiting cleanly.
+    // `signal()` installs on construction, so doing it first closes the gap.
+    let mut interrupt = signal(SignalKind::interrupt())?;
+
     let socket_path = resolve_socket_path()?;
     let (mut client, _ack) = DaemonClient::connect(&socket_path, "serialwrap-tail", "human")
         .await
@@ -66,7 +77,7 @@ pub async fn run(args: TailArgs) -> io::Result<()> {
     };
 
     if args.follow {
-        follow(&mut client, &device, cursor, &mut out).await?;
+        follow(&mut client, &device, cursor, &mut out, &mut interrupt).await?;
     }
     Ok(())
 }
@@ -151,6 +162,7 @@ async fn follow(
     device: &str,
     cursor: u64,
     out: &mut impl Write,
+    interrupt: &mut Signal,
 ) -> io::Result<()> {
     client
         .send(Request::Subscribe {
@@ -160,11 +172,9 @@ async fn follow(
         })
         .await?;
 
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
     loop {
         let reply = tokio::select! {
-            _ = &mut ctrl_c => return Ok(()),
+            _ = interrupt.recv() => return Ok(()),
             reply = client.read_push() => reply?,
         };
         check_ok(&reply, Some(device))?;
