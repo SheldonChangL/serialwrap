@@ -1,5 +1,21 @@
 <script lang="ts">
+  /**
+   * The full port inventory, shown in a status-bar drawer.
+   *
+   * The device *picker* in the log header answers "which port am I reading";
+   * this answers "what else is attached, and what does the daemon know about
+   * it" — full ids and paths, including ports that have disconnected. Rows
+   * are selectable here too, because a list of ports you can't switch to is
+   * exactly the dead end this page used to be.
+   */
   import { fetchDevices, type DeviceSummary } from "./api";
+  import { deviceLabel, sortDevices } from "./devices";
+
+  interface Props {
+    selectedId?: string | null;
+    onSelect?: (id: string) => void;
+  }
+  const { selectedId = null, onSelect }: Props = $props();
 
   type LoadState =
     | { kind: "loading" }
@@ -11,8 +27,7 @@
   async function load(): Promise<void> {
     state = { kind: "loading" };
     try {
-      const devices = await fetchDevices();
-      state = { kind: "loaded", devices };
+      state = { kind: "loaded", devices: sortDevices(await fetchDevices()) };
     } catch (e) {
       state = { kind: "error", message: e instanceof Error ? e.message : String(e) };
     }
@@ -23,23 +38,36 @@
 
 <section class="devices" data-testid="device-list" data-state={state.kind}>
   <div class="header">
-    <h2>Devices</h2>
-    <button type="button" onclick={load}>Refresh</button>
+    <span class="label-eyebrow">Everything the daemon has seen</span>
+    <button type="button" class="refresh" onclick={load}>Refresh</button>
   </div>
 
   {#if state.kind === "loading"}
     <p class="hint">Loading…</p>
   {:else if state.kind === "error"}
-    <p class="hint error">GET /api/devices failed: {state.message}</p>
+    <p class="hint error">Can't reach the daemon — {state.message}</p>
   {:else if state.devices.length === 0}
-    <p class="hint">No devices connected.</p>
+    <p class="hint">
+      No serial ports found. Plug a board in; recording starts the moment it enumerates.
+    </p>
   {:else}
     <ul>
       {#each state.devices as device (device.id)}
         <li>
-          <span class="dot" class:connected={device.connected}></span>
-          <span class="id">{device.id}</span>
-          <span class="path">{device.path ?? "(no path)"}</span>
+          <button
+            type="button"
+            class="row"
+            class:current={device.id === selectedId}
+            disabled={!onSelect}
+            aria-current={device.id === selectedId}
+            onclick={() => onSelect?.(device.id)}
+          >
+            <span class="dot" class:connected={device.connected}></span>
+            <span class="cell name">{deviceLabel(device)}</span>
+            <span class="cell path">{device.path ?? "(no path)"}</span>
+            <span class="cell id">{device.id}</span>
+            {#if !device.connected}<span class="cell state">disconnected</span>{/if}
+          </button>
         </li>
       {/each}
     </ul>
@@ -47,73 +75,124 @@
 </section>
 
 <style>
-  .devices {
-    border: 1px solid var(--border);
-    border-radius: 0.5rem;
-    padding: 1rem;
-    background: var(--surface);
-  }
-
   .header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 1rem;
+    gap: var(--space-4);
   }
 
-  h2 {
-    margin: 0;
-    font-size: 1rem;
-  }
-
-  button {
+  .refresh {
     font: inherit;
-    padding: 0.25rem 0.75rem;
-    border-radius: 0.35rem;
+    font-size: var(--text-sm);
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-sm);
     border: 1px solid var(--border);
     background: var(--surface-raised);
-    color: inherit;
+    color: var(--text-dim);
     cursor: pointer;
+  }
+
+  .refresh:hover {
+    color: var(--text);
+    border-color: var(--border-strong);
   }
 
   .hint {
     color: var(--text-dim);
-    margin: 0.75rem 0 0;
+    font-size: var(--text-sm);
+    margin: var(--space-3) 0 0;
+    line-height: 1.6;
   }
 
   .hint.error {
-    color: var(--dot-closed);
+    color: var(--gate);
   }
 
   ul {
     list-style: none;
-    margin: 0.75rem 0 0;
+    margin: var(--space-2) 0 0;
     padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
   }
 
-  li {
+  .row {
     display: flex;
-    align-items: center;
-    gap: 0.5rem;
+    align-items: baseline;
+    gap: var(--space-3);
+    width: 100%;
+    text-align: left;
+    font: inherit;
     font-family: var(--font-mono);
-    font-size: 0.875rem;
+    font-size: var(--text-sm);
+    padding: var(--space-1) var(--space-2);
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .row:hover:not(:disabled) {
+    background: var(--surface-raised);
+  }
+
+  .row:disabled {
+    cursor: default;
+  }
+
+  .row.current {
+    background: var(--rx-bg);
+  }
+
+  .cell {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .name {
+    flex: none;
+    min-width: 10rem;
+  }
+
+  .path {
+    flex: 1;
+    color: var(--text-dim);
+  }
+
+  .id {
+    color: var(--text-faint);
+    font-size: var(--text-xs);
+  }
+
+  .state {
+    flex: none;
+    color: var(--text-faint);
+    font-size: var(--text-xs);
   }
 
   .dot {
     width: 0.5rem;
     height: 0.5rem;
     border-radius: 50%;
-    background: var(--dot-closed);
+    background: var(--text-faint);
+    flex: none;
+    align-self: center;
   }
 
   .dot.connected {
-    background: var(--dot-open);
+    background: var(--ok);
   }
 
-  .path {
-    color: var(--text-dim);
+  /* Narrow: the daemon id is the first thing to drop — the path already
+   * identifies the port, and the id is only needed when you're comparing
+   * against a CLI invocation. */
+  @media (max-width: 40rem) {
+    .id {
+      display: none;
+    }
+    .name {
+      min-width: 0;
+    }
   }
 </style>

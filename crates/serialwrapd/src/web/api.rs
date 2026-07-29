@@ -47,6 +47,18 @@
 //! - [`get_config`] additionally computes `decode_health` — see
 //!   [`compute_decode_health`]'s doc comment for why this API didn't already
 //!   exist and what it measures.
+//!
+//! # The operator's write path
+//!
+//! - `POST /api/devices/:id/write`/[`write_device`]: the GUI's own
+//!   serial-port write, added because the earlier milestones left the browser
+//!   read-only — the CLI had `serialwrap write` and an agent had the MCP
+//!   `write` tool, but the one surface an operator actually sits in front of
+//!   could not send a byte, which made the GUI half a terminal. Same
+//!   ungated-for-humans posture as the config endpoints above, and the same
+//!   `tx` audit record every other write path produces. See that function's
+//!   doc comment for why bypassing the gate here is the policy rather than a
+//!   hole in it.
 //! - [`list_approvals`]/[`approve_approval`]/[`deny_approval`]: the
 //!   approval card's read/decide API (T5.4, issue #21) — calls
 //!   [`crate::protocol::Shared::gate`] directly, the *exact* [`crate::gate::Gate`]
@@ -94,7 +106,7 @@ use crate::presentation::{event_to_json, page_to_json, PresentationLimits};
 use crate::protocol::registry::Activity;
 use crate::protocol::Shared;
 use crate::query::{AssembledLine, OobRecord, QueryError};
-use wrap_proto::{ClientType, ExportBound, ExportFormat, Filter, Permission};
+use wrap_proto::{ClientType, ExportBound, ExportFormat, Filter, LineEnding, Permission};
 
 /// Identity string the GUI's ungated config/control-line/approval endpoints
 /// record as `changed_by`/`approved_by` in place of a kernel-verified UDS
@@ -115,6 +127,7 @@ pub fn routes() -> Router<Arc<Shared>> {
         .route("/api/devices/{id}/tail", get(tail))
         .route("/api/devices/{id}/config", get(get_config).post(set_config))
         .route("/api/devices/{id}/control_lines", post(set_control_lines))
+        .route("/api/devices/{id}/write", post(write_device))
         .route("/api/devices/{id}/test/inject", post(test_inject))
         .route(
             "/api/devices/{id}/test/submit_write",
@@ -334,8 +347,117 @@ async fn set_control_lines(
     }
 }
 
+/// Body for [`write_device`] — mirrors `Request::Write`'s payload shape
+/// (`protocol::session`) field-for-field, so the two write paths take the
+/// same input in the same encoding: `text` gets `line_ending` appended
+/// server-side, `data_b64` is sent as exactly the bytes given. There is
+/// deliberately no `hex` field even though the GUI's own input bar offers a
+/// HEX mode — the browser parses those digits and base64-encodes them, which
+/// keeps hex parsing in the two places that already own it (`cli::write` and
+/// `mcp::tools`) instead of adding a third copy here.
+#[derive(Debug, Deserialize)]
+struct WriteBody {
+    text: Option<String>,
+    data_b64: Option<String>,
+    #[serde(default)]
+    line_ending: Option<LineEnding>,
+}
+
+/// `POST /api/devices/:id/write` — the GUI operator's own write path.
+///
+/// Bypasses the gate and writes immediately, because the operator sitting at
+/// this page *is* the authority the gate answers to: per the Security-model
+/// wiki's policy-by-client-type table, a `human` client's writes go straight
+/// through (`protocol::session`'s `Request::Write` handler takes the exact
+/// same `Permission::ReadWrite` branch with the same `"human_rw"` gate
+/// label), since gating the operator only teaches them to turn the gate off.
+/// This is not a hole in the gate: an *agent* reaching this daemon over MCP
+/// still goes through [`crate::gate::Gate::submit_write`] and still needs a
+/// human decision, and this endpoint is unreachable from anywhere but
+/// loopback ([`crate::web::guard`]).
+///
+/// "Bypasses the gate" never means "unaudited" — the `tx` record appended on
+/// success is the same record every other client's write produces, in the
+/// same append-only stream, so `serialwrap audit` and every other client's
+/// `tail` see a GUI write exactly like a CLI or approved-agent one.
+async fn write_device(
+    State(shared): State<Arc<Shared>>,
+    Path(id): Path<String>,
+    Json(body): Json<WriteBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let dev = DeviceId(id.clone());
+    let Some(recorder) = shared.backend.recorder(&dev) else {
+        return device_not_found_response(&id);
+    };
+
+    // Same decode order and same errors as `Request::Write` — `data_b64`
+    // wins and is sent verbatim, `text` gets the line ending appended. LF is
+    // the default for a bare `text` here (matching the wire default) so the
+    // common case, an operator typing a command and pressing Enter, needs no
+    // extra field.
+    let bytes = match (body.data_b64, body.text) {
+        (Some(b64), _) => match BASE64.decode(&b64) {
+            Ok(bytes) => bytes,
+            Err(e) => return invalid_request_response(format!("invalid data_b64: {e}")),
+        },
+        (None, Some(text)) => {
+            let mut bytes = text.into_bytes();
+            bytes.extend_from_slice(crate::protocol::session::line_ending_bytes(
+                body.line_ending.unwrap_or(LineEnding::Lf),
+            ));
+            bytes
+        }
+        (None, None) => {
+            return invalid_request_response("write requires `data_b64` or `text`".to_string())
+        }
+    };
+
+    // A zero-byte write would put nothing on the wire but still append a `tx`
+    // record, leaving an audit entry for something that never happened —
+    // rejected rather than silently recorded. Note this is only reachable
+    // with an explicitly empty payload: `text: ""` with any line ending but
+    // `none` still sends that ending, which is a real keystroke (a bare
+    // Enter) and goes through.
+    if bytes.is_empty() {
+        return invalid_request_response("nothing to write: payload is empty".to_string());
+    }
+
+    match shared.backend.write_bytes(&dev, &bytes) {
+        Ok(()) => {
+            // Appended only after the bytes are actually out the port, and a
+            // failure here is logged rather than returned — the same
+            // reasoning `write_and_reply` documents: the write already
+            // happened, and reporting it as failed invites a retry that
+            // writes the same bytes to the device twice.
+            if let Err(e) =
+                recorder.append_tx(&bytes, GUI_CHANGED_BY, ClientType::Human, "human_rw")
+            {
+                eprintln!(
+                    "serialwrapd: web: write: failed to append tx record for an already-written \
+                     payload on {id}: {e}"
+                );
+            }
+            Json(json!({ "written": bytes.len() })).into_response()
+        }
+        Err(e) => backend_error_response(&e, &id),
+    }
+}
+
+/// `400 invalid_request` in this layer's error envelope — the shape
+/// [`backend_error_response`] and the gate endpoints already use.
+fn invalid_request_response(message: String) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": { "code": "invalid_request", "message": message } })),
+    )
+        .into_response()
+}
+
 /// Map a [`crate::protocol::backend::DeviceBackend`] error to an HTTP
-/// response — shared by [`set_config`]/[`set_control_lines`]. Not a full
+/// response — shared by [`set_config`]/[`set_control_lines`]/[`write_device`].
+/// Not a full
 /// mirror of `protocol::session`'s private `backend_error_to_wire` (out of
 /// this task's scope to touch/reuse — see `web::mod`'s module doc comment on
 /// why this layer independently shapes JSON rather than calling into
@@ -2645,5 +2767,155 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bytes, direct.bytes);
+    }
+
+    // ---- the operator's write path (`write_device`) ----
+
+    /// [`shared_with_device`] plus a real file behind the device's
+    /// `write_bytes`, so these tests can read back the exact bytes that
+    /// reached the "port" instead of trusting the handler's own reply.
+    fn shared_with_writable_device(
+        device_id: &str,
+    ) -> (Arc<Shared>, tempfile::TempDir, DeviceId, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(
+            crate::recorder::Recorder::open(
+                tmp.path(),
+                device_id,
+                crate::recorder::RecorderConfig::default(),
+            )
+            .expect("open recorder"),
+        );
+        let backend = Arc::new(TestBackend::new());
+        let id = DeviceId(device_id.to_string());
+        backend.register(id.clone(), recorder);
+        let sink = tmp.path().join("port-out.bin");
+        backend.register_writer(&id, std::fs::File::create(&sink).expect("create sink"));
+        let shared = Arc::new(Shared::new(
+            backend as Arc<dyn DeviceBackend>,
+            "test-version",
+            tmp.path().to_path_buf(),
+        ));
+        (shared, tmp, id, sink)
+    }
+
+    /// The `tx` records in a device's current tail, in order.
+    async fn tx_events(shared: &Arc<Shared>, device_id: &str) -> Vec<serde_json::Value> {
+        let (status, body) = get(
+            crate::web::router(shared.clone()),
+            &format!("/api/devices/{device_id}/tail?n=50"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        body["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .filter(|e| e["kind"] == "tx")
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn write_appends_the_requested_line_ending_and_audits_the_result() {
+        let (shared, _tmp, _id, sink) = shared_with_writable_device("dev-1");
+
+        let (status, body) = post(
+            crate::web::router(shared.clone()),
+            "/api/devices/dev-1/write",
+            json!({ "text": "status", "line_ending": "crlf" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["written"], 8);
+        assert_eq!(
+            std::fs::read(&sink).unwrap(),
+            b"status\r\n",
+            "the line ending the operator picked must be what reaches the port"
+        );
+
+        // "Bypasses the gate" must never mean "unaudited" — see
+        // `write_device`'s doc comment.
+        let events = tx_events(&shared, "dev-1").await;
+        assert_eq!(events.len(), 1, "one write, one tx record");
+        assert_eq!(events[0]["gate"], "human_rw");
+        assert_eq!(events[0]["client_type"], "human");
+        assert_eq!(events[0]["client"], GUI_CHANGED_BY);
+    }
+
+    #[tokio::test]
+    async fn write_sends_base64_bytes_verbatim_with_no_line_ending() {
+        let (shared, _tmp, _id, sink) = shared_with_writable_device("dev-1");
+
+        let (status, body) = post(
+            crate::web::router(shared.clone()),
+            "/api/devices/dev-1/write",
+            // `line_ending` is deliberately set *and* deliberately ignored:
+            // a caller who spelled out exact bytes gets exactly those bytes,
+            // the same rule `Request::Write` follows.
+            json!({ "data_b64": BASE64.encode([0xde, 0xad, 0xbe, 0xef]), "line_ending": "crlf" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["written"], 4);
+        assert_eq!(std::fs::read(&sink).unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[tokio::test]
+    async fn write_of_a_bare_enter_is_a_real_keystroke_and_goes_through() {
+        let (shared, _tmp, _id, sink) = shared_with_writable_device("dev-1");
+
+        let (status, _) = post(
+            crate::web::router(shared.clone()),
+            "/api/devices/dev-1/write",
+            json!({ "text": "", "line_ending": "lf" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(std::fs::read(&sink).unwrap(), b"\n");
+    }
+
+    #[tokio::test]
+    async fn write_rejects_a_payload_that_would_put_nothing_on_the_wire() {
+        let (shared, _tmp, _id, sink) = shared_with_writable_device("dev-1");
+
+        let (status, body) = post(
+            crate::web::router(shared.clone()),
+            "/api/devices/dev-1/write",
+            json!({ "text": "", "line_ending": "none" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert!(std::fs::read(&sink).unwrap().is_empty());
+        assert!(
+            tx_events(&shared, "dev-1").await.is_empty(),
+            "a rejected write must not leave an audit record for something that never happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_a_request_carrying_neither_text_nor_bytes() {
+        let (shared, _tmp, _id, _sink) = shared_with_writable_device("dev-1");
+        let (status, body) = post(
+            crate::web::router(shared.clone()),
+            "/api/devices/dev-1/write",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn write_404s_for_an_unknown_device() {
+        let (shared, _tmp, _id, _sink) = shared_with_writable_device("dev-1");
+        let (status, _) = post(
+            crate::web::router(shared.clone()),
+            "/api/devices/nope/write",
+            json!({ "text": "status" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

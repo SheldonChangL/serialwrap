@@ -462,23 +462,26 @@ fn assemble_txt_lines(records: &[Record]) -> Vec<TxtLine> {
         let Ok(bytes) = BASE64.decode(data_b64) else {
             continue;
         };
-        for &b in &bytes {
-            if b == b'\n' {
-                let mut raw = std::mem::take(&mut partial);
-                if raw.last() == Some(&b'\r') {
-                    raw.pop();
-                }
-                lines.push(TxtLine {
-                    seq: *seq,
-                    t_wall: t_wall.clone(),
-                    raw,
-                });
-                partial_pos = None;
-            } else {
-                partial.push(b);
-                partial_pos = Some((*seq, t_wall.clone()));
-            }
+        // Assemble with the same rule the live query layer uses — both `\r`
+        // and `\n` terminate, `\r\n` counts once, empty stretches dropped.
+        // This used to be a second, `\n`-only implementation, which is why a
+        // CR-terminated device's `txt` export came out as hex dumps while
+        // `serialwrap tail` showed it fine.
+        partial.extend_from_slice(&bytes);
+        let (completed, remainder) = crate::query::Terminator::Any.split(&partial);
+        partial = remainder;
+        for raw in completed {
+            lines.push(TxtLine {
+                seq: *seq,
+                t_wall: t_wall.clone(),
+                raw,
+            });
         }
+        partial_pos = if partial.is_empty() {
+            None
+        } else {
+            Some((*seq, t_wall.clone()))
+        };
     }
     // A trailing, never-newline-terminated tail: unlike the live query
     // layer (which deliberately holds this back — see `query.rs` — since

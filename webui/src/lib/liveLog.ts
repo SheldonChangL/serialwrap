@@ -378,11 +378,31 @@ export class LiveLogBuffer {
   private lastNonGapTMs: number | null = null;
   private gapThresholdS = DEFAULT_GAP_THRESHOLD_S;
 
+  /** Longest data line seen so far, in characters.
+   *
+   * Rows never wrap (fixed-height virtual scrolling depends on that), so the
+   * log pane scrolls horizontally as one surface and needs to know how wide
+   * that surface is. Absolutely-positioned virtual rows contribute nothing
+   * to their parent's intrinsic width, so `max-content` can't do this for
+   * us; tracking the longest line during ingest and multiplying by the
+   * monospace `ch` unit can, at O(1) per line.
+   *
+   * Only ever grows — eviction doesn't recompute it. An over-wide scroll
+   * range after the longest line ages out is invisible in practice, and
+   * rescanning the buffer to reclaim a few hundred pixels would trade a real
+   * cost for a cosmetic one. */
+  maxChars = 0;
+
   /** First real (non-gap) item's display time, for `"relative"` timestamp
    * mode — `null` until at least one item has been ingested. */
   sessionStartMs: number | null = null;
 
   private pushRaw(item: LogItem): void {
+    if (item.kind === "line") {
+      const chars =
+        item.render.kind === "text" ? item.render.text.length : item.render.hexPreview.length;
+      if (chars > this.maxChars) this.maxChars = chars;
+    }
     if (item.kind !== "gap") {
       if (this.sessionStartMs === null) this.sessionStartMs = item.tMs;
       if (this.lastNonGapTMs !== null) {
@@ -443,6 +463,22 @@ export class LiveLogBuffer {
   setFilter(pattern: string | null): void {
     this.filterRegex = pattern ? new RegExp(pattern) : null;
     this.filtered = this.items.filter((it) => this.matchesFilter(it));
+  }
+
+  /** Drop everything this tab is currently showing.
+   *
+   * A view-only operation: the daemon's recording is append-only and is not
+   * touched, so the cleared lines remain in `serialwrap tail`, in `export`,
+   * and in a reload of this page. That distinction is why the control is
+   * labelled "Clear view" rather than "Clear" — in a tool whose promise is
+   * that nothing is lost, a button that looks like it deletes the log had
+   * better not be ambiguous. */
+  clear(): void {
+    this.items = [];
+    this.filtered = [];
+    this.lastNonGapTMs = null;
+    this.sessionStartMs = null;
+    this.maxChars = 0;
   }
 
   formatTimestamp(item: LogItem, mode: TimestampMode, previousTMs: number | null): string {

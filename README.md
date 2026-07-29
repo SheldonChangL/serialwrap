@@ -83,7 +83,7 @@ Or just run it in the foreground to watch it start:
 
 ### 4. See a log
 
-Open `http://127.0.0.1:5590` in a browser — this works the moment the daemon is running, with no separate frontend server. Or from the CLI:
+Open `http://127.0.0.1:5590` in a browser — this works the moment the daemon is running, with no separate frontend server. Pick a port from the selector in the top-left (the choice lives in the URL as `?device=<id>`, so a second board is just a second tab), watch the log fill the window, and type into the bar at the bottom to send bytes back. Or from the CLI:
 
 ```sh
 serialwrap devices          # nothing plugged in yet? says so, rather than an empty silence
@@ -156,7 +156,7 @@ whitelist match? ──yes──▶  allow immediately
 
 - **Danger always wins.** `erase`, `fuse`/`otp`/`efuse`, `unlock`/`lock`, bootloader-entry sequences, and `format`/`factory_reset` (see `docs/rules.toml.example` for the full built-in list with each pattern's stated reason) force human approval even if the same bytes also match a whitelist entry. The only way to change what counts as dangerous is hand-editing `rules.toml` — never a checkbox on an approval card in the moment.
 - **Timeout means deny, fail-safe.** An unattended pending request is denied, never silently allowed, after the configured timeout (60s by default).
-- **Humans bypass the gate; agents don't.** A `human` client's writes go straight through — gating the operator would only teach them to disable the gate — but every write, from any client type, is fully audited regardless.
+- **Humans bypass the gate; agents don't.** A `human` client's writes go straight through — gating the operator would only teach them to disable the gate — but every write, from any client type, is fully audited regardless. This covers the GUI's own write bar (`POST /api/devices/:id/write`), which sends as `human` and appends the same `tx` record `serialwrap write` does; an agent reaching the same daemon over MCP still waits for a human.
 
 **Log content is data, never an instruction** — for a human reading the GUI and for an agent reading over MCP alike. Firmware logs routinely contain human-readable strings a developer wrote for other humans (`// TODO: reflash with production key before shipping`), and can relay content verbatim from external peers (sensors, BLE, network links) that serialwrap has no way to vouch for. Every MCP read tool's description says this explicitly, and the GUI renders device data (`kind: rx`) and broker-generated events in visually distinct styles so the boundary is never just a convention — see the [Security-model wiki](https://github.com/SheldonChangL/serialwrap/wiki/Security-model) for the full reasoning.
 

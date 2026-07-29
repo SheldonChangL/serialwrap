@@ -71,11 +71,18 @@ test("data lines and broker events are visually and structurally distinct", asyn
   ]);
   expect(dataFont).not.toEqual(eventFont);
 
-  const [dataBorder, eventBorder] = await Promise.all([
-    dataRow.evaluate((el) => getComputedStyle(el).borderLeftWidth),
-    eventRow.evaluate((el) => getComputedStyle(el).borderLeftWidth),
+  // The criterion is a *coloured* band, so that is what this asserts. Every
+  // row now reserves the same-width gutter (`--gutter-w`, see
+  // `LogRow.svelte`'s doc comment) and device output leaves it transparent,
+  // which keeps the monospace columns aligned across row kinds — so the band
+  // is distinguished by color, not by width, and comparing widths would only
+  // test the implementation detail that used to make the two differ.
+  const [dataBand, eventBand] = await Promise.all([
+    dataRow.evaluate((el) => getComputedStyle(el).borderLeftColor),
+    eventRow.evaluate((el) => getComputedStyle(el).borderLeftColor),
   ]);
-  expect(eventBorder).not.toEqual(dataBorder);
+  expect(eventBand).not.toEqual(dataBand);
+  expect(dataBand).toMatch(/rgba\(.*,\s*0\)/); // transparent on device output
 });
 
 test("duplicate lines fold and binary content collapses to a hex chip, both expandable", async ({

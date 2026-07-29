@@ -195,11 +195,14 @@ fn lease_error_to_wire(e: &LeaseError, context: &str) -> WireError {
 /// path's own encoding step (`TASKS.md` T2.1, issue #8). See the wiki:
 /// sending the wrong line ending to a firmware CLI is "a classic source of
 /// 'the board ignored my command'", which is exactly why this is a
-/// parameter on the request rather than a client-side convention. Kept
-/// local to this module (not added to `wrap_proto::LineEnding` itself)
-/// since only the write path needs the actual byte sequence; `data_b64`
-/// writes never go through this at all — see the `Request::Write` handler.
-fn line_ending_bytes(line_ending: LineEnding) -> &'static [u8] {
+/// parameter on the request rather than a client-side convention. Not added
+/// to `wrap_proto::LineEnding` itself since only a write path needs the
+/// actual byte sequence; `data_b64` writes never go through this at all —
+/// see the `Request::Write` handler. Shared with [`crate::web::api`]'s
+/// `write` endpoint, which appends the exact same bytes for the exact same
+/// reason (a GUI operator picking `CRLF` from a dropdown is making the same
+/// choice a CLI caller makes with `--line-ending`).
+pub(crate) fn line_ending_bytes(line_ending: LineEnding) -> &'static [u8] {
     match line_ending {
         LineEnding::Lf => b"\n",
         LineEnding::Crlf => b"\r\n",

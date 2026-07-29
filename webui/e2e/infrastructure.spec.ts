@@ -28,6 +28,10 @@ test("serves the embedded frontend with no separate frontend service, connects o
   await expect(status).toHaveAttribute("data-state", "open", { timeout: 10_000 });
   await expect(status).toContainText("Connected");
 
+  // The full port list moved into a status-bar drawer (see `App.svelte`'s
+  // layout doc comment); this assertion is about the HTTP round-trip
+  // rendering real API data, so open the drawer that holds it.
+  await page.getByTestId("open-devices").click();
   const devices = page.getByTestId("device-list");
   await expect(devices).toHaveAttribute("data-state", "loaded", { timeout: 10_000 });
 });

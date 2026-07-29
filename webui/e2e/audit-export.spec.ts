@@ -25,6 +25,15 @@ async function gotoConnectedLiveLog(page: Page): Promise<void> {
   });
 }
 
+/** The audit trail is a status-bar drawer now rather than a card below the
+ * log (see `App.svelte`'s layout doc comment). Export stayed a dialog and is
+ * still opened straight from the status bar, so only the audit tests need
+ * this. */
+async function openAuditDrawer(page: Page): Promise<void> {
+  await page.getByTestId("open-audit").click();
+  await expect(page.getByTestId("audit-drawer")).toBeVisible({ timeout: 5_000 });
+}
+
 // ---- T5.5 acceptance criterion 1: audit "jump to log" lands on the exact seq ----
 
 test("audit panel's jump-to-log lands on the exact record it names", async ({ page }) => {
@@ -33,6 +42,7 @@ test("audit panel's jump-to-log lands on the exact record it names", async ({ pa
     { kind: "rx", text: "boot ok\n" },
     { kind: "tx", text: "status\n", client: "claude-code", client_type: "agent", gate: "whitelist" },
   ]);
+  await openAuditDrawer(page);
 
   const auditRow = page.getByTestId("audit-row").filter({ hasText: "claude-code" }).first();
   await expect(auditRow).toBeVisible({ timeout: 5_000 });

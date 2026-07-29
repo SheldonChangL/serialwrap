@@ -35,6 +35,11 @@ async function gotoConnectedLiveLog(page: Page): Promise<void> {
   await expect(page.getByTestId("connection-dot")).toHaveAttribute("data-state", "open", {
     timeout: 10_000,
   });
+  // The clients list is a status-bar drawer now, not a permanently-mounted
+  // card below the log (see `App.svelte`'s layout doc comment) — every
+  // assertion below is about the panel's contents, so open it once here.
+  await page.getByTestId("open-clients").click();
+  await expect(page.getByTestId("clients-drawer")).toBeVisible({ timeout: 5_000 });
 }
 
 // ---- T5.5 acceptance criterion 4: agent's wait_for pattern + remaining time ----

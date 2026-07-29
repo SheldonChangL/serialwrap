@@ -14,7 +14,16 @@ mod mcp;
 #[derive(Parser)]
 #[command(
     name = "serialwrap",
-    version,
+    // Not clap's bare `version` (which would print `CARGO_PKG_VERSION`
+    // alone): this is the string an operator uses to answer "is the binary
+    // on my PATH built from the code in front of me?". That question is
+    // unavoidable once `serialwrap service install` points a login service
+    // at a *copy* of this binary — rebuilding the repo doesn't touch the
+    // copy, and `0.1.0` is identical either way. `SERVER_VERSION` carries
+    // `git describe --always --dirty`, so `serialwrap --version` can be
+    // compared against `git rev-parse --short HEAD` directly, with no
+    // daemon running. See `serialwrapd::SERVER_VERSION`.
+    version = serialwrapd::SERVER_VERSION,
     about = "Serial port broker: one daemon owns the port, everyone else is a client."
 )]
 struct Cli {

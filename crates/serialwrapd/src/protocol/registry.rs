@@ -380,17 +380,18 @@ mod tests {
         // `Auto`, the `\n` wins immediately (resolves `Lf`), producing one
         // complete line `"\rfirst"` (the leading `\r` stays as literal
         // content, since it isn't immediately before the `\n`). Under an
-        // honored `Cr` override, the leading `\r` completes an empty line
-        // immediately, and `"first\n"` — containing no `\r` at all — never
-        // completes, staying a pending half-line.
+        // honored `Cr` override, the leading `\r` bounds only an empty
+        // segment (cursor movement under `Cr`, not a blank line), and
+        // `"first\n"` — containing no `\r` at all — never completes,
+        // staying a pending half-line. So the override shows up as *no*
+        // completed lines at all.
         recorder.append_rx(b"\rfirst\n").unwrap();
 
         let state = registry.get_or_spawn(&crate::port::DeviceId("dev-1".to_string()), recorder);
         let page = state.read_since(0, None, None).unwrap();
         let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
-        assert_eq!(
-            texts,
-            vec![""],
+        assert!(
+            texts.is_empty(),
             "the registry must have loaded the persisted Cr override and constructed the query \
              state with it — an Auto-defaulted state would instead show one complete \
              \"\\rfirst\" line here: {texts:?}"

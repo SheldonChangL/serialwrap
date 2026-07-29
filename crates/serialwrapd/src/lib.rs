@@ -58,6 +58,30 @@ use std::sync::Arc;
 /// doc — this is CI/E2E-internal plumbing, not a supported feature.
 pub const TEST_BACKEND_DEVICE_ENV: &str = "SERIALWRAP_TEST_BACKEND_DEVICE";
 
+/// What the daemon reports as its version — over `hello`, on
+/// `GET /api/health`, and in the web GUI's connection pill.
+///
+/// The crate version alone is the same string for every build ever made
+/// from this tree, which makes it useless for the question an operator
+/// actually asks: *is the running daemon the code I just built?* That
+/// question comes up constantly once the daemon is a login service rather
+/// than something you start by hand — the service keeps running whatever
+/// binary it was pointed at, and nothing about `0.1.0` changes when you
+/// rebuild. Appending `build.rs`'s `git describe --always --dirty` makes
+/// the answer visible: compare it against `git rev-parse --short HEAD`, and
+/// note that a `-dirty` suffix means the binary was built from uncommitted
+/// work and so cannot be reproduced from any commit.
+///
+/// This is also the string that ends up alongside audit records, where
+/// "which build produced this?" is a question asked months later, by
+/// someone who no longer has the working tree.
+pub const SERVER_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("SERIALWRAPD_BUILD"),
+    ")"
+);
+
 /// Entry point the `serialwrap daemon` subcommand calls: brings up hotplug
 /// detection (T1.1) against the real system enumerator, the UDS protocol
 /// server (T1.4) on the production socket path, and the embedded web GUI
@@ -145,8 +169,7 @@ async fn serve_forever(
     let socket_path = protocol::default_socket_path()?;
     let listener = protocol::server::bind(&socket_path)?;
     let shared = Arc::new(
-        protocol::Shared::new(backend, env!("CARGO_PKG_VERSION"), data_dir)
-            .with_gate(production_gate()),
+        protocol::Shared::new(backend, SERVER_VERSION, data_dir).with_gate(production_gate()),
     );
     let web_shared = Arc::clone(&shared);
 

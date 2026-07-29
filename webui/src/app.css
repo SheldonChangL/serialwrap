@@ -1,29 +1,127 @@
+/**
+ * Design tokens for the serialwrap console.
+ *
+ * # The one idea everything else follows: RX and TX are colors
+ *
+ * A USB-serial adapter's entire user interface is two LEDs — one blinks when
+ * the board says something, one blinks when you do. This palette makes that
+ * the organizing principle: `--rx` marks everything the device originated,
+ * `--tx` everything an operator or agent sent, and the same two hues carry
+ * that meaning in every place they appear (a log row's left gutter, the
+ * write bar, the byte counters in the clients drawer, the activity pips in
+ * the top bar). Direction of data flow is the one fact a serial console
+ * always needs to communicate, so it gets the color budget.
+ *
+ * The corollary, and the reason this doesn't look like a terminal emulator:
+ * **device output itself is never colored.** Log text renders in the
+ * highest-contrast neutral available and nothing else does, so what the
+ * board actually said reads as fact while timestamps, event names, gate
+ * decisions and TX echoes read as annotation around it. Green-on-black
+ * would invert exactly that — it paints the data and leaves the metadata
+ * plain.
+ *
+ * # Light and dark are peers
+ *
+ * Neither mode is an afterthought tint of the other: both are authored
+ * against the same semantic names, and the accents are picked per-mode for
+ * equal contrast against their own ground (the dark-mode accents are
+ * lighter and less saturated than a naive inversion would give).
+ */
+
 :root {
   color-scheme: light dark;
+
+  /* Type. `--font-mono` carries log data and anything byte-exact;
+   * `--font-ui` carries chrome. The uppercase tracked label style built on
+   * `--font-ui` (see `.label-eyebrow` below) is the silkscreen lettering on
+   * a piece of bench equipment — it's how the chrome stays legibly distinct
+   * from data at 11px without needing a third family. */
   --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
-  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
 
-  --bg: #0e1116;
-  --surface: #161b22;
-  --surface-raised: #1f2530;
-  --border: #2a313c;
-  --text: #e6edf3;
-  --text-dim: #8b949e;
+  --text-xs: 0.6875rem; /* 11px — eyebrow labels, badges */
+  --text-sm: 0.75rem; /* 12px — chrome, status bar */
+  --text-base: 0.8125rem; /* 13px — log rows, inputs */
+  --text-lg: 1rem;
 
-  --dot-connecting: #d4a72c;
-  --dot-open: #3fb950;
-  --dot-stale: #d4a72c;
-  --dot-closed: #f85149;
+  /* Space. A 4px base, named by use rather than by number so a layout
+   * change reads as intent instead of arithmetic. */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-pill: 999px;
+
+  /* The fixed left gutter every log row carries. Wide enough to read as a
+   * deliberate band at a glance down the edge of a full screen of rows,
+   * narrow enough not to eat monospace columns. */
+  --gutter-w: 3px;
+
+  /* ---- Dark (authored first: this tool lives next to a code editor) ---- */
+  --bg: #12151a;
+  --surface: #191d24;
+  --surface-raised: #222831;
+  --surface-sunken: #0d1014;
+  --border: #2b323d;
+  --border-strong: #3a4351;
+
+  --text: #e7ecf2;
+  --text-dim: #8e9bab;
+  --text-faint: #626e7d;
+
+  /* Direction-of-flow accents — the signature pair. */
+  --rx: #5fc9d9;
+  --rx-bg: rgba(95, 201, 217, 0.1);
+  --tx: #e3a72f;
+  --tx-bg: rgba(227, 167, 47, 0.12);
+
+  /* Status. `--gate` doubles as the destructive/denied color: in this
+   * product they are the same event. */
+  --ok: #4cc46a;
+  --warn: #e3a72f;
+  --gate: #f0655e;
+  --gate-bg: rgba(240, 101, 94, 0.12);
+
+  --focus-ring: #7fb3ff;
+
+  /* Legacy aliases — the connection-status pill and device dots were
+   * written against these names before this file had a semantic layer.
+   * Kept pointing at the new tokens rather than renamed at every call site,
+   * so there is exactly one definition of "green means open" in the app. */
+  --dot-open: var(--ok);
+  --dot-connecting: var(--warn);
+  --dot-stale: var(--warn);
+  --dot-closed: var(--gate);
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f6f8fa;
+    --bg: #eef1f4;
     --surface: #ffffff;
-    --surface-raised: #eef1f4;
-    --border: #d0d7de;
-    --text: #1f2328;
-    --text-dim: #57606a;
+    --surface-raised: #f3f5f8;
+    --surface-sunken: #ffffff;
+    --border: #d5dbe2;
+    --border-strong: #b6bfca;
+
+    --text: #131820;
+    --text-dim: #5b6675;
+    --text-faint: #8894a3;
+
+    --rx: #1c7f91;
+    --rx-bg: rgba(28, 127, 145, 0.09);
+    --tx: #9a6708;
+    --tx-bg: rgba(154, 103, 8, 0.1);
+
+    --ok: #1f9c46;
+    --warn: #9a6708;
+    --gate: #c4372f;
+    --gate-bg: rgba(196, 55, 47, 0.09);
+
+    --focus-ring: #1e6fd9;
   }
 }
 
@@ -31,9 +129,55 @@
   box-sizing: border-box;
 }
 
+html,
+body {
+  height: 100%;
+}
+
 body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: var(--font-sans);
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  /* The app owns its own scrolling regions (the log viewport, each drawer).
+   * A page-level scrollbar here would mean the log could be scrolled out of
+   * view, which is the one thing this layout exists to prevent. */
+  overflow: hidden;
+}
+
+/** The silkscreen-label style: small, uppercase, widely tracked. Used for
+  * every piece of chrome that names something rather than being something —
+  * drawer titles, column headers, badge text. */
+.label-eyebrow {
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* Every timestamp, byte count, sequence number and baud rate in this app is
+ * a number in a column that a reader compares vertically. Tabular figures
+ * are not a detail here — proportional digits make a column of timestamps
+ * unscannable. */
+.tnum,
+input[type="number"] {
+  font-variant-numeric: tabular-nums;
+}
+
+:where(button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

@@ -148,6 +148,13 @@
       };
       await setDeviceConfig(deviceId, patch);
       onApplied();
+      // Dismiss on success: the settings are applied, the config chip
+      // behind this popover already shows the new framing, and the
+      // `config_change` row (with its one-click undo) has just landed in
+      // the log — all of which this popover would otherwise be covering.
+      // A failure deliberately keeps it open, since `applyError` below is
+      // the only place that failure is reported.
+      onClose();
     } catch (e) {
       applyError = e instanceof Error ? e.message : String(e);
     } finally {

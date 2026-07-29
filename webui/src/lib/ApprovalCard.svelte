@@ -65,8 +65,17 @@
    * buttons and a settled-state banner (T5.4 acceptance criterion 8: "不
    * 殘留可點按鈕"). */
   const settled = $derived(timedOut || resolvedElsewhere);
+  /** Both branches say what the *outcome* was, not merely that the card is
+   * over. A timeout is a denial — fail-safe is the whole point of the
+   * default — so saying "timed out" alone would leave the operator guessing
+   * whether the bytes went out. (This string used to be bilingual, the only
+   * such string in an otherwise all-English interface; the Chinese half was
+   * quoting an acceptance criterion, which belongs in the comment above and
+   * not on screen.) */
   const resolutionLabel = $derived(
-    timedOut ? "已逾時拒絕 — timed out, denied" : "already decided elsewhere",
+    timedOut
+      ? "Timed out — denied, nothing was sent"
+      : "Already decided from another client",
   );
 
   const isDanger = $derived(approval.danger_reason !== null);

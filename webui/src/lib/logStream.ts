@@ -105,6 +105,50 @@ export async function setControlLines(
   }
 }
 
+/** What to append after `text`. Mirrors `wrap_proto::LineEnding`'s wire
+ * names — sending the wrong one to a firmware CLI is the classic reason a
+ * board "ignores" a command, which is why this is a visible control in the
+ * write bar rather than a hidden constant. */
+export type LineEnding = "lf" | "crlf" | "cr" | "none";
+
+export interface WritePayload {
+  /** UTF-8 text; the daemon appends `line_ending`. */
+  text?: string;
+  /** Exact bytes, base64. Sent verbatim, no line ending — hex mode parses
+   * the operator's digits in the browser and encodes them here, so the
+   * daemon keeps exactly one byte-decoding path (see the `WriteBody` doc
+   * comment in `crates/serialwrapd/src/web/api.rs`). */
+  data_b64?: string;
+  line_ending?: LineEnding;
+}
+
+/** `POST /api/devices/:id/write`: send bytes to the port as the operator.
+ *
+ * Goes out immediately rather than through the write gate, because the
+ * person clicking Send is the human the gate exists to ask — the same
+ * `human` bypass `serialwrap write` has always had over UDS. It is still
+ * audited: the daemon appends the same `tx` record every other write path
+ * produces, so this write appears in this very log view, in every other
+ * client's `tail`, and in `serialwrap audit`. */
+export async function writeToDevice(
+  deviceId: string,
+  payload: WritePayload,
+): Promise<{ written: number }> {
+  const res = await fetch(`/api/devices/${encodeURIComponent(deviceId)}/write`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      (body as { error?: { message?: string } }).error?.message ??
+        `${res.status} ${res.statusText}`,
+    );
+  }
+  return body as { written: number };
+}
+
 const BACKOFF_SCHEDULE_MS = [500, 1_000, 2_000, 4_000, 5_000];
 
 function backoffFor(attempt: number): number {
