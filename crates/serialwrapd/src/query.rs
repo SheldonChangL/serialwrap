@@ -223,14 +223,101 @@ impl Terminator {
     }
 }
 
-/// Bare `\r` bytes observed with no `\n` yet seen before [`Partial`]'s
-/// auto-detection commits to [`Terminator::Cr`]. Two, not one: a device
-/// that happens to lead with a single stray `\r` before its very first
-/// real `\n` (and is genuinely LF-terminated) must not be mistaken for
-/// CR-only off a single sample — but any `\n` byte, whenever it arrives, is
-/// unambiguous proof of `\n`-termination and wins immediately regardless of
-/// this counter (see [`Partial::push`]).
+/// Bare `\r` bytes, with no `\n` yet seen, that make the probe worth judging.
+/// Two, not one: a genuinely LF-terminated device that prefixes its first
+/// line with a stray `\r` (a boot-time cursor reset, say) would otherwise be
+/// judged off a probe containing nothing but that one byte. Any `\n`, by
+/// contrast, makes the probe judgeable immediately — at that point both
+/// conventions are represented and [`score_terminator`] can compare them.
 const CR_AUTO_DETECT_THRESHOLD: usize = 2;
+
+/// How many times the *other* terminator byte may appear inside line content
+/// before the resolved terminator is treated as wrong and detection reopens.
+///
+/// Four, not one: a genuinely LF-terminated device that occasionally emits a
+/// bare `\r` (progress-bar redraws) must not trip this, while a stream
+/// actually delimited by the other byte trips it within a line or two. This
+/// is the fastest available proof of a wrong decision — a CR-only device read
+/// under `Lf` never completes a line at all, so waiting for assembled lines
+/// to look wrong would mean waiting for [`MAX_PARTIAL_BYTES`].
+const REDETECT_AFTER_WRONG_HITS: usize = 4;
+
+/// How many consecutive mostly-unprintable assembled lines mean the resolved
+/// terminator is probably wrong.
+///
+/// Detection has to commit early — a live `tail -f` cannot wait for a large
+/// sample before showing anything — so it will sometimes commit on evidence
+/// that later proves unrepresentative. Issue #52's capture is the motivating
+/// case: it opens with flash-mode garbage (in which both `\r` and `\n` occur
+/// by chance) and only later settles into the device's real CR-only logging.
+const REDETECT_AFTER_BAD_LINES: usize = 6;
+
+/// Printable-content ratio below which an assembled line counts as evidence
+/// that the terminator is wrong. Correctly framed log lines sit far above
+/// this; content with the other terminator embedded sits below.
+const BAD_LINE_PRINTABLE_RATIO: f64 = 0.75;
+
+/// Pick the terminator that yields the more plausible set of text lines.
+///
+/// The obvious rule — "the first `\n` proves LF-termination" — does not
+/// survive contact with real captures. A device caught mid-flash, or read at
+/// the wrong baud, emits essentially random bytes, and `0x0a` occurs in those
+/// by chance: in issue #52's capture the very first `\n` sits at byte offset
+/// 1, inside garbage, while the device's actual log is CR-only. Any "first
+/// byte of this shape wins, permanently" rule locks onto that stray byte and
+/// mis-assembles every real line for the rest of the session.
+///
+/// So decide on evidence: split the probe both ways and see which split looks
+/// like log lines. Two signals carry it, failing in different directions,
+/// which is why both are needed:
+///
+/// - **Whether lines get produced at all.** A stream delimited only by `\r`
+///   splits under `Lf` into one enormous unterminated remainder — zero
+///   complete lines. That asymmetry is the strongest signal available.
+/// - **Printable ratio of line content.** Correct framing leaves clean text;
+///   wrong framing leaves the other terminator embedded in the content
+///   (`\rinterface 1 is initialized`), dragging control bytes in.
+fn score_terminator(probe: &[u8]) -> Terminator {
+    fn quality(term: Terminator, probe: &[u8]) -> (usize, f64) {
+        let (lines, _) = term.split(probe);
+        let mut printable = 0usize;
+        let mut total = 0usize;
+        for content in &lines {
+            for &b in content {
+                total += 1;
+                if b == b'\t' || (0x20..=0x7e).contains(&b) {
+                    printable += 1;
+                }
+            }
+        }
+        let ratio = if total == 0 {
+            0.0
+        } else {
+            printable as f64 / total as f64
+        };
+        (lines.len(), ratio)
+    }
+
+    let (lf_lines, lf_ratio) = quality(Terminator::Lf, probe);
+    let (cr_lines, cr_ratio) = quality(Terminator::Cr, probe);
+
+    if lf_lines == 0 && cr_lines > 0 {
+        return Terminator::Cr;
+    }
+    if cr_lines == 0 && lf_lines > 0 {
+        return Terminator::Lf;
+    }
+
+    // Both produced lines (mixed or noisy input). Prefer the cleaner content,
+    // requiring a clear margin so ordinary noise doesn't flip the decision;
+    // LF keeps ties because it is the overwhelmingly common convention.
+    const MARGIN: f64 = 0.05;
+    if cr_ratio > lf_ratio + MARGIN {
+        Terminator::Cr
+    } else {
+        Terminator::Lf
+    }
+}
 
 /// Upper bound on how many undecided probe bytes [`Partial`] accumulates
 /// before auto-detection is forced to commit to *some* mode even without
@@ -315,6 +402,16 @@ struct Partial {
     /// a `\r` is paired with a following `\n` can't always be decided
     /// within the same call that saw the `\r`.
     swallow_next_lf: bool,
+    /// True when the configured mode was `Auto`, so re-detection is allowed.
+    /// An explicit `Lf`/`Cr` override is the operator's stated intent and is
+    /// never second-guessed.
+    auto: bool,
+    /// Consecutive assembled lines that did not look like text. Drives
+    /// [`REDETECT_AFTER_BAD_LINES`].
+    bad_lines: usize,
+    /// Occurrences of the other terminator byte inside line content since the
+    /// current decision was made. Drives [`REDETECT_AFTER_WRONG_HITS`].
+    wrong_terminator_hits: usize,
 }
 
 impl Default for Partial {
@@ -335,6 +432,9 @@ impl Partial {
             resolved,
             cr_seen: 0,
             swallow_next_lf: false,
+            auto: configured == LineTerminatorMode::Auto,
+            bad_lines: 0,
+            wrong_terminator_hits: 0,
         }
     }
 
@@ -380,19 +480,22 @@ impl Partial {
             }
             None => {
                 self.buf.push(b);
-                if b == b'\n' {
-                    self.resolved = Some(Terminator::Lf);
+                // *When* to judge and *how* are separate questions. A `\n`
+                // means both conventions are now represented well enough in
+                // the probe to compare them; a run of bare `\r`s with no `\n`
+                // says the same for a CR-only device. What the judgement
+                // itself must not be is "first terminator-shaped byte wins" —
+                // see [`score_terminator`].
+                let can_judge = if b == b'\n' {
+                    true
                 } else if b == b'\r' {
                     self.cr_seen += 1;
-                    if self.cr_seen >= CR_AUTO_DETECT_THRESHOLD {
-                        self.resolved = Some(Terminator::Cr);
-                    }
-                } else if self.buf.len() >= AUTO_DETECT_PROBE_CAP {
-                    self.resolved = Some(if self.cr_seen > 0 {
-                        Terminator::Cr
-                    } else {
-                        Terminator::Lf
-                    });
+                    self.cr_seen >= CR_AUTO_DETECT_THRESHOLD
+                } else {
+                    false
+                };
+                if can_judge || self.buf.len() >= AUTO_DETECT_PROBE_CAP {
+                    self.resolved = Some(score_terminator(&self.buf));
                 }
 
                 if let Some(term) = self.resolved {
@@ -448,6 +551,20 @@ impl Partial {
             Terminator::Cr => b == b'\r',
         };
         if !is_terminator {
+            // The other terminator byte piling up inside what is supposed to
+            // be one line's content is the fastest proof the wrong one was
+            // chosen — see [`REDETECT_AFTER_WRONG_HITS`].
+            let is_other_terminator = match term {
+                Terminator::Lf => b == b'\r',
+                Terminator::Cr => b == b'\n',
+            };
+            if is_other_terminator && self.auto {
+                self.wrong_terminator_hits += 1;
+                if self.wrong_terminator_hits >= REDETECT_AFTER_WRONG_HITS {
+                    self.reopen_detection();
+                    return;
+                }
+            }
             self.buf.push(b);
             return;
         }
@@ -455,10 +572,48 @@ impl Partial {
         if term == Terminator::Lf && line.last() == Some(&b'\r') {
             line.pop(); // CRLF: the `\r` belongs to the terminator, not the content.
         }
+        self.note_line_quality(&line);
         out.push((line, false));
         if term == Terminator::Cr {
             self.swallow_next_lf = true;
         }
+    }
+
+    /// Track whether assembled lines still look like text, and reopen
+    /// auto-detection if enough of them in a row do not. Only meaningful under
+    /// `Auto` — see [`REDETECT_AFTER_BAD_LINES`].
+    fn note_line_quality(&mut self, line: &[u8]) {
+        // An empty line is evidence neither way: CR-only devices legitimately
+        // produce them from `\r\r`.
+        if !self.auto || line.is_empty() {
+            return;
+        }
+        let printable = line
+            .iter()
+            .filter(|&&b| b == b'\t' || (0x20..=0x7e).contains(&b))
+            .count();
+        if (printable as f64 / line.len() as f64) >= BAD_LINE_PRINTABLE_RATIO {
+            self.bad_lines = 0;
+            return;
+        }
+        self.bad_lines += 1;
+        if self.bad_lines >= REDETECT_AFTER_BAD_LINES {
+            self.reopen_detection();
+        }
+    }
+
+    /// Drop the resolved terminator so the next bytes re-probe from scratch.
+    ///
+    /// `buf` is deliberately kept: it is the in-progress tail of real device
+    /// output, and it doubles as the probe the fresh detection will judge —
+    /// which is exactly the content that proved the previous decision wrong,
+    /// so it is the most informative sample available.
+    fn reopen_detection(&mut self) {
+        self.resolved = None;
+        self.cr_seen = 0;
+        self.bad_lines = 0;
+        self.wrong_terminator_hits = 0;
+        self.swallow_next_lf = false;
     }
 }
 
@@ -1341,6 +1496,59 @@ mod tests {
                 "none of this fixture should ever hit the partial cap"
             );
         }
+    }
+
+    /// Issue #52 end to end, from the user's real recording: a capture that
+    /// opens with flash-mode garbage — in which `\n` occurs by chance at byte
+    /// offset 1, verbatim below — and then settles into the device's actual
+    /// CR-only logging. Detection is *expected* to guess wrong on the garbage
+    /// and then recover, which is the behaviour no one-shot decision can
+    /// provide, and why this can't be fixed by tuning a threshold.
+    #[test]
+    fn garbage_prefix_then_cr_only_log_recovers_and_yields_clean_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+
+        recorder
+            .append_rx(b"\x84\n\x8c\xc6baA\x0117\xa9-\xfa\x05\xbc\x92\xc0F\xbdB\xa1\xfb")
+            .unwrap();
+        state.ingest(&recorder);
+
+        for chunk in [
+            &b"\rinterface 0 is initialized"[..],
+            &b"\rinterface 1 is initialized"[..],
+            &b"\rcfg_size_lib = 120, cfg_size_user = 120"[..],
+            &b"\r\rInitializing WIFI ...[Driver]: [HALMAC]"[..],
+            &b"\r HALMAC_MAJOR_VER = 1"[..],
+            &b"\rosd_render_task start"[..],
+            &b"\r\r[Local] Socket closed"[..],
+            &b"\rrtsp_cmd_options"[..],
+        ] {
+            recorder.append_rx(chunk).unwrap();
+            state.ingest(&recorder);
+        }
+
+        let page = state.read_since(0, None, None).unwrap();
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+
+        for expected in [
+            "interface 1 is initialized",
+            "cfg_size_lib = 120, cfg_size_user = 120",
+            "osd_render_task start",
+            "[Local] Socket closed",
+        ] {
+            assert!(
+                texts.contains(&expected),
+                "missing {expected:?} among {texts:?}"
+            );
+        }
+        // An embedded control byte is what made every renderer fall back to a
+        // hex dump, so no assembled line may still carry one.
+        assert!(
+            !texts.iter().any(|t| t.contains('\r')),
+            "no assembled line may still contain a CR: {texts:?}"
+        );
     }
 
     #[test]

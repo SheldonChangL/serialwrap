@@ -120,6 +120,15 @@ pub struct PresentationLimits {
     pub fold_min_run: usize,
 }
 
+/// Bytes of each reply's [`PresentationLimits::max_result_bytes`] budget
+/// reserved for the reply's own JSON framing rather than its items.
+///
+/// `ViewItem::json_size` measures items only, but what a consumer pays for is
+/// the whole reply — the `lines`/`events`/`cursor`/`truncated` wrapper and the
+/// separators between items are context too. Reserving a fixed amount keeps
+/// the cap honest without coupling this module to any caller's exact envelope.
+const ENVELOPE_BUDGET_RESERVE: usize = 256;
+
 impl Default for PresentationLimits {
     fn default() -> Self {
         Self {
@@ -399,7 +408,12 @@ pub fn present(
 
     let mut out_lines = Vec::new();
     let mut out_events = Vec::new();
-    let mut bytes_used = 0usize;
+    // Start the budget already charged for the reply's own envelope. A
+    // consumer that budgeted 8 KB of context genuinely cannot afford 8 KB
+    // *plus* framing, and `json_size()` measures only the items — it was the
+    // particular mix of items in any given reply that kept this under the
+    // limit by luck before.
+    let mut bytes_used = ENVELOPE_BUDGET_RESERVE;
     let mut truncated = false;
     let mut cursor = full_cursor;
 
