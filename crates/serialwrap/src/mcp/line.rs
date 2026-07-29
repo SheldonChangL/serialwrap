@@ -74,6 +74,7 @@ pub fn assembled_line_from_wire(line: &Value) -> serialwrapd::query::AssembledLi
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        capped: line.get("capped").and_then(Value::as_bool).unwrap_or(false),
     }
 }
 

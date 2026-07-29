@@ -71,7 +71,11 @@ async fn start_daemon_with_writable_device(
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("test.sock");
     let listener = server::bind(&path).expect("bind test socket");
-    let shared = Arc::new(Shared::new(backend as Arc<dyn DeviceBackend>, "test"));
+    let shared = Arc::new(Shared::new(
+        backend as Arc<dyn DeviceBackend>,
+        "test",
+        dir.path(),
+    ));
     tokio::spawn(server::serve(listener, shared));
 
     (
@@ -115,7 +119,9 @@ async fn start_daemon_with_writable_device_and_gate(
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("test.sock");
     let listener = server::bind(&path).expect("bind test socket");
-    let shared = Arc::new(Shared::new(backend as Arc<dyn DeviceBackend>, "test").with_gate(gate));
+    let shared = Arc::new(
+        Shared::new(backend as Arc<dyn DeviceBackend>, "test", dir.path()).with_gate(gate),
+    );
     tokio::spawn(server::serve(listener, shared));
     // `tmp_data` must outlive the test (the recorder holds open fds into
     // it); leaked rather than threaded through the return tuple, matching
@@ -221,7 +227,11 @@ async fn start_plain_daemon(device_id: &str) -> (TestDaemon, tempfile::TempDir) 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("test.sock");
     let listener = server::bind(&path).expect("bind test socket");
-    let shared = Arc::new(Shared::new(backend as Arc<dyn DeviceBackend>, "test"));
+    let shared = Arc::new(Shared::new(
+        backend as Arc<dyn DeviceBackend>,
+        "test",
+        dir.path(),
+    ));
     tokio::spawn(server::serve(listener, shared));
 
     (

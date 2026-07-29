@@ -30,7 +30,7 @@ async fn start_test_daemon(backend: Arc<dyn DeviceBackend>) -> (PathBuf, tempfil
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("test.sock");
     let listener = server::bind(&path).expect("bind test socket");
-    let shared = Arc::new(Shared::new(backend, "test"));
+    let shared = Arc::new(Shared::new(backend, "test", dir.path()));
     tokio::spawn(server::serve(listener, shared));
     (path, dir)
 }

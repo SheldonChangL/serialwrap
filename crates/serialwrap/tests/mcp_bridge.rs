@@ -54,7 +54,11 @@ async fn start_daemon_with_device(device_id: &str, recorder: Arc<Recorder>) -> T
     let backend = Arc::new(TestBackend::new());
     backend.register(DeviceId(device_id.to_string()), recorder);
     let listener = server::bind(&path).expect("bind test socket");
-    let shared = Arc::new(Shared::new(backend as Arc<dyn DeviceBackend>, "test"));
+    let shared = Arc::new(Shared::new(
+        backend as Arc<dyn DeviceBackend>,
+        "test",
+        dir.path(),
+    ));
     tokio::spawn(server::serve(listener, shared));
     TestDaemon {
         socket_path: path,
@@ -106,7 +110,9 @@ async fn start_daemon_with_gate_and_pty(
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("test.sock");
     let listener = server::bind(&path).expect("bind test socket");
-    let shared = Arc::new(Shared::new(backend as Arc<dyn DeviceBackend>, "test").with_gate(gate));
+    let shared = Arc::new(
+        Shared::new(backend as Arc<dyn DeviceBackend>, "test", dir.path()).with_gate(gate),
+    );
     tokio::spawn(server::serve(listener, shared));
     // `tmp_data` must outlive the test (the recorder holds open fds into
     // it) -- leak its lifetime, same reasoning as `start_daemon_with_empty_device`

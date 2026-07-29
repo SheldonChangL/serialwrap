@@ -52,6 +52,7 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use wrap_proto::{Filter, Kind, Record};
 
 use crate::recorder::{ReadSinceError, Recorder};
@@ -99,13 +100,25 @@ pub struct AssembledLine {
     /// bytes regardless of what `text` looks like.
     pub text: String,
     /// `seq` of the raw `rx` record whose bytes contained this line's
-    /// terminating `\n`. Not unique across a batch — a single rx chunk can
-    /// complete more than one line, in which case they share this `seq`
-    /// (callers resume from `seq + 1`, the same convention
-    /// `Recorder::read_since` itself uses for its own `next_cursor`).
+    /// terminator — `\n` (or, since issue #52, a bare `\r` under CR-only
+    /// assembly) — or, for a [`Self::capped`] line, the record whose bytes
+    /// crossed [`MAX_PARTIAL_BYTES`]. Not unique across a batch — a single
+    /// rx chunk can complete more than one line (including, for the byte
+    /// that resolves [`LineTerminatorMode::Auto`] detection, every line
+    /// retroactively completed from the probe accumulated before it — see
+    /// [`Partial`]'s docs), in which case they share this `seq` (callers
+    /// resume from `seq + 1`, the same convention `Recorder::read_since`
+    /// itself uses for its own `next_cursor`).
     pub seq: u64,
     pub t_mono: f64,
     pub t_wall: String,
+    /// `true` if this line was force-completed by [`MAX_PARTIAL_BYTES`]
+    /// rather than an actual line terminator ever arriving (issue #52's
+    /// partial-buffer-cap requirement) — `raw`/`text` still hold exactly
+    /// whatever bytes had accumulated, just cut off rather than
+    /// terminator-delimited. `false` for every ordinarily-terminated line,
+    /// which is every line this project produced before this field existed.
+    pub capped: bool,
 }
 
 /// One out-of-band occurrence: an `event` or `gate` kind record. Always
@@ -124,13 +137,329 @@ pub struct OobRecord {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// In-progress, not-yet-newline-terminated tail of rx bytes. Deliberately
-/// never exposed outside this module: it is not a candidate for
-/// `wait_for`, not returned by `tail`/`read_since`, and not subject to a
-/// `Filter` — see the module docs.
-#[derive(Debug, Default)]
+/// How a device's rx stream splits into lines — issue #52: the original
+/// implementation only ever recognized `\n` (stripping a preceding `\r` for
+/// CRLF), so a device that terminates every line with a bare `\r` and never
+/// sends `\n` at all (common in embedded/RTOS printf implementations, e.g.
+/// the Realtek RTL8735B this issue was filed against) never completed a
+/// single line: `wait_for` could never match, and the growing partial
+/// buffer never had a bound (see [`MAX_PARTIAL_BYTES`]).
+///
+/// [`LineTerminatorMode::Auto`] (the default) is a per-device *persisted*
+/// choice — see [`crate::device_profile::DeviceProfile::line_terminator`] —
+/// so a device that's already been auto-detected once doesn't need to pay
+/// the detection probe again after a reconnect, and a device whose stream
+/// is genuinely ambiguous (see [`Partial`]'s docs) can be pinned explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LineTerminatorMode {
+    /// Detect from the stream itself — see [`Partial`]'s docs for the exact
+    /// heuristic. What every device starts as; this is also what makes
+    /// existing LF/CRLF devices' behavior byte-for-byte unchanged by this
+    /// fix, since the very first `\n` any device ever sends resolves
+    /// [`Terminator::Lf`] immediately and permanently.
+    #[default]
+    Auto,
+    /// Force `\n`-terminated (an immediately preceding `\r` is still
+    /// stripped, so this also covers CRLF) — skips detection entirely.
+    Lf,
+    /// Force `\r`-terminated (an immediately following `\n` is swallowed
+    /// too) — skips detection entirely. For a device already known to be
+    /// CR-only (or whose stream is too ambiguous for [`Auto`] to resolve
+    /// confidently — see [`Partial`]'s docs), pinning this avoids the
+    /// detection probe altogether.
+    Cr,
+}
+
+/// A concrete (already-decided, non-[`LineTerminatorMode::Auto`]) line
+/// terminator convention, and the actual byte-splitting logic for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Terminator {
+    /// `\n` ends a line; an immediately preceding `\r` is part of the
+    /// terminator too (CRLF), not the line's content.
+    Lf,
+    /// `\r` ends a line; an immediately following `\n` is part of the
+    /// terminator too (so an explicit `Cr` override still handles a
+    /// genuine CRLF stream correctly, not just bare-CR).
+    Cr,
+}
+
+impl Terminator {
+    /// Split every complete line out of `buf`, in order, returning
+    /// `(completed_lines, remainder)` — `remainder` is the new in-progress
+    /// tail (possibly empty), exactly mirroring the old bare `if b ==
+    /// b'\n'` loop's semantics but generalized to either terminator byte.
+    ///
+    /// A line's content never includes its own terminator bytes. For
+    /// [`Terminator::Cr`], two consecutive `\r`s with nothing between them
+    /// produce one empty line — the same thing a real terminal does with
+    /// back-to-back carriage returns, and exactly what issue #52's own
+    /// fixture data contains (`\r\r[Driver]: ...`).
+    fn split(self, buf: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let mut lines = Vec::new();
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while i < buf.len() {
+            let is_terminator = match self {
+                Terminator::Lf => buf[i] == b'\n',
+                Terminator::Cr => buf[i] == b'\r',
+            };
+            if !is_terminator {
+                i += 1;
+                continue;
+            }
+            let mut end = i;
+            if self == Terminator::Lf && end > start && buf[end - 1] == b'\r' {
+                end -= 1; // CRLF: the `\r` belongs to the terminator, not the content.
+            }
+            lines.push(buf[start..end].to_vec());
+            i += 1;
+            if self == Terminator::Cr && i < buf.len() && buf[i] == b'\n' {
+                i += 1; // CRLF under a Cr override: swallow the paired `\n` too.
+            }
+            start = i;
+        }
+        (lines, buf[start..].to_vec())
+    }
+}
+
+/// Bare `\r` bytes observed with no `\n` yet seen before [`Partial`]'s
+/// auto-detection commits to [`Terminator::Cr`]. Two, not one: a device
+/// that happens to lead with a single stray `\r` before its very first
+/// real `\n` (and is genuinely LF-terminated) must not be mistaken for
+/// CR-only off a single sample — but any `\n` byte, whenever it arrives, is
+/// unambiguous proof of `\n`-termination and wins immediately regardless of
+/// this counter (see [`Partial::push`]).
+const CR_AUTO_DETECT_THRESHOLD: usize = 2;
+
+/// Upper bound on how many undecided probe bytes [`Partial`] accumulates
+/// before auto-detection is forced to commit to *some* mode even without
+/// [`CR_AUTO_DETECT_THRESHOLD`] ever being crossed (e.g. a device whose
+/// very first line is extremely long and contains no `\r` at all yet
+/// either) — falls back to [`Terminator::Cr`] if any `\r` was seen at all,
+/// otherwise [`Terminator::Lf`] (the pre-issue-#52 default), so detection
+/// itself is always bounded and never blocks a decision forever.
+const AUTO_DETECT_PROBE_CAP: usize = 256;
+
+/// Hard cap on an in-progress (not-yet-terminated) line's byte length,
+/// independent of [`AUTO_DETECT_PROBE_CAP`] and regardless of
+/// detected/configured mode. Crossing it force-completes whatever's
+/// accumulated as one line — marked [`AssembledLine::capped`] — instead of
+/// growing without bound (issue #52's third, lowest-severity consequence: a
+/// CR-only device that, pre-fix, never produced a terminator at all could
+/// grow `partial.buf` forever).
+const MAX_PARTIAL_BYTES: usize = 64 * 1024;
+
+/// In-progress, not-yet-terminated tail of rx bytes, plus this device's
+/// line-terminator auto-detection state. Deliberately never exposed outside
+/// this module: an in-progress line is not a candidate for `wait_for`, not
+/// returned by `tail`/`read_since`, and not subject to a `Filter` — see the
+/// module docs.
+///
+/// # Auto-detection strategy
+///
+/// While [`Self::resolved`] is `None` (only possible under
+/// [`LineTerminatorMode::Auto`]), every incoming byte is inspected without
+/// yet being treated as a terminator:
+///
+/// - The first `\n` byte ever seen resolves [`Terminator::Lf`] immediately
+///   and permanently. This is deliberately asymmetric with the `\r` rule
+///   below: seeing an actual `\n` is unambiguous proof this device uses
+///   `\n`, and [`Terminator::Lf`]'s own splitting already tolerates an
+///   optional preceding `\r` (i.e. it handles CRLF too), so there is no
+///   ambiguity left to resolve once `\n` shows up even once.
+/// - [`CR_AUTO_DETECT_THRESHOLD`] bare `\r` bytes with no `\n` seen yet
+///   resolves [`Terminator::Cr`].
+/// - Failing both, [`AUTO_DETECT_PROBE_CAP`] undecided bytes forces a
+///   decision (`Cr` if any `\r` was seen, else the legacy `Lf` default).
+///
+/// Once resolved, the *entire* probe accumulated so far (not just the
+/// triggering byte) is re-split under the now-known terminator — see
+/// [`Terminator::split`] — so nothing before the decision point is lost or
+/// misassembled, and detection never has to "look ahead" beyond bytes
+/// already received.
+///
+/// # Genuinely mixed/ambiguous streams
+///
+/// A device is expected to use exactly one convention for its entire
+/// session (real firmware does); this module does not attempt to
+/// re-detect mid-stream once [`Self::resolved`] is set; [`Auto`]
+/// [`LineTerminatorMode::Auto`] resolves once, then stays resolved for the
+/// lifetime of this [`Partial`] (i.e. for as long as the owning
+/// [`DeviceQueryState`] lives — across reconnects, since it's cached per
+/// device, see `protocol::registry::QueryRegistry`). A device that
+/// legitimately switches convention mid-session, or whose first bytes are
+/// ambiguous enough to trip the wrong branch above (e.g. exactly one stray
+/// leading `\r` followed by silence past [`AUTO_DETECT_PROBE_CAP`] before
+/// any real newline), is exactly the case
+/// [`LineTerminatorMode::Lf`]/[`LineTerminatorMode::Cr`] exists for: an
+/// explicit per-device override in
+/// [`crate::device_profile::DeviceProfile::line_terminator`] skips
+/// detection entirely.
+#[derive(Debug)]
 struct Partial {
     buf: Vec<u8>,
+    /// `None` only while the configured [`LineTerminatorMode`] was `Auto`
+    /// and no decision has been forced yet — see the struct docs. Set
+    /// immediately at construction for an explicit `Lf`/`Cr` override
+    /// (detection never runs at all in that case).
+    resolved: Option<Terminator>,
+    /// Bare `\r` bytes seen so far while `resolved.is_none()`. Meaningless
+    /// (and unused) once resolved.
+    cr_seen: usize,
+    /// Only meaningful once `resolved == Some(Terminator::Cr)`: set right
+    /// after a `\r` completes a line, so that *if* the very next byte
+    /// turns out to be `\n`, it's swallowed as the second half of a CRLF
+    /// pair instead of starting a new (empty) line. Needed because bytes
+    /// arrive one at a time across separate [`Self::push`] calls — whether
+    /// a `\r` is paired with a following `\n` can't always be decided
+    /// within the same call that saw the `\r`.
+    swallow_next_lf: bool,
+}
+
+impl Default for Partial {
+    fn default() -> Self {
+        Self::new(LineTerminatorMode::Auto)
+    }
+}
+
+impl Partial {
+    fn new(configured: LineTerminatorMode) -> Self {
+        let resolved = match configured {
+            LineTerminatorMode::Lf => Some(Terminator::Lf),
+            LineTerminatorMode::Cr => Some(Terminator::Cr),
+            LineTerminatorMode::Auto => None,
+        };
+        Self {
+            buf: Vec::new(),
+            resolved,
+            cr_seen: 0,
+            swallow_next_lf: false,
+        }
+    }
+
+    /// Feed one incoming byte. Returns every line completed as a result —
+    /// usually 0 or 1, but an auto-detection decision landing on this byte
+    /// can retroactively complete several at once (see the struct docs).
+    /// Each returned line is `(raw_bytes, capped)`; `capped` is `true` only
+    /// for a line forced out by [`MAX_PARTIAL_BYTES`] rather than an actual
+    /// terminator.
+    ///
+    /// # Why this never rescans the whole buffer
+    ///
+    /// Once [`Self::resolved`] is known, appending one byte can complete at
+    /// most one line, and deciding whether it does never requires looking
+    /// at anything before it — so the per-byte fast path below only ever
+    /// inspects the single incoming byte, never re-splits everything
+    /// accumulated so far. That matters for more than tidiness: an earlier
+    /// version of this function called [`Terminator::split`] (a full
+    /// `O(buf.len())` scan) on *every* byte, which is quadratic in the
+    /// length of the longest unterminated stretch — exactly the shape a
+    /// [`MAX_PARTIAL_BYTES`]-sized run of data with no terminator has, and
+    /// exactly what this project's own partial-cap tests construct.
+    /// [`Terminator::split`] is still used, but only once: the single
+    /// one-time pass over whatever's accumulated in the probe the instant
+    /// `Auto` detection resolves (bounded by [`AUTO_DETECT_PROBE_CAP`], so
+    /// still cheap).
+    fn push(&mut self, b: u8) -> Vec<(Vec<u8>, bool)> {
+        let mut out = Vec::new();
+
+        match self.resolved {
+            Some(term) => {
+                if std::mem::take(&mut self.swallow_next_lf) && term == Terminator::Cr && b == b'\n'
+                {
+                    // Swallowed: the second half of a CRLF pair under an
+                    // explicit `Cr` override (or, in principle, an
+                    // auto-detected one — though `Auto` only ever resolves
+                    // `Cr` when no `\n` has been seen at all, so this path
+                    // is reachable in practice only via an explicit
+                    // override). Contributes nothing.
+                } else {
+                    self.push_resolved_byte(term, b, &mut out);
+                }
+            }
+            None => {
+                self.buf.push(b);
+                if b == b'\n' {
+                    self.resolved = Some(Terminator::Lf);
+                } else if b == b'\r' {
+                    self.cr_seen += 1;
+                    if self.cr_seen >= CR_AUTO_DETECT_THRESHOLD {
+                        self.resolved = Some(Terminator::Cr);
+                    }
+                } else if self.buf.len() >= AUTO_DETECT_PROBE_CAP {
+                    self.resolved = Some(if self.cr_seen > 0 {
+                        Terminator::Cr
+                    } else {
+                        Terminator::Lf
+                    });
+                }
+
+                if let Some(term) = self.resolved {
+                    // Detection just resolved on this byte: the probe
+                    // accumulated so far (bounded by
+                    // `AUTO_DETECT_PROBE_CAP`) has never been split yet —
+                    // exactly one full pass now, the only time this
+                    // function ever rescans more than the latest byte.
+                    let (completed, remainder) = term.split(&self.buf);
+                    self.buf = remainder;
+                    out.extend(completed.into_iter().map(|line| (line, false)));
+                    // The probe can only have resolved ending in an
+                    // unpaired `\r` if `\r` is the byte that just arrived
+                    // (the trigger) — `split` already paired it against
+                    // anything already in the probe; this carries the
+                    // possibility of pairing it against a *future* byte
+                    // forward into the fast path above.
+                    if term == Terminator::Cr {
+                        self.swallow_next_lf = b == b'\r';
+                    }
+                }
+            }
+        }
+
+        if self.buf.len() > MAX_PARTIAL_BYTES {
+            if self.resolved.is_none() {
+                // Only reachable if `AUTO_DETECT_PROBE_CAP >=
+                // MAX_PARTIAL_BYTES`, which the constants above never do —
+                // kept as a defensive fallback so this cap is a hard
+                // guarantee regardless of how those constants are tuned.
+                self.resolved = Some(if self.cr_seen > 0 {
+                    Terminator::Cr
+                } else {
+                    Terminator::Lf
+                });
+            }
+            out.push((std::mem::take(&mut self.buf), true));
+            self.swallow_next_lf = false;
+        }
+
+        out
+    }
+
+    /// Append `b` under an already-[`Self::resolved`] `term`, completing a
+    /// line into `out` if `b` is that terminator — the `O(1)`-per-byte
+    /// counterpart to [`Terminator::split`], covering the exact same rules
+    /// (CRLF-stripping for `Lf`, paired-`\n`-swallowing for `Cr` via
+    /// [`Self::swallow_next_lf`]) at single-byte granularity instead of a
+    /// full-buffer scan. See [`Self::push`]'s docs for why this exists.
+    fn push_resolved_byte(&mut self, term: Terminator, b: u8, out: &mut Vec<(Vec<u8>, bool)>) {
+        let is_terminator = match term {
+            Terminator::Lf => b == b'\n',
+            Terminator::Cr => b == b'\r',
+        };
+        if !is_terminator {
+            self.buf.push(b);
+            return;
+        }
+        let mut line = std::mem::take(&mut self.buf);
+        if term == Terminator::Lf && line.last() == Some(&b'\r') {
+            line.pop(); // CRLF: the `\r` belongs to the terminator, not the content.
+        }
+        out.push((line, false));
+        if term == Terminator::Cr {
+            self.swallow_next_lf = true;
+        }
+    }
 }
 
 /// Result of a `tail`/`read_since`-shaped query.
@@ -292,10 +621,19 @@ impl Default for DeviceQueryState {
 
 impl DeviceQueryState {
     pub fn new() -> Self {
+        Self::with_line_terminator(LineTerminatorMode::Auto)
+    }
+
+    /// Like [`Self::new`], but pinning the line-terminator convention
+    /// instead of auto-detecting it — the per-device override path (issue
+    /// #52): a caller that already knows a device's convention (e.g. from
+    /// [`crate::device_profile::DeviceProfile::line_terminator`]) can skip
+    /// [`Partial`]'s detection probe entirely.
+    pub fn with_line_terminator(mode: LineTerminatorMode) -> Self {
         Self {
             lines: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
-            partial: Mutex::new(Partial::default()),
+            partial: Mutex::new(Partial::new(mode)),
             oldest_seq: Mutex::new(None),
             recorder_cursor: Mutex::new(0),
             notify: tokio::sync::Notify::new(),
@@ -395,11 +733,7 @@ impl DeviceQueryState {
                             continue;
                         };
                         for &b in &bytes {
-                            if b == b'\n' {
-                                let mut raw = std::mem::take(&mut partial.buf);
-                                if raw.last() == Some(&b'\r') {
-                                    raw.pop();
-                                }
+                            for (raw, capped) in partial.push(b) {
                                 let text = String::from_utf8_lossy(&raw).into_owned();
                                 lines.push(AssembledLine {
                                     raw,
@@ -407,10 +741,9 @@ impl DeviceQueryState {
                                     seq: *seq,
                                     t_mono: *t_mono,
                                     t_wall: t_wall.clone(),
+                                    capped,
                                 });
                                 added = true;
-                            } else {
-                                partial.buf.push(b);
                             }
                         }
                     }
@@ -940,6 +1273,332 @@ mod tests {
         let page = state.read_since(0, None, None).unwrap();
         let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, vec!["a", "b", "c"]);
+    }
+
+    // ---- Issue #52: CR-only line assembly ----
+
+    /// The exact bytes from issue #52's real-device capture (Realtek
+    /// RTL8735B / AmebaPro2): every line starts with a bare `\r`, no `\n`
+    /// anywhere in the whole session. Fed as five separate `append_rx`
+    /// calls, mirroring the five separate reads the issue's own report
+    /// lists (so this also exercises detection/assembly carrying state
+    /// across chunk boundaries, not just within one buffer).
+    #[test]
+    fn issue_52_cr_only_device_assembles_the_real_reported_bytes_into_correct_text_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+
+        let chunks: &[&[u8]] = &[
+            b"\rosd_update_custom_init Jun  3 2026",
+            b"\rosd ch 0 e1 num 24 (0, 1, 2)",
+            b"\rosd_render_task start",
+            b"\r\r[Driver]: TSFValue = 31802015744465, tsf = 0, shift_set= 0x8000",
+            b"\r",
+        ];
+        for chunk in chunks {
+            recorder.append_rx(chunk).unwrap();
+            state.ingest(&recorder);
+        }
+
+        let page = state.read_since(0, None, None).unwrap();
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        // A bare `\r` right at the very start of the whole session (before
+        // any content at all) and the back-to-back `\r\r` before "[Driver]"
+        // each bound an empty segment — see `Terminator::split`'s docs —
+        // so both surface as empty lines alongside the real content, never
+        // as data loss or a garbled merge of adjacent lines.
+        assert_eq!(
+            texts,
+            vec![
+                "",
+                "osd_update_custom_init Jun  3 2026",
+                "osd ch 0 e1 num 24 (0, 1, 2)",
+                "osd_render_task start",
+                "",
+                "[Driver]: TSFValue = 31802015744465, tsf = 0, shift_set= 0x8000",
+            ],
+            "{texts:?}"
+        );
+        assert!(
+            state.line_count() >= 6,
+            "the device's real log lines must have actually assembled, not just accumulated \
+             forever in the partial buffer (the pre-fix bug)"
+        );
+        for line in &page.lines {
+            assert!(
+                std::str::from_utf8(&line.raw).is_ok(),
+                "a correctly CR-terminated line must never contain an embedded \\r: {:?}",
+                line.raw
+            );
+            assert!(
+                !line.text.contains('\r'),
+                "text must not contain \\r: {:?}",
+                line.text
+            );
+            assert!(
+                !line.capped,
+                "none of this fixture should ever hit the partial cap"
+            );
+        }
+    }
+
+    #[test]
+    fn cr_only_detection_needs_two_bare_crs_a_single_leading_cr_before_a_real_newline_stays_lf() {
+        // A device that's genuinely LF-terminated but happens to prefix its
+        // very first line with one stray `\r` (e.g. a boot-time cursor
+        // reset) must not be misdetected as CR-only from that single
+        // sample — seeing the real `\n` must still win, producing two
+        // clean, separate lines rather than a CR-split merge or a stuck
+        // partial. The stray leading `\r` isn't immediately before the
+        // `\n` (not a CRLF pair), so it stays as literal content in the
+        // first line's `text` — the same pre-existing CRLF-stripping rule
+        // this project already had (only a `\r` directly adjacent to `\n`
+        // is part of the terminator).
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+        recorder.append_rx(b"\rboot ok\n").unwrap();
+        state.ingest(&recorder);
+        recorder.append_rx(b"second line\n").unwrap();
+        state.ingest(&recorder);
+
+        let page = state.read_since(0, None, None).unwrap();
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["\rboot ok", "second line"], "{texts:?}");
+    }
+
+    #[test]
+    fn explicit_cr_override_skips_detection_from_the_very_first_byte() {
+        // Same one-stray-leading-\r-then-\n shape as the auto-detect test
+        // above, but this time with an explicit `Cr` override — proving
+        // the override actually takes effect (bypasses the LF-wins-on-\n
+        // heuristic entirely) rather than being inert configuration.
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::with_line_terminator(LineTerminatorMode::Cr);
+        recorder.append_rx(b"\rfirst\rsecond\r").unwrap();
+        state.ingest(&recorder);
+
+        let page = state.read_since(0, None, None).unwrap();
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["", "first", "second"], "{texts:?}");
+    }
+
+    #[test]
+    fn explicit_cr_override_swallows_a_paired_lf_even_when_it_arrives_in_a_separate_chunk() {
+        // Regression coverage for a bug caught during review: an earlier
+        // version of `Partial::push` called `Terminator::split` on every
+        // byte, which only ever paired a `\r` with an immediately
+        // following `\n` if *both* bytes were already sitting in the same
+        // buffer at once. Since that version flushed the buffer the
+        // instant the `\r` itself arrived, a `\n` arriving in a
+        // *subsequent* `append_rx`/`push` call was never recognized as
+        // paired — it leaked through as the start of a new, spurious empty
+        // line instead of being swallowed. `swallow_next_lf` exists
+        // specifically to carry that pairing decision across calls.
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::with_line_terminator(LineTerminatorMode::Cr);
+
+        recorder.append_rx(b"first\r").unwrap();
+        state.ingest(&recorder); // the `\r` arrives alone...
+        recorder.append_rx(b"\nsecond\r").unwrap();
+        state.ingest(&recorder); // ...and its paired `\n` arrives separately.
+
+        let page = state.read_since(0, None, None).unwrap();
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["first", "second"],
+            "the \\n must be swallowed as part of the CRLF pair even though it arrived in a \
+             separate chunk from its \\r — no spurious empty line: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_lf_override_never_auto_detects_cr_even_with_many_bare_crs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::with_line_terminator(LineTerminatorMode::Lf);
+        // Plenty of bare `\r`s (well past the auto-detect threshold) but no
+        // `\n` at all yet — under `Auto` this would resolve `Cr`; under an
+        // explicit `Lf` override it must not.
+        recorder.append_rx(b"\r\r\r\r\rstill going").unwrap();
+        state.ingest(&recorder);
+        assert_eq!(
+            state.line_count(),
+            0,
+            "an explicit Lf override must keep waiting for \\n regardless of \\r content"
+        );
+        recorder.append_rx(b"\n").unwrap();
+        state.ingest(&recorder);
+        let page = state.read_since(0, None, None).unwrap();
+        assert_eq!(page.lines.len(), 1);
+        assert_eq!(page.lines[0].text, "\r\r\r\r\rstill going");
+    }
+
+    #[tokio::test]
+    async fn wait_for_matches_on_a_cr_only_device() {
+        // Issue #52 acceptance criterion: `wait_for` — the MCP bridge's
+        // core primitive — must actually match on a CR-only device, not
+        // just `read_since`/`tail`.
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = std::sync::Arc::new(recorder(tmp.path()));
+        let state = std::sync::Arc::new(DeviceQueryState::new());
+
+        let waiter = {
+            let state = std::sync::Arc::clone(&state);
+            tokio::spawn(async move { state.wait_for("boot ok", Duration::from_secs(2)).await })
+        };
+        // Deterministically let `waiter` reach its "checked" snapshot before
+        // the match actually arrives — same reasoning as this file's other
+        // `wait_for` tests just above (no fixed sleep).
+        tokio::task::yield_now().await;
+        recorder.append_rx(b"\rboot ok\r").unwrap();
+        state.ingest(&recorder);
+
+        let outcome = waiter.await.unwrap().unwrap();
+        match outcome {
+            WaitForOutcome::Matched { line, .. } => assert_eq!(line, "boot ok"),
+            other => panic!("expected Matched, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_never_matches_an_unterminated_half_line_on_a_cr_only_device() {
+        // The flip side of the previous test, and issue #52's explicit
+        // "half-line semantics preserved" acceptance criterion: a pattern
+        // that would match the *content* must still not fire until the
+        // terminating `\r` actually arrives, on a CR-only device exactly
+        // as it already does for LF (`assembles_only_complete_lines_and_
+        // holds_back_the_partial_tail` above).
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = std::sync::Arc::new(recorder(tmp.path()));
+        let state = std::sync::Arc::new(DeviceQueryState::new());
+        // Establish CR-only mode up front: "noise" gives one real completed
+        // line, then two bare CRs (crossing the auto-detect threshold)
+        // close it out and add one empty line — two known-good lines
+        // total, so the half-line appended below is unambiguous.
+        recorder.append_rx(b"noise\r\r").unwrap();
+        state.ingest(&recorder);
+        assert_eq!(
+            state.line_count(),
+            2,
+            "sanity check on the CR-mode-establishing prefix"
+        );
+
+        let waiter = {
+            let state = std::sync::Arc::clone(&state);
+            tokio::spawn(async move { state.wait_for("boot ok", Duration::from_millis(80)).await })
+        };
+        // Same deterministic "let the waiter reach its checked snapshot
+        // first" pattern as `wait_for_matches_on_a_cr_only_device` above.
+        tokio::task::yield_now().await;
+        recorder.append_rx(b"boot ok").unwrap(); // deliberately no trailing \r
+        state.ingest(&recorder);
+
+        let outcome = waiter.await.unwrap().unwrap();
+        assert_eq!(
+            state.line_count(),
+            2,
+            "only the two earlier established lines — never the half-line"
+        );
+        match outcome {
+            WaitForOutcome::TimedOut { .. } => {}
+            other => panic!("expected TimedOut (half-line must never match), got {other:?}"),
+        }
+    }
+
+    // ---- Issue #52: unbounded partial-buffer growth ----
+
+    #[test]
+    fn partial_buffer_beyond_the_cap_is_forced_into_one_capped_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+
+        // No terminator anywhere — under the pre-#52 behavior this would
+        // grow `partial.buf` forever. Exactly `MAX_PARTIAL_BYTES + 1` bytes
+        // guarantees the cap triggers on the very last byte pushed, with
+        // nothing left over in the new (post-flush) partial buffer, so the
+        // forced line's length is exactly this payload's — a payload any
+        // larger would still be handled correctly (no data ever dropped),
+        // just split across more than one capped line, one per
+        // `MAX_PARTIAL_BYTES`-sized span.
+        let payload = vec![b'x'; MAX_PARTIAL_BYTES + 1];
+        recorder.append_rx(&payload).unwrap();
+        state.ingest(&recorder);
+
+        assert_eq!(
+            state.line_count(),
+            1,
+            "crossing the cap must force exactly one line out, not zero (unbounded growth) or \
+             more than one"
+        );
+        let page = state.read_since(0, None, None).unwrap();
+        let forced = &page.lines[0];
+        assert!(forced.capped, "a cap-forced line must be flagged capped");
+        assert_eq!(
+            forced.raw.len(),
+            MAX_PARTIAL_BYTES + 1,
+            "no bytes may be dropped when force-completing"
+        );
+
+        // Assembly must continue working correctly afterwards — the cap
+        // must not leave the assembler in a broken state.
+        recorder.append_rx(b"back to normal\n").unwrap();
+        state.ingest(&recorder);
+        let page = state.read_since(0, None, None).unwrap();
+        assert_eq!(page.lines.len(), 2);
+        assert!(!page.lines[1].capped);
+        assert_eq!(page.lines[1].text, "back to normal");
+    }
+
+    #[test]
+    fn a_payload_many_times_the_cap_splits_into_several_capped_lines_with_no_data_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recorder = recorder(tmp.path());
+        let state = DeviceQueryState::new();
+
+        // Each capped flush fires as soon as the buffer *exceeds*
+        // `MAX_PARTIAL_BYTES`, i.e. at exactly `MAX_PARTIAL_BYTES + 1`
+        // bytes (see `Partial::push`) — so three flushes consume
+        // `3 * (MAX_PARTIAL_BYTES + 1)` bytes, leaving a clean 7-byte
+        // remainder still pending from this payload.
+        let per_flush = MAX_PARTIAL_BYTES + 1;
+        let payload = vec![b'y'; per_flush * 3 + 7];
+        recorder.append_rx(&payload).unwrap();
+        state.ingest(&recorder);
+
+        let page = state.read_since(0, None, None).unwrap();
+        // Three full-cap-sized capped lines, plus the 7-byte remainder
+        // still pending (not yet capped — it hasn't crossed the threshold
+        // itself) — nothing beyond that, and nothing dropped.
+        assert_eq!(
+            page.lines.len(),
+            3,
+            "{:?}",
+            page.lines.iter().map(|l| l.raw.len()).collect::<Vec<_>>()
+        );
+        assert!(page.lines.iter().all(|l| l.capped));
+        let total: usize = page.lines.iter().map(|l| l.raw.len()).sum();
+        assert_eq!(
+            total,
+            per_flush * 3,
+            "every capped line together must account for every byte up to the still-pending \
+             remainder — no silent drops"
+        );
+
+        // The 7-byte remainder is still sitting in the partial buffer,
+        // exactly as an ordinary half-line would be — completing it
+        // normally must produce clean content, not corruption.
+        recorder.append_rx(b"\n").unwrap();
+        state.ingest(&recorder);
+        let page = state.read_since(0, None, None).unwrap();
+        assert_eq!(page.lines.len(), 4);
+        assert!(!page.lines[3].capped);
+        assert_eq!(page.lines[3].raw.len(), 7);
     }
 
     #[test]

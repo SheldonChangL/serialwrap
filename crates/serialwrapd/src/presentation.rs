@@ -538,6 +538,7 @@ mod tests {
             seq,
             t_mono: seq as f64,
             t_wall: format!("t{seq}"),
+            capped: false,
         }
     }
 
@@ -583,6 +584,81 @@ mod tests {
             LineRender::Text {
                 text: "hello".to_string(),
                 raw_hex: None
+            }
+        );
+    }
+
+    // ---- Issue #52 acceptance criterion: clean ASCII with a CR terminator
+    // is never presented as binary ----
+
+    /// A correctly CR-terminated line has no embedded `\r` at all (the CR
+    /// was the terminator, stripped by `query::Terminator::split` before it
+    /// ever reaches `AssembledLine::raw`) — so once `serialwrapd::query`
+    /// correctly recognizes CR as a line terminator (this same issue #52),
+    /// this content is *always* valid UTF-8, and `render_line` never even
+    /// reaches the invalid-UTF-8 ratio/threshold logic below, regardless of
+    /// what that threshold is set to. This test pins that down with the
+    /// issue's own real device content (a 35-byte line from the RTL8735B
+    /// capture, minus the leading `\r` the query layer now strips as the
+    /// terminator).
+    #[test]
+    fn issue_52_a_correctly_assembled_cr_terminated_line_renders_as_plain_text() {
+        let limits = PresentationLimits::default();
+        let raw = b"osd_update_custom_init Jun  3 2026";
+        assert!(
+            std::str::from_utf8(raw).is_ok(),
+            "sanity: this fixture must actually be valid UTF-8"
+        );
+        let rendered = render_line(&line(0, raw), &limits);
+        assert_eq!(
+            rendered,
+            LineRender::Text {
+                text: "osd_update_custom_init Jun  3 2026".to_string(),
+                raw_hex: None,
+            },
+            "clean ASCII (even from a device whose line-ending convention was CR) must never \
+             render as BinarySummary"
+        );
+    }
+
+    /// Diagnosis note for issue #52's "35 bytes, 1 control char (2.9%),
+    /// crosses a 30% threshold?" report: this ratio-based threshold isn't
+    /// actually what misclassified the user's log as binary. A bare `\r`
+    /// (0x0D) is a *valid* single-byte UTF-8 codepoint, so `render_line`'s
+    /// `std::str::from_utf8(&line.raw).is_ok()` check is `true` for content
+    /// like this even with an embedded `\r` still in it (e.g. before this
+    /// issue's line-assembly fix, when the query layer had no CR-as-
+    /// terminator recognition at all) — `invalid_utf8_ratio`'s 30%
+    /// threshold is never even evaluated. The actual "binary" hex-dump the
+    /// user saw came from a *different*, independent, zero-tolerance
+    /// mechanism: `serialwrap`'s CLI-only `cli::render::is_terminal_safe`,
+    /// which flags *any* control byte other than tab, regardless of ratio —
+    /// see that function's module for why it's out of this fix's scope.
+    /// This test just pins down the presentation-layer half of that
+    /// diagnosis: a single embedded control byte alone never crosses this
+    /// module's ratio threshold merely by being a control byte, only by
+    /// being part of *invalid* UTF-8.
+    #[test]
+    fn a_single_embedded_cr_byte_alone_never_crosses_the_ratio_threshold() {
+        let limits = PresentationLimits::default();
+        let mut raw = b"\r".to_vec();
+        raw.extend_from_slice(b"osd_update_custom_init Jun  3 2026");
+        assert!(
+            std::str::from_utf8(&raw).is_ok(),
+            "a bare \\r is valid single-byte UTF-8 — this must hold for the diagnosis to apply"
+        );
+        assert_eq!(
+            invalid_utf8_ratio(&raw),
+            0.0,
+            "a control byte that's still valid UTF-8 contributes nothing to the invalid-UTF-8 \
+             ratio — confirms this module's ratio threshold was never the mechanism that \
+             misclassified issue #52's log lines"
+        );
+        assert_eq!(
+            render_line(&line(0, &raw), &limits),
+            LineRender::Text {
+                text: String::from_utf8_lossy(&raw).into_owned(),
+                raw_hex: None,
             }
         );
     }

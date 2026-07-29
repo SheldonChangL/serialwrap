@@ -55,7 +55,11 @@ async fn start_daemon_with_device(device_id: &str, recorder: Arc<Recorder>) -> T
     let backend = Arc::new(TestBackend::new());
     backend.register(DeviceId(device_id.to_string()), recorder);
     let listener = server::bind(&path).expect("bind test socket");
-    let shared = Arc::new(Shared::new(backend as Arc<dyn DeviceBackend>, "test"));
+    let shared = Arc::new(Shared::new(
+        backend as Arc<dyn DeviceBackend>,
+        "test",
+        dir.path(),
+    ));
     tokio::spawn(server::serve(listener, shared));
     TestDaemon {
         socket_path: path,
@@ -437,7 +441,11 @@ async fn s1_boot_banner_is_visible_via_plain_tail_with_no_client_present_during_
     let socket_dir = tempfile::tempdir().expect("socket tempdir");
     let socket_path = socket_dir.path().join("test.sock");
     let listener = server::bind(&socket_path).expect("bind test socket");
-    let shared = Arc::new(Shared::new(backend as Arc<dyn DeviceBackend>, "test"));
+    let shared = Arc::new(Shared::new(
+        backend as Arc<dyn DeviceBackend>,
+        "test",
+        socket_dir.path(),
+    ));
     tokio::spawn(server::serve(listener, shared));
 
     let output = cli(&socket_path, &["tail", "-n", "50", &id.0])

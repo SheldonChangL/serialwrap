@@ -56,15 +56,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::Map;
 
 use crate::port_config::PortConfig;
+use crate::query::LineTerminatorMode;
 use crate::recorder::Recorder;
 
-/// One device's persisted configuration. Currently just [`PortConfig`];
-/// a `struct` (rather than a bare type alias) so future per-device
-/// settings (e.g. a friendly name) have somewhere to go without changing
-/// every call site.
+/// One device's persisted configuration. A `struct` (rather than a bare
+/// type alias around just [`PortConfig`]) so per-device settings beyond the
+/// port config itself have somewhere to go without changing every call
+/// site — [`Self::line_terminator`] (issue #52) is the first to use that
+/// room: "跟著裝置記住" applies to line-ending convention exactly the same
+/// way it already does to baud.
+///
+/// `#[serde(default)]` on `line_terminator` keeps this forward-compatible
+/// with a `profile.json` written before this field existed: it
+/// deserializes as [`LineTerminatorMode::Auto`], never a load failure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DeviceProfile {
     pub config: PortConfig,
+    #[serde(default)]
+    pub line_terminator: LineTerminatorMode,
 }
 
 /// Persists [`DeviceProfile`]s under `<data_dir>/devices/<device_id>/profile.json`.
@@ -196,6 +205,75 @@ mod tests {
         }
     }
 
+    // ---- Issue #52: per-device line-terminator override persistence ----
+
+    #[test]
+    fn line_terminator_defaults_to_auto_and_round_trips_through_save_and_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(tmp.path());
+
+        assert_eq!(
+            DeviceProfile::default().line_terminator,
+            LineTerminatorMode::Auto,
+            "a brand-new profile must default to auto-detection, not force a mode"
+        );
+
+        let profile = DeviceProfile {
+            config: custom_config(),
+            line_terminator: LineTerminatorMode::Cr,
+        };
+        store.save("dev-1", &profile).unwrap();
+        let loaded = store.load("dev-1").unwrap().expect("profile must load");
+        assert_eq!(loaded.line_terminator, LineTerminatorMode::Cr);
+    }
+
+    #[test]
+    fn line_terminator_serializes_as_snake_case_matching_this_repos_wire_convention() {
+        // `wrap_proto::request::LineEnding` (the write-side equivalent) is
+        // `#[serde(rename_all = "snake_case")]`; every other enum on this
+        // wire follows the same rule. Pin it down explicitly rather than
+        // relying on `#[derive(Serialize)]`'s PascalCase default, since
+        // `profile.json` is hand-editable and this field is read by the
+        // daemon on every device's first `get_or_spawn`.
+        for (mode, expected) in [
+            (LineTerminatorMode::Auto, "auto"),
+            (LineTerminatorMode::Lf, "lf"),
+            (LineTerminatorMode::Cr, "cr"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(mode).unwrap(),
+                serde_json::Value::String(expected.to_string()),
+                "{mode:?} must serialize as snake_case \"{expected}\""
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_json_written_before_line_terminator_existed_still_loads_as_auto() {
+        // Simulates a `profile.json` persisted by a pre-issue-#52 daemon
+        // build: no `line_terminator` key at all. `#[serde(default)]` must
+        // make this a normal, successful load (falling back to `Auto`), not
+        // a `ProfileStore::load` error — an operator upgrading the daemon
+        // must never have their existing saved profiles start failing to
+        // load.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(tmp.path());
+        let dir = tmp.path().join("devices").join("dev-1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("profile.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({ "config": PortConfig::default() }))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store
+            .load("dev-1")
+            .unwrap()
+            .expect("a profile.json missing line_terminator must still load");
+        assert_eq!(loaded.line_terminator, LineTerminatorMode::Auto);
+    }
+
     // ---- Acceptance criterion 4: persistence + reconnect application ----
 
     #[test]
@@ -206,6 +284,7 @@ mod tests {
 
         let profile = DeviceProfile {
             config: custom_config(),
+            ..Default::default()
         };
         store.save("dev-1", &profile).unwrap();
 
@@ -225,6 +304,7 @@ mod tests {
                 "dev-1",
                 &DeviceProfile {
                     config: custom_config(),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -246,6 +326,7 @@ mod tests {
                 "dev-1",
                 &DeviceProfile {
                     config: PortConfig::default(),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -254,6 +335,7 @@ mod tests {
                 "dev-1",
                 &DeviceProfile {
                     config: custom_config(),
+                    ..Default::default()
                 },
             )
             .unwrap();
