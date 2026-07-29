@@ -46,6 +46,7 @@ async fn start_daemon(device_id: &str) -> (TestDaemon, tempfile::TempDir, Arc<Re
     let shared = Arc::new(Shared::new(
         Arc::clone(&backend) as Arc<dyn DeviceBackend>,
         "test",
+        dir.path(),
     ));
     tokio::spawn(server::serve(listener, shared));
 

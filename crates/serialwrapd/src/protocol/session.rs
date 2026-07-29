@@ -267,6 +267,13 @@ fn line_json(l: &crate::query::AssembledLine) -> serde_json::Value {
     if std::str::from_utf8(&l.raw).is_err() {
         obj.insert("raw_b64".to_string(), BASE64.encode(&l.raw).into());
     }
+    // Issue #52: only present (and `true`) when the partial-buffer cap
+    // force-completed this line rather than an actual terminator — additive
+    // field, omitted entirely for every ordinarily-terminated line, so
+    // existing consumers that don't know about it see no change at all.
+    if l.capped {
+        obj.insert("capped".to_string(), true.into());
+    }
     serde_json::Value::Object(obj)
 }
 

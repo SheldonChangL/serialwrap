@@ -55,7 +55,7 @@ async fn start_test_daemon_with_gate(
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("test.sock");
     let listener = server::bind(&path).expect("bind test socket");
-    let shared = Arc::new(Shared::new(backend, "test").with_gate(gate));
+    let shared = Arc::new(Shared::new(backend, "test", dir.path()).with_gate(gate));
     tokio::spawn(server::serve(listener, shared));
     (path, dir)
 }

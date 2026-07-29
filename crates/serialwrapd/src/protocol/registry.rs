@@ -18,8 +18,9 @@ use std::time::{Duration, Instant};
 
 use wrap_proto::{ClientType, Permission};
 
+use crate::device_profile::ProfileStore;
 use crate::port::DeviceId;
-use crate::query::{spawn_poller, DeviceQueryState, DEFAULT_POLL_INTERVAL};
+use crate::query::{spawn_poller, DeviceQueryState, LineTerminatorMode};
 use crate::recorder::Recorder;
 
 /// One cached device's query state plus the background poller task
@@ -28,15 +29,29 @@ type CachedQueryState = (Arc<DeviceQueryState>, tokio::task::JoinHandle<()>);
 
 /// Lazily creates and caches one [`DeviceQueryState`] per device. See the
 /// module docs.
+///
+/// Also owns an [`Arc<ProfileStore>`] purely to read (never write) each
+/// device's persisted [`crate::device_profile::DeviceProfile::line_terminator`]
+/// override the moment a [`DeviceQueryState`] is first created for it
+/// (issue #52) — a *second* `ProfileStore` handle onto the same
+/// `data_dir`/`profile.json` files `port::HotplugDetector`'s own
+/// `PortConfigApi` already reads/writes for `PortConfig`. Deliberately not
+/// the *same* handle: threading `PortConfigApi`'s existing one through here
+/// would mean reaching across `DeviceBackend`'s trait boundary (touching
+/// the trait itself, `LiveBackend`, and `TestBackend` for no benefit)
+/// purely to share an object that's already stateless, path-keyed file
+/// I/O — a second instance reads the identical bytes.
 pub struct QueryRegistry {
     poll_interval: Duration,
+    profiles: Arc<ProfileStore>,
     states: Mutex<HashMap<DeviceId, CachedQueryState>>,
 }
 
 impl QueryRegistry {
-    pub fn new(poll_interval: Duration) -> Self {
+    pub fn new(poll_interval: Duration, profiles: Arc<ProfileStore>) -> Self {
         Self {
             poll_interval,
+            profiles,
             states: Mutex::new(HashMap::new()),
         }
     }
@@ -59,17 +74,23 @@ impl QueryRegistry {
         if let Some((state, _)) = states.get(id) {
             return Arc::clone(state);
         }
-        let state = Arc::new(DeviceQueryState::new());
+        // Best-effort, same defensive stance `port::HotplugDetector` takes
+        // loading the exact same file for `PortConfig` (see that module's
+        // `handle_new_device`): a missing or unreadable profile just means
+        // "no override yet" (`Auto`), never a hard failure to create the
+        // query state at all.
+        let line_terminator = self
+            .profiles
+            .load(&id.0)
+            .ok()
+            .flatten()
+            .map(|p| p.line_terminator)
+            .unwrap_or(LineTerminatorMode::Auto);
+        let state = Arc::new(DeviceQueryState::with_line_terminator(line_terminator));
         state.ingest(&recorder);
         let handle = spawn_poller(recorder, Arc::clone(&state), self.poll_interval);
         states.insert(id.clone(), (Arc::clone(&state), handle));
         state
-    }
-}
-
-impl Default for QueryRegistry {
-    fn default() -> Self {
-        Self::new(DEFAULT_POLL_INTERVAL)
     }
 }
 
@@ -319,5 +340,77 @@ impl ClientRegistry {
             }
             None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device_profile::DeviceProfile;
+    use crate::recorder::{Recorder, RecorderConfig};
+
+    // ---- Issue #52: `get_or_spawn` actually honors a persisted per-device
+    // line-terminator override, not just `DeviceQueryState::
+    // with_line_terminator` in isolation ----
+
+    #[tokio::test]
+    async fn get_or_spawn_seeds_the_query_state_from_the_devices_persisted_line_terminator_override(
+    ) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let profiles = Arc::new(ProfileStore::new(data_dir.path()));
+        profiles
+            .save(
+                "dev-1",
+                &DeviceProfile {
+                    line_terminator: LineTerminatorMode::Cr,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let registry = QueryRegistry::new(Duration::from_millis(5), profiles);
+        let recorder_dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            Recorder::open(recorder_dir.path(), "dev-1", RecorderConfig::default()).unwrap(),
+        );
+        // Deliberately a payload where `Auto` and an explicit `Cr` override
+        // would resolve *differently*, so this test can't pass merely
+        // because auto-detection would have reached the same answer
+        // anyway: exactly one bare `\r` followed by a real `\n`. Under
+        // `Auto`, the `\n` wins immediately (resolves `Lf`), producing one
+        // complete line `"\rfirst"` (the leading `\r` stays as literal
+        // content, since it isn't immediately before the `\n`). Under an
+        // honored `Cr` override, the leading `\r` completes an empty line
+        // immediately, and `"first\n"` — containing no `\r` at all — never
+        // completes, staying a pending half-line.
+        recorder.append_rx(b"\rfirst\n").unwrap();
+
+        let state = registry.get_or_spawn(&crate::port::DeviceId("dev-1".to_string()), recorder);
+        let page = state.read_since(0, None, None).unwrap();
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![""],
+            "the registry must have loaded the persisted Cr override and constructed the query \
+             state with it — an Auto-defaulted state would instead show one complete \
+             \"\\rfirst\" line here: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_or_spawn_defaults_to_auto_when_no_profile_has_ever_been_saved() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let profiles = Arc::new(ProfileStore::new(data_dir.path()));
+        let registry = QueryRegistry::new(Duration::from_millis(5), profiles);
+        let recorder_dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            Recorder::open(recorder_dir.path(), "dev-2", RecorderConfig::default()).unwrap(),
+        );
+        recorder.append_rx(b"plain lf line\n").unwrap();
+
+        let state = registry.get_or_spawn(&crate::port::DeviceId("dev-2".to_string()), recorder);
+        let page = state.read_since(0, None, None).unwrap();
+        assert_eq!(page.lines.len(), 1);
+        assert_eq!(page.lines[0].text, "plain lf line");
     }
 }

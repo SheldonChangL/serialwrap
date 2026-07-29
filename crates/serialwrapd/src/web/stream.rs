@@ -332,6 +332,7 @@ mod tests {
         let shared = Arc::new(Shared::new(
             backend as Arc<dyn DeviceBackend>,
             "test-version",
+            tmp.path(),
         ));
         (shared, tmp)
     }
@@ -443,6 +444,7 @@ mod tests {
             seq,
             t_mono: seq as f64,
             t_wall: format!("t{seq}"),
+            capped: false,
         }
     }
 

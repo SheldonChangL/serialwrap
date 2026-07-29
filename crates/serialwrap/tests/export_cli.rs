@@ -44,7 +44,11 @@ async fn start_daemon_with_device(device_id: &str, recorder: Arc<Recorder>) -> T
     let backend = Arc::new(TestBackend::new());
     backend.register(DeviceId(device_id.to_string()), recorder);
     let listener = server::bind(&path).expect("bind test socket");
-    let shared = Arc::new(Shared::new(backend as Arc<dyn DeviceBackend>, "test"));
+    let shared = Arc::new(Shared::new(
+        backend as Arc<dyn DeviceBackend>,
+        "test",
+        dir.path(),
+    ));
     tokio::spawn(server::serve(listener, shared));
     TestDaemon {
         socket_path: path,

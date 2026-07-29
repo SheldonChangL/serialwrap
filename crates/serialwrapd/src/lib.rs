@@ -82,14 +82,14 @@ async fn run_with_hotplug() -> std::io::Result<()> {
     let data_dir = recorder::default_data_dir()?;
     let detector = port::HotplugDetector::new(
         Box::new(port::SystemEnumerator::new()),
-        data_dir,
+        data_dir.clone(),
         port::HotplugConfig::default(),
     );
     let backend: Arc<dyn protocol::backend::DeviceBackend> = Arc::new(
         protocol::backend::LiveBackend::new(detector.port_config_api(), detector.recorders()),
     );
     let handle = detector.spawn();
-    serve_forever(backend).await?;
+    serve_forever(backend, data_dir).await?;
     // Unreachable in practice — see `serve_forever`'s doc comment for why
     // this line exists at all.
     handle.stop();
@@ -114,7 +114,7 @@ async fn run_with_test_backend(device_id: String) -> std::io::Result<()> {
     let test_backend = protocol::backend::testing::TestBackend::new();
     test_backend.register(port::DeviceId(device_id), recorder);
     let backend: Arc<dyn protocol::backend::DeviceBackend> = Arc::new(test_backend);
-    serve_forever(backend).await
+    serve_forever(backend, data_dir).await
 }
 
 /// Shared tail of [`run_with_hotplug`]/[`run_with_test_backend`]: bind the
@@ -128,7 +128,10 @@ async fn run_with_test_backend(device_id: String) -> std::io::Result<()> {
 /// half-working state (see `web::serve_on`'s doc comment), a daemon that
 /// claims to have started but has no working browser endpoint is worse
 /// than one that fails loudly at startup.
-async fn serve_forever(backend: Arc<dyn protocol::backend::DeviceBackend>) -> std::io::Result<()> {
+async fn serve_forever(
+    backend: Arc<dyn protocol::backend::DeviceBackend>,
+    data_dir: std::path::PathBuf,
+) -> std::io::Result<()> {
     // Bind the web listener *before* `protocol::server::bind`: the UDS
     // bind is destructive — it unconditionally unlinks whatever socket
     // file is already at that path, live daemon or not (see that
@@ -142,7 +145,8 @@ async fn serve_forever(backend: Arc<dyn protocol::backend::DeviceBackend>) -> st
     let socket_path = protocol::default_socket_path()?;
     let listener = protocol::server::bind(&socket_path)?;
     let shared = Arc::new(
-        protocol::Shared::new(backend, env!("CARGO_PKG_VERSION")).with_gate(production_gate()),
+        protocol::Shared::new(backend, env!("CARGO_PKG_VERSION"), data_dir)
+            .with_gate(production_gate()),
     );
     let web_shared = Arc::clone(&shared);
 

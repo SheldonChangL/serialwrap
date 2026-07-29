@@ -128,9 +128,11 @@ mod tests {
     /// peer address should, unsurprisingly, pass the loopback guard.
     #[tokio::test]
     async fn serve_wires_up_a_real_socket_end_to_end() {
+        let tmp = tempfile::tempdir().expect("tempdir");
         let shared = Arc::new(Shared::new(
             Arc::new(TestBackend::new()) as Arc<dyn DeviceBackend>,
             "test-version",
+            tmp.path(),
         ));
         let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

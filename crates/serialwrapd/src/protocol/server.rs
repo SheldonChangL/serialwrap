@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use tokio::net::UnixListener;
 
+use crate::device_profile::ProfileStore;
 use crate::gate::Gate;
+use crate::query::DEFAULT_POLL_INTERVAL;
 
 use super::backend::DeviceBackend;
 use super::registry::{ClientRegistry, QueryRegistry};
@@ -34,10 +36,25 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn new(backend: Arc<dyn DeviceBackend>, server_version: impl Into<String>) -> Self {
+    /// `data_dir` is where per-device state lives (`devices/<id>/...` —
+    /// see `recorder.rs`'s and `device_profile.rs`'s "Storage layout"
+    /// docs); it's needed here only so [`QueryRegistry`] can read a
+    /// device's persisted line-terminator override (issue #52) the moment
+    /// it first creates that device's query state — see
+    /// [`QueryRegistry`]'s own docs for why this is a second,
+    /// independent [`ProfileStore`] handle rather than one threaded
+    /// through [`DeviceBackend`].
+    pub fn new(
+        backend: Arc<dyn DeviceBackend>,
+        server_version: impl Into<String>,
+        data_dir: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             backend,
-            queries: QueryRegistry::default(),
+            queries: QueryRegistry::new(
+                DEFAULT_POLL_INTERVAL,
+                Arc::new(ProfileStore::new(data_dir.into())),
+            ),
             clients: ClientRegistry::new(),
             server_version: server_version.into(),
             gate: Gate::default(),

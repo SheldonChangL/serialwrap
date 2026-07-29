@@ -79,9 +79,11 @@ mod tests {
         use crate::protocol::backend::DeviceBackend;
         use crate::protocol::Shared;
 
+        let tmp = tempfile::tempdir().expect("tempdir");
         let shared = Arc::new(Shared::new(
             Arc::new(TestBackend::new()) as Arc<dyn DeviceBackend>,
             "test",
+            tmp.path(),
         ));
         let router = crate::web::router(shared);
 

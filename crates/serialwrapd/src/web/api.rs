@@ -1318,9 +1318,11 @@ mod tests {
     use crate::protocol::Shared;
 
     fn shared() -> Arc<Shared> {
+        let tmp = tempfile::tempdir().expect("tempdir");
         Arc::new(Shared::new(
             Arc::new(TestBackend::new()) as Arc<dyn DeviceBackend>,
             "test-version",
+            tmp.path(),
         ))
     }
 
@@ -1387,6 +1389,7 @@ mod tests {
         let shared = Arc::new(Shared::new(
             backend as Arc<dyn DeviceBackend>,
             "test-version",
+            tmp.path(),
         ));
 
         let router = crate::web::router(shared);
@@ -1445,6 +1448,7 @@ mod tests {
         let shared = Arc::new(Shared::new(
             backend as Arc<dyn DeviceBackend>,
             "test-version",
+            tmp.path(),
         ));
         (shared, tmp, id)
     }
@@ -1714,6 +1718,7 @@ mod tests {
             seq: 0,
             t_mono: 0.0,
             t_wall: "t0".to_string(),
+            capped: false,
         }
     }
 

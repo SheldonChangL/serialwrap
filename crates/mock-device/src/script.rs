@@ -29,6 +29,58 @@ pub fn repeated_line(line: &str, times: usize) -> Vec<u8> {
     out
 }
 
+/// Line-ending convention for [`lines_with_ending`]/
+/// [`repeated_line_with_ending`] — the generator-side counterpart of the
+/// read-side line-assembly conventions `serialwrapd::query`'s
+/// `LineTerminatorMode`/auto-detection now handles (issue #52), and of the
+/// write-side conventions `serialwrap write -e lf|crlf|cr` already exposed.
+/// Before issue #52, every mock-device fixture in this crate was hardcoded
+/// to `Lf`, which is exactly why none of this project's tests exercised
+/// CR-only assembly until this issue's own fixtures (in `serialwrapd::query`
+/// and this module's own tests below) added it directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEnding {
+    /// Bare `\n`.
+    Lf,
+    /// `\r\n`.
+    Crlf,
+    /// Bare `\r`, no `\n` at all — the RTL8735B/AmebaPro2 convention issue
+    /// #52 was filed against.
+    Cr,
+}
+
+impl LineEnding {
+    fn terminator(self) -> &'static [u8] {
+        match self {
+            LineEnding::Lf => b"\n",
+            LineEnding::Crlf => b"\r\n",
+            LineEnding::Cr => b"\r",
+        }
+    }
+}
+
+/// `lines`, each terminated per `ending` — the line-ending-aware,
+/// multi-line generator [`repeated_line_with_ending`] delegates to. Useful
+/// for fixtures that need several *distinct* lines (e.g. a CR-only boot
+/// sequence), not just one line repeated.
+pub fn lines_with_ending(lines: &[&str], ending: LineEnding) -> Vec<u8> {
+    let term = ending.terminator();
+    let mut out = Vec::new();
+    for line in lines {
+        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(term);
+    }
+    out
+}
+
+/// [`repeated_line`], generalized to any [`LineEnding`] — for exercising
+/// `serialwrapd::query`'s CR-only/CRLF/LF line assembly and auto-detection
+/// (issue #52) with mock-device fixtures instead of hand-built byte
+/// literals in every test.
+pub fn repeated_line_with_ending(line: &str, times: usize, ending: LineEnding) -> Vec<u8> {
+    lines_with_ending(&vec![line; times], ending)
+}
+
 /// `len` bytes of deterministic, non-UTF-8 binary content.
 ///
 /// Cycles through every byte value 0x00..=0xFF, so for any `len >= 1` it is
@@ -64,5 +116,44 @@ mod tests {
     #[test]
     fn periodic_line_includes_seq() {
         assert_eq!(periodic_line(42), b"tick seq=42\n".to_vec());
+    }
+
+    // ---- Issue #52: line-ending-aware generators ----
+
+    #[test]
+    fn lines_with_ending_lf_matches_plain_repeated_line() {
+        assert_eq!(
+            lines_with_ending(&["hello", "hello", "hello"], LineEnding::Lf),
+            repeated_line("hello", 3),
+            "LF generator must produce byte-for-byte the same output as the pre-existing \
+             LF-only helper"
+        );
+    }
+
+    #[test]
+    fn lines_with_ending_crlf_produces_expected_bytes() {
+        assert_eq!(
+            lines_with_ending(&["a", "b"], LineEnding::Crlf),
+            b"a\r\nb\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn lines_with_ending_cr_produces_bare_cr_no_lf_at_all() {
+        let out = lines_with_ending(&["a", "b"], LineEnding::Cr);
+        assert_eq!(out, b"a\rb\r".to_vec());
+        assert!(
+            !out.contains(&b'\n'),
+            "a CR-only fixture must never contain an LF byte, or it isn't actually exercising \
+             CR-only assembly: {out:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_line_with_ending_cr_repeats_correctly() {
+        assert_eq!(
+            repeated_line_with_ending("tick", 3, LineEnding::Cr),
+            b"tick\rtick\rtick\r".to_vec()
+        );
     }
 }
