@@ -143,6 +143,26 @@ test("ANSI color codes render as color, never as visible [1;34m noise", async ({
   await expect(page.locator('[data-row-kind="line"]')).toHaveCount(1);
 });
 
+test("sending from the write bar returns focus to the entry for the next command", async ({
+  page,
+}) => {
+  await gotoConnectedLiveLog(page);
+  const input = page.getByTestId("write-input");
+  await input.fill("ls");
+  await input.press("Enter");
+
+  // `TestBackend` has no writer registered over HTTP (`register_writer` is
+  // a Rust-test-only seam — see `web/api.rs`'s module docs), so this send
+  // completes through the *error* path. That is fine for what this guards:
+  // the entry is disabled while sending, and a `focus()` issued before it
+  // re-enables is silently ignored, dumping keyboard focus on <body> after
+  // every send — success or failure alike. The error path additionally
+  // keeps the rejected payload in place, ready to fix and resend.
+  await expect(page.getByTestId("write-error")).toBeVisible({ timeout: 10_000 });
+  await expect(input).toHaveValue("ls");
+  await expect(input).toBeFocused();
+});
+
 test("scrolling up pauses following; the pill count is correct; clicking it returns to the tail", async ({
   page,
 }) => {

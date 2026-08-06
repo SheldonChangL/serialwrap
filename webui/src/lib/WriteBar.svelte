@@ -95,13 +95,19 @@
       if (raw.length > 0 && history[history.length - 1] !== raw) history = [...history, raw];
       historyIndex = null;
       value = "";
-      await tick();
-      inputEl?.focus();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
       sending = false;
     }
+    // Refocus only after `sending` is back to false *and* the DOM has
+    // caught up: the entry is `disabled` while sending, and calling
+    // `focus()` on a still-disabled input is silently ignored — which is
+    // exactly the bug this ordering fixes (the old code focused inside the
+    // `try`, before `finally` re-enabled the input). On error the entry
+    // keeps the rejected payload and the focus, ready to fix and resend.
+    await tick();
+    inputEl?.focus();
   }
 
   function recall(direction: -1 | 1): void {
