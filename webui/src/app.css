@@ -88,6 +88,28 @@
 
   --focus-ring: #7fb3ff;
 
+  /* ANSI SGR foregrounds for device output (see `ansi.ts`). 0-7 normal,
+   * 8-15 bright. Tuned for this dark surface rather than taken from any
+   * terminal's stock palette: "black" (0) must stay readable on --bg, and
+   * the rest sit at roughly the same perceived brightness as --text so a
+   * colorized `ls` reads as calmly as plain output. */
+  --ansi-0: #8e9bab;
+  --ansi-1: #ef7b72;
+  --ansi-2: #63c982;
+  --ansi-3: #d9b153;
+  --ansi-4: #6fa8f5;
+  --ansi-5: #c98fe0;
+  --ansi-6: #5fc9d9;
+  --ansi-7: #cfd6df;
+  --ansi-8: #778496;
+  --ansi-9: #ff958c;
+  --ansi-10: #7fe09c;
+  --ansi-11: #f0cc6e;
+  --ansi-12: #8cbcff;
+  --ansi-13: #e0a8f5;
+  --ansi-14: #7fdeec;
+  --ansi-15: #f2f6fa;
+
   /* Legacy aliases — the connection-status pill and device dots were
    * written against these names before this file had a semantic layer.
    * Kept pointing at the new tokens rather than renamed at every call site,
@@ -122,6 +144,24 @@
     --gate-bg: rgba(196, 55, 47, 0.09);
 
     --focus-ring: #1e6fd9;
+
+    /* Darkened for a white surface; same hue assignments as the dark set. */
+    --ansi-0: #5b6675;
+    --ansi-1: #c4372f;
+    --ansi-2: #1f7c3d;
+    --ansi-3: #93690a;
+    --ansi-4: #1e5fc0;
+    --ansi-5: #8f3fae;
+    --ansi-6: #16707f;
+    --ansi-7: #4a5462;
+    --ansi-8: #75808f;
+    --ansi-9: #d4574f;
+    --ansi-10: #2c9151;
+    --ansi-11: #a87d1c;
+    --ansi-12: #3b74d0;
+    --ansi-13: #a35cc0;
+    --ansi-14: #2b8494;
+    --ansi-15: #333d4b;
   }
 }
 

@@ -112,6 +112,37 @@ test("duplicate lines fold and binary content collapses to a hex chip, both expa
   await expect(binaryRow).toContainText(/ff fe fd fc/);
 });
 
+test("ANSI color codes render as color, never as visible [1;34m noise", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  // What a busybox `ls` on a firmware console actually emits: SGR-colored
+  // names with resets, plus an uncolored tail on the same line. The exact
+  // regression this guards: ESC is invisible in HTML, so without parsing,
+  // the row displayed `[1;34mbin[0m …` (issue observed live on a SigmaStar
+  // camera console, 2026-08-06).
+  await injectLog(daemon!, DEVICE_ID, [
+    { kind: "rx", text: "\u001b[1;34mbin\u001b[0m  \u001b[1;36mlinuxrc\u001b[0m  plain\n" },
+  ]);
+
+  const row = page.locator('[data-row-kind="line"]').first();
+  // Stripped text, with the run of spaces between columns preserved.
+  await expect(row).toHaveText(/bin {2}linuxrc {2}plain/, { timeout: 10_000 });
+  await expect(row).not.toContainText("[1;34m");
+
+  // The color must actually land: the styled span picks up a palette
+  // foreground different from the row's default text color.
+  const colored = row.locator("span", { hasText: "bin" }).last();
+  const [spanColor, rowColor] = await Promise.all([
+    colored.evaluate((el) => getComputedStyle(el).color),
+    row.evaluate((el) => getComputedStyle(el).color),
+  ]);
+  expect(spanColor).not.toEqual(rowColor);
+
+  // And the filter box matches the *visible* text — the regex runs against
+  // the ANSI-stripped string, not the raw bytes.
+  await page.getByTestId("filter-input").fill("linuxrc");
+  await expect(page.locator('[data-row-kind="line"]')).toHaveCount(1);
+});
+
 test("scrolling up pauses following; the pill count is correct; clicking it returns to the tail", async ({
   page,
 }) => {

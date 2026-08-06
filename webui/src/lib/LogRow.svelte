@@ -24,6 +24,7 @@
    * visible scrollbar, exactly like a terminal's own pager.
    */
   import type { LogItem } from "./liveLog";
+  import type { AnsiSpan } from "./ansi";
   import { describeEvent, type EventTone } from "./eventText";
   import { setDeviceConfig } from "./logStream";
 
@@ -84,6 +85,16 @@
     return out.length > 0 ? out : [{ t: text, hit: false }];
   }
 
+  /** Inline style for one ANSI span — see `ansi.ts` for what is and isn't
+   * rendered. The 16 palette entries live in `app.css` (`--ansi-0`…`-15`),
+   * theme-adjusted the same way the direction accents are. */
+  function ansiStyle(sp: AnsiSpan): string | undefined {
+    const parts: string[] = [];
+    if (sp.fg !== null) parts.push(`color: var(--ansi-${sp.fg})`);
+    if (sp.bold) parts.push("font-weight: 600");
+    return parts.length > 0 ? parts.join("; ") : undefined;
+  }
+
   const described = $derived(
     item.kind === "event" ? describeEvent(item.name, item.extra) : null,
   );
@@ -117,6 +128,10 @@
   }
 </script>
 
+<!-- Kept to one line: rows are `white-space: pre`, so any formatting
+     whitespace inside this snippet would become visible output. -->
+{#snippet ansiText(spans: AnsiSpan[])}{#each spans as sp}{#if ansiStyle(sp)}<span style={ansiStyle(sp)}>{sp.text}</span>{:else}{sp.text}{/if}{/each}{/snippet}
+
 {#if item.kind === "gap"}
   <div class="row gap" data-testid="log-row" data-row-kind="gap" data-highlighted={highlighted}>
     <span class="chip tnum">no output for {item.deltaS.toFixed(1)}s</span>
@@ -139,7 +154,10 @@
     {#if item.folded}
       <button type="button" class="inline-toggle fold-toggle" onclick={() => onToggleExpand(item.id)}>
         {#if item.render.kind === "text"}
-          <span class="text">{item.render.text}</span>
+          <span class="text"
+            >{#if item.render.spans}{@render ansiText(item.render.spans)}{:else}{item.render
+                .text}{/if}</span
+          >
         {:else}
           <span class="text dim">{item.render.length} bytes of binary</span>
         {/if}
@@ -161,13 +179,22 @@
       </button>
     {:else if item.render.rawHex !== null}
       <button type="button" class="inline-toggle binary-toggle" onclick={() => onToggleExpand(item.id)}>
-        <span class="text">{item.render.text}</span>
+        <span class="text"
+          >{#if item.render.spans}{@render ansiText(item.render.spans)}{:else}{item.render
+              .text}{/if}</span
+        >
         {#if expanded}
           <span class="hex">{item.render.rawHex}</span>
         {:else}
           <span class="meta affordance">· view as hex</span>
         {/if}
       </button>
+    {:else if item.render.spans && !highlightRe}
+      <!-- Colors and match-highlighting don't compose (a match can straddle
+           style runs); highlight mode wins because the user just asked for
+           it, and `render.text` is already ANSI-stripped so the regex and
+           the marks see clean text either way. -->
+      <span class="text">{@render ansiText(item.render.spans)}</span>
     {:else}
       <span class="text"
         >{#each segments(item.render.text, highlightRe) as seg}{#if seg.hit}<mark>{seg.t}</mark

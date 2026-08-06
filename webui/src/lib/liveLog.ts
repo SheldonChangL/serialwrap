@@ -34,6 +34,8 @@
  * seam for a fold to fall through.
  */
 
+import { hasAnsi, parseAnsi, type AnsiSpan } from "./ansi";
+
 /** Wire shape of one `presentation::PresentedLine` (see `line_to_json`). */
 export interface PresentedLineJson {
   seq?: number;
@@ -74,16 +76,31 @@ export interface PresentedPageJson {
  * `binary_summary` means the daemon already decided this is a compact hex
  * chip; `binary: true` with `raw_hex` (no `binary_summary`) means the
  * daemon kept the full text *and* the full hex (the low-ratio-invalid-utf8
- * case) — see `presentation.rs`'s module docs for why both are `binary`. */
+ * case) — see `presentation.rs`'s module docs for why both are `binary`.
+ *
+ * One client-side addition on top of the wire shape: ANSI escape
+ * sequences are parsed out here, once, at decode time. `text` is always
+ * the *stripped* string — so the filter box, fold display, and highlight
+ * matching all see what the human sees, never `[1;34m` noise — and
+ * `spans` carries the styled runs for display when the line actually had
+ * any SGR color in it (`null` for the overwhelmingly common plain line,
+ * which skips the parse entirely — see `ansi.ts`). */
 export type LineRender =
-  | { kind: "text"; text: string; rawHex: string | null }
+  | { kind: "text"; text: string; spans: AnsiSpan[] | null; rawHex: string | null }
   | { kind: "binary_summary"; length: number; hexPreview: string };
 
 function decodeRender(line: PresentedLineJson): LineRender {
   if (line.binary_summary) {
     return { kind: "binary_summary", length: line.binary_summary.length, hexPreview: line.binary_summary.hex_preview };
   }
-  return { kind: "text", text: line.text ?? "", rawHex: line.binary ? (line.raw_hex ?? null) : null };
+  const raw = line.text ?? "";
+  const spans = hasAnsi(raw) ? parseAnsi(raw) : null;
+  return {
+    kind: "text",
+    text: spans ? spans.map((s) => s.text).join("") : raw,
+    spans,
+    rawHex: line.binary ? (line.raw_hex ?? null) : null,
+  };
 }
 
 /** Every kind of row the live log view can render, plus the client-only
