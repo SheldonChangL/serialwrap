@@ -163,6 +163,37 @@ test("sending from the write bar returns focus to the entry for the next command
   await expect(input).toBeFocused();
 });
 
+test("Tab completes paths harvested from device output, shell-style", async ({ page }) => {
+  await gotoConnectedLiveLog(page);
+  await injectLog(daemon!, DEVICE_ID, [
+    { kind: "rx", text: "capture thumbnail /mnt/mmc/DCIM/A/REC_001.jpg\n" },
+    { kind: "rx", text: "update dcf for /mnt/mmc/THUMBNAIL/B/REC_001.jpg\n" },
+  ]);
+  // The harvest happens on render, so wait for the lines to land first.
+  await expect(page.locator('[data-row-kind="line"]')).toHaveCount(2, { timeout: 10_000 });
+
+  const input = page.getByTestId("write-input");
+  await input.fill("ls /mn");
+  await input.press("Tab");
+  // One candidate at this depth → applied outright, one segment at a time.
+  await expect(input).toHaveValue("ls /mnt/");
+  await input.press("Tab");
+  await expect(input).toHaveValue("ls /mnt/mmc/");
+
+  // Two candidates now: the strip appears and Tab cycles through it.
+  await input.press("Tab");
+  const strip = page.getByTestId("write-suggestions");
+  await expect(strip.locator(".suggestion")).toHaveCount(2);
+  await input.press("Tab");
+  await expect(input).toHaveValue("ls /mnt/mmc/DCIM/");
+
+  // A bare word completes against path segments (`ls DCIM`-style relative
+  // commands), not just absolute prefixes.
+  await input.fill("ls THUMB");
+  await input.press("Tab");
+  await expect(input).toHaveValue("ls THUMBNAIL");
+});
+
 test("scrolling up pauses following; the pill count is correct; clicking it returns to the tail", async ({
   page,
 }) => {

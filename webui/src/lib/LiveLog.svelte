@@ -40,6 +40,8 @@
     type DeviceConfig,
     type LogStreamState,
   } from "./logStream";
+  import { stripAnsi } from "./ansi";
+  import { harvest } from "./completion";
   import { formatConfig } from "./eventText";
   import LogRow from "./LogRow.svelte";
   import Timeline from "./Timeline.svelte";
@@ -277,6 +279,13 @@
     // push stream — no new subscription needed, just react to it.
     if (page.events.some((e) => e.event === "config_change")) {
       refreshConfig();
+    }
+    // Feed the write bar's Tab completion (see `completion.ts`): absolute
+    // paths the device prints are exactly the paths an operator will want
+    // to type next. Binary lines are skipped — corrupted bytes that happen
+    // to contain slashes are not paths.
+    for (const line of page.lines) {
+      if (line.text && !line.binary) harvest(deviceId, stripAnsi(line.text));
     }
     pendingPages.push(page);
     if (!rafScheduled) {

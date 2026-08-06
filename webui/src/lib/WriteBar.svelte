@@ -21,6 +21,7 @@
    *   board, which is the only recall that is ever useful.
    */
   import { tick } from "svelte";
+  import { completeWord, longestCommonPrefix } from "./completion";
   import { writeToDevice, type LineEnding } from "./logStream";
 
   interface Props {
@@ -110,6 +111,52 @@
     inputEl?.focus();
   }
 
+  /** Tab-completion state (see `completion.ts` for where candidates come
+   * from). `suggestions` non-empty means a strip of candidates is showing
+   * and further Tabs cycle through it; any edit or Escape dismisses it. */
+  let suggestions = $state<string[]>([]);
+  let suggestIndex = $state(-1);
+  let suggestWordStart = 0;
+
+  function clearSuggestions(): void {
+    suggestions = [];
+    suggestIndex = -1;
+  }
+
+  function applyCandidate(candidate: string): void {
+    value = value.slice(0, suggestWordStart) + candidate;
+    inputEl?.focus();
+  }
+
+  /** Terminal-style Tab: first press completes to the longest common
+   * prefix (applying outright if only one candidate), further presses
+   * cycle the remaining candidates. History words complete too — commands
+   * you've sent are as likely to be retyped as paths are. */
+  function completeAtCursor(): void {
+    if (suggestions.length > 0) {
+      suggestIndex = (suggestIndex + 1) % suggestions.length;
+      applyCandidate(suggestions[suggestIndex]);
+      return;
+    }
+    const wordStart = Math.max(value.lastIndexOf(" "), value.lastIndexOf("\t")) + 1;
+    const word = value.slice(wordStart);
+    if (word === "") return;
+    const fromHistory = word.startsWith("/")
+      ? []
+      : history.flatMap((h) => h.split(/\s+/)).filter((w) => w.startsWith(word) && w !== word);
+    const candidates = [...new Set([...completeWord(deviceId, word), ...fromHistory])];
+    if (candidates.length === 0) return;
+    suggestWordStart = wordStart;
+    if (candidates.length === 1) {
+      applyCandidate(candidates[0]);
+      return;
+    }
+    const lcp = longestCommonPrefix(candidates);
+    if (lcp.length > word.length) value = value.slice(0, wordStart) + lcp;
+    suggestions = candidates;
+    suggestIndex = -1;
+  }
+
   function recall(direction: -1 | 1): void {
     if (history.length === 0) return;
     if (historyIndex === null) {
@@ -131,13 +178,27 @@
   function onKeyDown(e: KeyboardEvent): void {
     if (e.key === "Enter") {
       e.preventDefault();
+      clearSuggestions();
       void send();
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
+      clearSuggestions();
       recall(-1);
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
+      clearSuggestions();
       recall(1);
+    } else if (e.key === "Tab" && !e.shiftKey && mode === "text" && value !== "") {
+      // Hijacked only mid-composition: an empty entry keeps Tab's normal
+      // focus-order meaning, so keyboard users aren't trapped in the input.
+      e.preventDefault();
+      completeAtCursor();
+    } else if (e.key === "Escape") {
+      clearSuggestions();
+    } else if (e.key !== "Shift") {
+      // Any real edit invalidates the strip — the word it was computed
+      // for no longer exists.
+      clearSuggestions();
     }
   }
 
@@ -149,6 +210,24 @@
         : "Type a command, press Enter",
   );
 </script>
+
+{#if suggestions.length > 0}
+  <div class="suggestions" data-testid="write-suggestions" role="listbox" aria-label="Completions">
+    {#each suggestions as s, i}
+      <button
+        type="button"
+        class="suggestion"
+        class:selected={i === suggestIndex}
+        role="option"
+        aria-selected={i === suggestIndex}
+        onclick={() => {
+          applyCandidate(s);
+          clearSuggestions();
+        }}>{s}</button
+      >
+    {/each}
+  </div>
+{/if}
 
 <form
   class="write-bar"
@@ -173,6 +252,7 @@
     autocapitalize="off"
     aria-label="Bytes to send to the serial port"
     onkeydown={onKeyDown}
+    oninput={clearSuggestions}
   />
 
   <div class="modes" role="group" aria-label="Payload format">
@@ -328,6 +408,37 @@
   .send:disabled {
     opacity: 0.45;
     cursor: default;
+  }
+
+  /* The completion strip sits where a terminal would print its candidate
+   * list: directly above the prompt, in the data font, gone on the next
+   * keystroke. */
+  .suggestions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    padding: var(--space-1) var(--space-3);
+    border-top: 1px solid var(--border);
+    border-left: var(--gutter-w) solid var(--tx);
+    background: var(--surface);
+  }
+
+  .suggestion {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    padding: 0 var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-raised);
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+
+  .suggestion:hover,
+  .suggestion.selected {
+    color: var(--tx);
+    border-color: var(--tx);
+    background: var(--tx-bg);
   }
 
   .error {
